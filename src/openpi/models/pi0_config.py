@@ -31,6 +31,8 @@ class Pi0Config(_model.BaseModelConfig):
     # Use the same value in the inference config as in the training ablation.
     use_force_history: bool = True
     use_state: bool = True
+    # Per-step width of the force sequence fed to the wrench GRU (6 = TCP wrench only, as in LIFT).
+    wrench_dim: int = 6
 
     # The residual branch reuses the frozen base-policy SigLIP. These settings
     # control only the trainable correction decoder and wrench encoder.
@@ -99,7 +101,7 @@ class Pi0Config(_model.BaseModelConfig):
 
         with at.disable_typechecking():
             wrench_spec = (
-                jax.ShapeDtypeStruct([batch_size, self.action_horizon, 6], jnp.float32)
+                jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.wrench_dim], jnp.float32)
                 if self.reactive_in_use or self.residual_policy_in_use
                 else None
             )

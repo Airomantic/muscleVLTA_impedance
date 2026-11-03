@@ -76,7 +76,9 @@ def create_trained_policy(
         metadata=train_config.policy_metadata,
         rtc_rebase=(
             flexiv_transforms.rebase_prefix_observation
-            if isinstance(train_config.data, _config.LeRobotSingleiPhoneFlexivDataConfig)
+            if isinstance(
+                train_config.data, _config.LeRobotSingleiPhoneFlexivDataConfig | _config.LeRobotAR3LiftDataConfig
+            )
             and train_config.data.extra_delta_transform
             else None
         ),

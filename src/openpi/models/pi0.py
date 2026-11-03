@@ -34,6 +34,7 @@ def create_residual_policy_submodule(config: pi0_config.Pi0Config, rngs: nnx.Rng
         hidden_size=config.residual_wrench_hidden_dim,
         output_size=config.residual_width,
         action_horizon=config.action_horizon,
+        input_size=config.wrench_dim,
     )
     residual_wrench_gru.lazy_init(rngs=rngs, method="init")
     residual_core = _residual_policy.create_residual_policy_core(
@@ -153,6 +154,7 @@ class Pi0(_model.BaseModel):
         self.residual_policy_in_use = config.residual_policy_in_use
         self.original_head = config.original_head
         self.use_force_history = config.use_force_history
+        self.wrench_dim = config.wrench_dim
         self.cross_attention_latency = config.cross_attention_latency
         self.residual_image_keys = config.residual_image_keys
         self.residual_action_dim = len(config.residual_action_scale) if config.residual_policy_in_use else 0
@@ -201,6 +203,7 @@ class Pi0(_model.BaseModel):
                 hidden_size=action_expert_config.width // 2,
                 output_size=action_expert_config.width,
                 action_horizon=config.action_horizon,
+                input_size=config.wrench_dim,
             )
             wrench_gru.lazy_init(rngs=rngs, method="init")
             model_parts["wrench_gru"] = wrench_gru
@@ -327,7 +330,7 @@ class Pi0(_model.BaseModel):
     def _get_wrench_memory(self, observation: _model.Observation):
         if observation.wrench is None:
             batch_size = observation.state.shape[0]
-            wrench = jnp.zeros((batch_size, self.action_horizon, 6), dtype=observation.state.dtype)
+            wrench = jnp.zeros((batch_size, self.action_horizon, self.wrench_dim), dtype=observation.state.dtype)
         else:
             wrench = observation.wrench
         wrench_mask = self._get_wrench_mask(observation)
@@ -345,7 +348,7 @@ class Pi0(_model.BaseModel):
 
     def _get_residual_wrench_memory(self, wrench, wrench_mask, batch_size: int):
         if wrench is None:
-            wrench = jnp.zeros((batch_size, self.action_horizon, 6), dtype=jnp.float32)
+            wrench = jnp.zeros((batch_size, self.action_horizon, self.wrench_dim), dtype=jnp.float32)
             wrench_mask = jnp.zeros((batch_size,), dtype=jnp.bool_)
         else:
             wrench = jnp.asarray(wrench, dtype=jnp.float32)

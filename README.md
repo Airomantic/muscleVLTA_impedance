@@ -47,7 +47,7 @@ combines offline demonstrations with human corrections.
 </p>
 
 Built on OpenPI, this repository provides **policy training and model inference**,
-not a robot-control or data-collection stack.
+not a robot-control or data-collection stack (except the [AR3 deployment](#-rokae-ar3--dm-gripper) of this fork).
 
 ## ⚙️ Installation
 
@@ -201,6 +201,56 @@ bash scripts/train_online_dagger_lerobot_residual.sh
 Baseline-specific data requirements, residual checkpoint loading, and target
 generation are documented in these two launchers. The residual model is implemented
 in [src/openpi/models/residual_policy.py](src/openpi/models/residual_policy.py).
+
+## 🦾 Rokae AR3 + DM Gripper
+
+This fork trains LIFT on the Rokae AR3 with its
+[Cartesian impedance controller](https://github.com/Airomantic/ar3_CartesianImpedanceControl)
+and the DM tac G2/V3 gripper ([SDK](https://github.com/Airomantic/dmrobotics_Flux_pkg_V1.2.13.1)),
+and runs the trained policy on that robot. LeRobot v3.0 recordings are read natively
+([src/openpi/data/lerobot_v3.py](src/openpi/data/lerobot_v3.py)); the I/O mapping is in
+[src/openpi/policies/ar3_lift_policy.py](src/openpi/policies/ar3_lift_policy.py):
+
+| LIFT input / output | AR3 dataset feature |
+| --- | --- |
+| base image / wrist image | `observation.images.front` / `observation.images.wrist` |
+| `state` (7D) | `observation.tcp_pose` (xyz + rotation) + `observation.gripper_position` (0 = closed … 1000 = open) |
+| force sequence (13D, reactive expert) | `observation.tcp_wrench` (6D) + `observation.tau_m` (7 joint torques) |
+| `actions` (10 × 7, 10 Hz) | relative TCP pose (xyz + Euler xyz of `inv(T_state) @ T_target`) + gripper target |
+
+**Train** (`pi05_ar3_lift_reactive`, from `pi05_base`, 30k steps, batch 96, H100 GPUs 0–2; options in the header):
+
+```bash
+bash scripts/train_ar3_lift_gpu012.sh
+```
+
+**Serve and validate** a checkpoint step directory on the GPU server, replaying recorded frames exactly as the robot
+queries the policy (LIFT Algorithm 1: `reactive_replan`, then one `reactive_step` per force reading):
+
+```bash
+bash scripts/serve_ar3_lift.sh /data/jiang/train_checkpoints/pi05_ar3_lift_reactive/<exp>/29999
+.venv/bin/python scripts/ar3_lift_replay_check.py --port 8000 --episode 0 --num-chunks 5
+```
+
+**Run on the robot PC** (ROS 2 Jazzy, domain 111). Forward the policy port with
+`ssh -N -L 8000:127.0.0.1:8000 <user>@<gpu-server>`, then:
+
+```bash
+./infer_oneclick.sh                                  # impedance controller, gripper service, cameras, tilt, readiness
+./infer_oneclick.sh --ready-only --initialize-gripper  # once after gripper power-up (MOVES the fingers)
+scripts/run_ar3_lift_robot.sh --check                # controller, cameras, gripper and policy; no motion
+scripts/run_ar3_lift_robot.sh --max-chunks 3         # dry run: targets only on preview_command
+scripts/run_ar3_lift_robot.sh --execute --move-to-start  # MOVES the arm and gripper
+```
+
+The client ([scripts/ar3_lift_robot_client.py](scripts/ar3_lift_robot_client.py)) streams the absolute TCP targets at
+100 Hz to the impedance controller with the recording teleoperation's command shaping and commands the gripper
+(speed 80, force level 20) over gRPC. It recenters the controller's workspace sphere at the start pose
+(`./infer_oneclick.sh` uses a 0.45 m radius; the recorded motions reach 0.43 m) and stops on stale sensors,
+tracking errors, controller faults, policy timeouts and Ctrl+C. Closing tabs is not an emergency stop: keep the
+robot's hardware stop within reach. The robot Python (`INFER_ROBOT_PYTHON`, default the gripper's `.venv-ros`) also
+needs `pip install 'websockets>=11,<18' msgpack typing_extensions pillow`. The TCP wrench component order (assumed
+Fx, Fy, Fz, Tx, Ty, Tz) still awaits vendor or physical validation.
 
 ## 🙏 Acknowledgements
 
