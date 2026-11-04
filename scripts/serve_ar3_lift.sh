@@ -87,12 +87,39 @@ if [[ ! -d "${checkpoint}/params" || ! -d "${checkpoint}/assets" ]]; then
 fi
 checkpoint="$(cd "${checkpoint}" && pwd)"
 
+# A partially copied Orbax checkpoint can contain the directories but no model weights.
+for metadata in _METADATA manifest.ocdbt; do
+    if [[ ! -s "${checkpoint}/params/${metadata}" ]]; then
+        echo "Incomplete checkpoint: missing or empty ${checkpoint}/params/${metadata}; finish copying params/." >&2
+        exit 1
+    fi
+done
+weight_files=("${checkpoint}"/params/ocdbt.process_*/d/* "${checkpoint}"/params/d/*)
+has_weights=0
+for weight_file in "${weight_files[@]}"; do
+    if [[ -f "${weight_file}" && -s "${weight_file}" ]]; then
+        has_weights=1
+        break
+    fi
+done
+if (( ! has_weights )); then
+    echo "Incomplete checkpoint: no weight data under ${checkpoint}/params; finish copying params/." >&2
+    exit 1
+fi
+
 # The norm stats are read from <checkpoint>/assets/<asset_id>/; the AR3 configs take the id from OPENPI_AR3_ASSET_ID.
 if [[ -z "${OPENPI_AR3_ASSET_ID:-}" ]]; then
     stats=("${checkpoint}"/assets/*/norm_stats.json)
     if [[ ${#stats[@]} -eq 1 && -f "${stats[0]}" ]]; then
         OPENPI_AR3_ASSET_ID="$(basename "$(dirname "${stats[0]}")")"
+    else
+        echo "Expected one assets/*/norm_stats.json in ${checkpoint}; set OPENPI_AR3_ASSET_ID if there are several." >&2
+        exit 1
     fi
+fi
+if [[ ! -s "${checkpoint}/assets/${OPENPI_AR3_ASSET_ID}/norm_stats.json" ]]; then
+    echo "Missing normalization stats: ${checkpoint}/assets/${OPENPI_AR3_ASSET_ID}/norm_stats.json" >&2
+    exit 1
 fi
 
 if [[ ! -f "${DATA_HOME}/big_vision/paligemma_tokenizer.model" ]]; then
@@ -106,8 +133,9 @@ fi
 
 environment=(
     "OPENPI_DATA_HOME=${DATA_HOME}"
+    # The model's Python 3.11 must not import the shell's ROS Python 3.12 overlays.
     # Always import this repository's openpi (the copied venv may point at another checkout).
-    "PYTHONPATH=${REPO_ROOT}/src:${REPO_ROOT}/packages/openpi-client/src${PYTHONPATH:+:${PYTHONPATH}}"
+    "PYTHONPATH=${REPO_ROOT}/src:${REPO_ROOT}/packages/openpi-client/src"
 )
 if [[ -n "${OPENPI_AR3_ASSET_ID:-}" ]]; then
     environment+=("OPENPI_AR3_ASSET_ID=${OPENPI_AR3_ASSET_ID}")
@@ -123,7 +151,8 @@ else
 fi
 
 command=(
-    env "${environment[@]}"
+    env -u PYTHONHOME -u LD_LIBRARY_PATH -u AMENT_PREFIX_PATH -u COLCON_PREFIX_PATH
+    -u CMAKE_PREFIX_PATH -u ROS_PACKAGE_PATH "${environment[@]}"
     "${PYTHON}" "${REPO_ROOT}/scripts/serve_policy.py"
     --config-name "${CONFIG_NAME}"
     --checkpoint-dir "${checkpoint}"

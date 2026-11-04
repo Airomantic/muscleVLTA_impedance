@@ -4,7 +4,7 @@
 # policy (scripts/serve_ar3_lift.sh; from the GPU server: ssh -N -L 8000:127.0.0.1:8000 <user>@<server>).
 #
 # Usage (all arguments go to the client; it moves the robot only with --execute):
-#   scripts/run_ar3_lift_robot.sh --check                       # controller, cameras, gripper, policy; no motion
+#   scripts/run_ar3_lift_robot.sh --check                       # controller, cameras, gripper; no motion
 #   scripts/run_ar3_lift_robot.sh --max-chunks 3                # dry run: targets only on preview_command
 #   scripts/run_ar3_lift_robot.sh --execute --move-to-start     # MOVES the arm and gripper
 #   scripts/run_ar3_lift_robot.sh --help                        # all client options
@@ -63,7 +63,7 @@ if ((help)); then
     sed -n '2,/^set -euo pipefail$/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'
     echo
 else
-    modules=(rclpy numpy msgpack websockets.sync.client typing_extensions)
+    modules=(rclpy numpy msgpack websockets.sync.client typing_extensions PIL.Image)
     ((gripper)) && modules+=(grpc DM_V3Gripper.gripper_pb2)
     "${ros[@]}" "$PYTHON" -c '
 import importlib
@@ -77,7 +77,7 @@ for name in sys.argv[1:]:
         missing.append(f"{name} ({type(error).__name__}: {error})")
 if missing:
     sys.exit("missing modules: " + "; ".join(missing))
-' "${modules[@]}" || die "The robot Python lacks the modules above: rclpy comes from $ROS_SETUP (Python 3.12), grpc and DM_V3Gripper from the gripper's .venv-ros; install the others with: $PYTHON -m pip install 'websockets>=11,<18' msgpack typing_extensions pillow"
+' "${modules[@]}" || die "The robot Python lacks the modules above: rclpy comes from $ROS_SETUP (Python 3.12), grpc and DM_V3Gripper from the gripper's .venv-ros; install into this environment (user-site packages are disabled): PYTHONNOUSERSITE=1 $PYTHON -m pip install 'websockets>=11,<18' msgpack typing_extensions pillow"
 fi
 
 exec "${command[@]}"

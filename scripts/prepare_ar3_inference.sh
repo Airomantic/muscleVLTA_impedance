@@ -12,6 +12,10 @@ TILT_DIR="${INFER_TILT_DIR:-$UPPERLIMB/../../huanEr}"
 SERVO_PYTHON="${INFER_SERVO_PYTHON:-$HOME/anaconda3/envs/qwen3VL/bin/python}"
 ROS_SETUP="${INFER_ROS_SETUP:-/opt/ros/jazzy/setup.bash}"
 CAMERA_LAUNCH_DIR="${INFER_CAMERA_LAUNCH_DIR:-/opt/ros/jazzy/share/orbbec_camera/launch}"
+WRIST_DRIVER_OVERLAY="${INFER_WRIST_DRIVER_OVERLAY-}"
+if [[ ! -v INFER_WRIST_DRIVER_OVERLAY && -d "$ROOT/outputs/orbbec_wrist_driver/overlay" ]]; then
+    WRIST_DRIVER_OVERLAY="$ROOT/outputs/orbbec_wrist_driver/overlay"
+fi
 ARM_INTERFACE="${INFER_ARM_INTERFACE:-enp132s0}"
 ARM_CIDR="${INFER_ARM_CIDR:-192.168.0.100/24}"
 ARM_IP="${INFER_ARM_IP:-192.168.0.160}"
@@ -32,7 +36,7 @@ FRONT_SERIAL="${INFER_FRONT_SERIAL:-CPC8563000HX}"
 WRIST_SERIAL="${INFER_WRIST_SERIAL:-CV2856D000BV}"
 TILT_ANGLE="${INFER_TILT_ANGLE:-40.0}"
 WAIT_TIMEOUT="${INFER_TIMEOUT:-180}"
-CHECKPOINT="${INFER_CHECKPOINT:-$ROOT/infer_checkpoint/29999}"
+CHECKPOINT="${INFER_CHECKPOINT:-$ROOT/infer_checkpoint/20000}"
 export ROS_DOMAIN_ID="${INFER_ROS_DOMAIN_ID:-111}"
 export OPENPI_HOST="${OPENPI_HOST:-127.0.0.1}"
 export OPENPI_PORT="${OPENPI_PORT:-8000}"
@@ -42,9 +46,10 @@ RT_PARAMS=install/ar3_cartesian_impedance/share/ar3_cartesian_impedance/config/r
 WRIST_COLOR=(enable_color_auto_exposure:=false color_exposure:=80 color_gain:=16
     enable_color_auto_white_balance:=false color_white_balance:=4600)
 
-WITH_ARM=1 WITH_SSH=1 WITH_CAMERAS=1 WITH_TILT=1 WITH_POLICY=0
+WITH_ARM=1 WITH_SSH=1 WITH_FRONT_CAMERA=1 WITH_WRIST_CAMERA=1 WITH_TILT=1 WITH_POLICY=0
 WINDOWS=0 MODE=start TASK=""
 INITIALIZE_GRIPPER=0
+WITH_READY_TAB=1
 ORIGINAL_ARGS=("$@")
 
 info() { printf '[infer_oneclick] %s\n' "$*"; }
@@ -55,18 +60,24 @@ usage() {
 Usage: ./infer_oneclick.sh [OPTIONS]
   --dry-run          Print commands/dependencies; no device or network access.
   --check            Check local files/interpreters only; no device/network access.
-  --checkpoint DIR   Checkpoint step directory for --with-policy (default: infer_checkpoint/29999).
+  --checkpoint DIR   Checkpoint step directory for --with-policy (default: infer_checkpoint/20000).
   --ready-only       Connect the gripper and recheck running services; no new tabs.
+  --no-ready-tab     Launch services without a readiness tab (for a supervising debugger).
   --initialize-gripper
                      Allow gripper calibration if needed (MOVES the gripper).
   --no-ssh           Reuse the running remote gripper service (gRPC 192.168.127.10:50008).
   --no-arm           Do not launch or check the arm's Cartesian impedance controller.
   --no-cameras       Do not open/check the front/wrist RGB cameras.
+  --no-front-camera  Do not open/check the front RGB camera; preserve its current owner.
+  --no-wrist-camera  Do not open/check the wrist RGB camera; preserve its current owner.
   --no-tilt          Do not start or move the camera tilt servo.
   --with-policy      Also serve the policy on this PC (scripts/serve_ar3_lift.sh; needs a GPU).
   --no-policy        Do not launch/check the policy server (default; serve it on the GPU server).
   --windows          Separate GNOME windows instead of tabs in one new window.
   -h, --help         Show this help.
+
+Repeated invocations reuse existing devices and start only missing ones. Reused
+devices still pass readiness checks; an existing process alone is not readiness.
 
 Default: the AR3 Cartesian impedance controller of the recordings (xCoreSDK RT,
 enable_motion, workspace_radius_m 0.45), the remote DM gripper service, front/wrist
@@ -82,7 +93,11 @@ After PREPARATION READY run the robot client (it MOVES the arm only with --execu
 Stop teleoperation, recording and other arm controllers first. One owner per camera.
 
 Paths: INFER_AR3_WS, INFER_GRIPPER_DIR, INFER_ROBOT_PYTHON, INFER_TILT_DIR,
-INFER_SERVO_PYTHON, INFER_ROS_SETUP, INFER_CAMERA_LAUNCH_DIR.
+INFER_SERVO_PYTHON, INFER_ROS_SETUP, INFER_CAMERA_LAUNCH_DIR, INFER_WRIST_DRIVER_OVERLAY.
+The wrist uses outputs/orbbec_wrist_driver/overlay when present (G305 V4L2 single-start
+fix). INFER_WRIST_DRIVER_OVERLAY selects another overlay; an explicitly empty value
+uses the system driver. Only the wrist process receives this AMENT_PREFIX_PATH;
+the front camera and arm keep the system ROS environment.
 Devices: INFER_ARM_INTERFACE, INFER_ARM_CIDR, INFER_ARM_IP, INFER_WORKSPACE_RADIUS,
 INFER_GRIPPER_INTERFACE, INFER_GRIPPER_CIDR, INFER_GRIPPER_HOST, INFER_GRIPPER_USER,
 INFER_GRIPPER_CHANNEL, INFER_GRIPPER_MOTOR_ID, INFER_FRONT_SERIAL, INFER_WRIST_SERIAL,
@@ -106,6 +121,8 @@ emergency stop and does not guarantee arm power-off or a physical stop.
 Readiness requires fresh, connected, initialized gripper feedback, not just a
 responsive gRPC server. If the motor is uninitialized, clear the gripper workspace
 and rerun with --ready-only --initialize-gripper.
+Wrist frame metadata must report manual exposure 80, gain 16 and white balance
+4600 K, including when reusing an existing camera process.
 EOF
 }
 
@@ -119,9 +136,12 @@ while (($#)); do
             CHECKPOINT="$2"; shift ;;
         --no-ssh) WITH_SSH=0 ;;
         --ready-only) TASK=ready ;;
+        --no-ready-tab) WITH_READY_TAB=0 ;;
         --initialize-gripper) INITIALIZE_GRIPPER=1 ;;
         --no-arm) WITH_ARM=0 ;;
-        --no-cameras) WITH_CAMERAS=0 ;;
+        --no-cameras) WITH_FRONT_CAMERA=0; WITH_WRIST_CAMERA=0 ;;
+        --no-front-camera) WITH_FRONT_CAMERA=0 ;;
+        --no-wrist-camera) WITH_WRIST_CAMERA=0 ;;
         --no-tilt) WITH_TILT=0 ;;
         --with-policy) WITH_POLICY=1 ;;
         --no-policy) WITH_POLICY=0 ;;
@@ -135,6 +155,11 @@ while (($#)); do
     shift
 done
 [[ "$CHECKPOINT" == /* ]] || CHECKPOINT="$PWD/$CHECKPOINT"
+if [[ -n "$WRIST_DRIVER_OVERLAY" && "$WRIST_DRIVER_OVERLAY" != /* ]]; then
+    WRIST_DRIVER_OVERLAY="$PWD/$WRIST_DRIVER_OVERLAY"
+fi
+# Terminal tasks change their working directory; propagate the resolved overlay path.
+export INFER_WRIST_DRIVER_OVERLAY="$WRIST_DRIVER_OVERLAY"
 [[ "$WAIT_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "INFER_TIMEOUT must be a positive integer."
 [[ "$GRIPPER_MOTOR_ID" =~ ^[0-9]+$ && ${#GRIPPER_MOTOR_ID} -le 3 ]] \
     && ((10#$GRIPPER_MOTOR_ID >= 1 && 10#$GRIPPER_MOTOR_ID <= 255)) \
@@ -159,14 +184,28 @@ ROS_CMD=(env -i "HOME=$HOME" "PATH=/usr/bin:/bin:/usr/local/bin"
 TASKS=()
 ((WITH_ARM)) && TASKS+=(arm)
 ((WITH_SSH)) && TASKS+=(gripper)
-((WITH_CAMERAS)) && TASKS+=(front wrist)
+((WITH_FRONT_CAMERA)) && TASKS+=(front)
+((WITH_WRIST_CAMERA)) && TASKS+=(wrist)
 ((WITH_TILT)) && TASKS+=(tilt)
 ((WITH_POLICY)) && TASKS+=(policy)
-TASKS+=(ready)
+((WITH_READY_TAB)) && TASKS+=(ready)
 
 quote_remote() {
     local arg
     for arg in "$@"; do printf "'%s' " "${arg//\'/\'\\\'\'}"; done
+}
+
+validate_wrist_overlay() {
+    [[ -n "$WRIST_DRIVER_OVERLAY" ]] || return 0
+    [[ -d "$WRIST_DRIVER_OVERLAY" ]] || die "Missing wrist driver overlay: $WRIST_DRIVER_OVERLAY"
+    local path
+    for path in lib/liborbbec_camera.so share/ament_index/resource_index/rclcpp_components/orbbec_camera \
+        share/ament_index/resource_index/packages/orbbec_camera wrist_driver.json; do
+        [[ -f "$WRIST_DRIVER_OVERLAY/$path" ]] || die "Incomplete wrist driver overlay; missing $WRIST_DRIVER_OVERLAY/$path"
+    done
+    [[ -s "$WRIST_DRIVER_OVERLAY/lib/liborbbec_camera.so" \
+        && -s "$WRIST_DRIVER_OVERLAY/share/ament_index/resource_index/rclcpp_components/orbbec_camera" ]] \
+        || die "Wrist driver overlay has an empty library or component index: $WRIST_DRIVER_OVERLAY"
 }
 
 command_for() {
@@ -185,15 +224,24 @@ command_for() {
                 "$GRIPPER_USER@$GRIPPER_HOST" "$(quote_remote bash -lic "$remote")") ;;
         front|wrist)
             local launch=gemini_330_series.launch.py serial="$FRONT_SERIAL" format=MJPG
+            local camera_ros=("${ROS_CMD[@]}")
             # Gemini 305 exposes YUYV, not the front camera's MJPG profile.
             [[ "$1" == front ]] || { launch=gemini305.launch.py; serial="$WRIST_SERIAL"; format=YUYV; }
-            COMMAND=("${ROS_CMD[@]}" ros2 launch "$CAMERA_LAUNCH_DIR/$launch"
+            if [[ "$1" == wrist && -n "$WRIST_DRIVER_OVERLAY" ]]; then
+                validate_wrist_overlay
+                # Apply after setup.bash; preserve its system package/library lookup paths.
+                camera_ros+=(bash --noprofile --norc -c
+                    'set -e; export AMENT_PREFIX_PATH="$1${AMENT_PREFIX_PATH:+:$AMENT_PREFIX_PATH}"; shift; exec "$@"'
+                    _ "$WRIST_DRIVER_OVERLAY")
+            fi
+            COMMAND=("${camera_ros[@]}" ros2 launch "$CAMERA_LAUNCH_DIR/$launch"
                 "camera_name:=$1" "serial_number:=$serial" device_num:=2 enable_color:=true
                 color_width:=640 color_height:=480 color_fps:=30 "color_format:=$format"
                 enable_depth:=false enable_point_cloud:=false enable_colored_point_cloud:=false
                 enable_frame_sync:=false)
             [[ "$1" == front ]] \
-                || COMMAND+=(uvc_backend:=v4l2 enable_left_color:=false enable_right_color:=false "${WRIST_COLOR[@]}") ;;
+                || COMMAND+=(uvc_backend:=v4l2 enable_ir_auto_exposure:=false
+                    enable_left_color:=false enable_right_color:=false "${WRIST_COLOR[@]}") ;;
         tilt)
             TASK_CWD="$TILT_DIR"
             COMMAND=("${ROS_CMD[@]}" /usr/bin/python3 "$TILT_DIR/camera_tilt_ros2.py" --ros-args
@@ -239,10 +287,17 @@ preflight() {
         executables+=("$AR3_WS/install/ar3_cartesian_impedance/lib/ar3_cartesian_impedance/cartesian_impedance_node")
         [[ -d "/sys/class/net/$ARM_INTERFACE" ]] || die "Missing arm interface: $ARM_INTERFACE"
     fi
-    if ((WITH_CAMERAS)); then
-        files+=("$CAMERA_LAUNCH_DIR/gemini_330_series.launch.py" "$CAMERA_LAUNCH_DIR/gemini305.launch.py")
-        [[ -n "$FRONT_SERIAL" && -n "$WRIST_SERIAL" && "$FRONT_SERIAL" != "$WRIST_SERIAL" ]] \
-            || die "Set distinct nonempty INFER_FRONT_SERIAL and INFER_WRIST_SERIAL."
+    if ((WITH_FRONT_CAMERA)); then
+        files+=("$CAMERA_LAUNCH_DIR/gemini_330_series.launch.py")
+        [[ -n "$FRONT_SERIAL" ]] || die "Set a nonempty INFER_FRONT_SERIAL."
+    fi
+    if ((WITH_WRIST_CAMERA)); then
+        validate_wrist_overlay
+        files+=("$CAMERA_LAUNCH_DIR/gemini305.launch.py")
+        [[ -n "$WRIST_SERIAL" ]] || die "Set a nonempty INFER_WRIST_SERIAL."
+    fi
+    if ((WITH_FRONT_CAMERA && WITH_WRIST_CAMERA)); then
+        [[ "$FRONT_SERIAL" != "$WRIST_SERIAL" ]] || die "Set distinct INFER_FRONT_SERIAL and INFER_WRIST_SERIAL."
     fi
     if ((WITH_TILT)); then
         files+=("$TILT_DIR/camera_tilt_ros2.py" "$TILT_DIR/usb_servo.py")
@@ -272,6 +327,9 @@ preflight() {
 print_plan() {
     info "ROS domain $ROS_DOMAIN_ID; arm $ARM_IP (workspace radius $WORKSPACE_RADIUS m); gripper $GRIPPER_HOST:$GRIPPER_PORT"
     ((WITH_POLICY)) && info "Policy: $CHECKPOINT on GPU ${OPENPI_SERVE_GPU:-0}, ws://$OPENPI_HOST:$OPENPI_PORT"
+    if ((WITH_WRIST_CAMERA)) || [[ "$TASK" == wrist ]]; then
+        info "Wrist camera driver: ${WRIST_DRIVER_OVERLAY:-system ROS driver}; front camera uses the system driver."
+    fi
     if [[ "$TASK" == ready ]]; then
         info "Recheck existing services; require gripper $GRIPPER_HOST via $GRIPPER_INTERFACE src $GRIPPER_LOCAL_IP. No new tabs."
     else
@@ -290,7 +348,9 @@ print_plan() {
                 "$GRIPPER_CHANNEL" "$GRIPPER_MOTOR_ID" "$GRIPPER_HOST" "$GRIPPER_PORT"
             printf '  Require fresh, connected, initialized motor feedback; calibration only with the explicit flag.\n'
             ((WITH_ARM)) && printf '  Wait for the controller RT state, metadata and status, then %s/tau_m.\n' "$CONTROLLER"
-            ((WITH_CAMERAS)) && printf '  Wait for /front/color/image_raw and /wrist/color/image_raw samples.\n'
+            ((WITH_FRONT_CAMERA)) && printf '  Wait for /front/color/image_raw samples.\n'
+            ((WITH_WRIST_CAMERA)) && printf '  Wait for /wrist/color/image_raw samples.\n'
+            ((WITH_WRIST_CAMERA)) && printf '  Check /wrist/color/metadata: exposure 80, gain 16, white balance 4600 K; AE/AWB off.\n'
             ((WITH_TILT)) && printf '  Wait for measured /camera_tilt/state_deg within %s +/- 2 degrees.\n' "$TILT_ANGLE"
             ((WITH_POLICY)) && printf '  Wait for http://%s:%s/healthz.\n' "$OPENPI_HOST" "$OPENPI_PORT"
         else
@@ -323,23 +383,65 @@ wait_controller() {
         --timeout "$WAIT_TIMEOUT" || die "The Cartesian impedance controller is not ready; inspect the arm tab."
 }
 
-check_conflicts() {
-    local nodes
-    nodes=$(timeout --kill-after=3 15 "${ROS_CMD[@]}" ros2 node list --no-daemon) \
+check_wrist_controls() {
+    local metadata
+    info "Checking wrist frame metadata: exposure 80, gain 16, white balance 4600 K; AE/AWB off."
+    metadata=$(timeout --signal=TERM --kill-after=3 "$WAIT_TIMEOUT" "${ROS_CMD[@]}" ros2 topic echo \
+        /wrist/color/metadata orbbec_camera_msgs/msg/Metadata --once --no-daemon \
+        --qos-reliability reliable --field json_data --full-length) \
+        || die "No wrist frame metadata; inspect the wrist camera tab and ROS domain."
+    printf '%s' "$metadata" | /usr/bin/python3 -c '
+import json
+import sys
+
+expected = dict(auto_exposure=0, exposure=80, gain=16, auto_white_balance=0, white_balance=4600)
+try:
+    actual, _ = json.JSONDecoder().raw_decode(sys.stdin.read().lstrip())
+    mismatches = [f"{key}: expected {value}, got {actual.get(key)!r}" for key, value in expected.items()
+                  if actual.get(key) != value]
+except (ValueError, AttributeError) as error:
+    print(f"Invalid wrist frame metadata: {error}", file=sys.stderr)
+    sys.exit(1)
+if mismatches:
+    print("Wrist camera settings mismatch: " + "; ".join(mismatches), file=sys.stderr)
+    sys.exit(1)
+print("[infer_oneclick] Wrist frame metadata verified: exposure 80, gain 16, white balance 4600 K; AE/AWB off.")
+' || die "Wrist camera controls are not ready. Stop its owning launch process, then rerun ./infer_oneclick.sh to apply the required settings."
+}
+
+select_missing_tasks() {
+    local nodes more task present
+    nodes=$(timeout --kill-after=3 15 "${ROS_CMD[@]}" ros2 node list --no-daemon --spin-time 3) \
         || die "Cannot inspect ROS nodes; no tasks started."
+    # DDS may discover the two camera participants at different times. Never infer absence from a short scan.
+    if { ((WITH_FRONT_CAMERA)) && [[ "$nodes" != *"/front/"* ]]; } \
+        || { ((WITH_WRIST_CAMERA)) && [[ "$nodes" != *"/wrist/"* ]]; }; then
+        more=$(timeout --kill-after=3 15 "${ROS_CMD[@]}" ros2 node list --no-daemon --spin-time 3) \
+            || die "Cannot finish ROS discovery; no tasks started."
+        nodes+=$'\n'"$more"
+    fi
     reject_command_sources "$nodes"
-    if ((WITH_ARM)) && [[ "$nodes" == *cartesian_impedance_node* || "$nodes" == *controller_manager* ]]; then
-        die "An arm controller already exists; inspect it and use --no-arm to keep a running impedance controller."
-    fi
-    if ((WITH_CAMERAS)) && [[ "$nodes" == *"/front/"* || "$nodes" == *"/wrist/"* ]]; then
-        die "Camera nodes already exist; use --no-cameras to preserve their ownership."
-    fi
-    if ((WITH_TILT)) && [[ "$nodes" == *camera_tilt_servo* ]]; then
-        die "The tilt node already exists; use --no-tilt (no servo command will be sent)."
-    fi
     if ((WITH_POLICY)) && tcp_ready "$OPENPI_HOST" "$OPENPI_PORT"; then
         die "Policy port is occupied; use --no-policy or choose another OPENPI_PORT."
     fi
+    local missing=()
+    for task in "${TASKS[@]}"; do
+        present=0
+        case "$task" in
+            arm) [[ "$nodes" != *cartesian_impedance_node* ]] || present=1 ;;
+            front) [[ "$nodes" != *"/front/"* ]] || present=1 ;;
+            wrist) [[ "$nodes" != *"/wrist/"* ]] || present=1 ;;
+            tilt) [[ "$nodes" != *camera_tilt_servo* ]] || present=1 ;;
+            gripper) if tcp_ready "$GRIPPER_HOST" "$GRIPPER_PORT"; then present=1; fi ;;
+        esac
+        if ((present)); then
+            info "Reusing existing $task; readiness will still check it."
+        else
+            missing+=("$task")
+        fi
+    done
+    # Filter only the startup list. Keep WITH_* and ORIGINAL_ARGS intact so readiness checks reused devices too.
+    TASKS=("${missing[@]}")
 }
 
 reject_command_sources() {
@@ -347,6 +449,8 @@ reject_command_sources() {
         || die "Teleoperation is running. Stop it before inference preparation."
     [[ "$1" != *ar3_lift_robot_client* ]] \
         || die "The AR3 LIFT robot client is running. Stop it before gripper preparation."
+    [[ "$1" != *controller_manager* && "$1" != *rokae_driver* && "$1" != *ros2_control_node* ]] \
+        || die "Another arm controller is running; stop it before inference preparation."
 }
 
 check_gripper_route() {
@@ -394,7 +498,7 @@ run_task() {
                 return
             fi ;;
         ready)
-            nodes=$(timeout --kill-after=3 15 "${ROS_CMD[@]}" ros2 node list --no-daemon) \
+            nodes=$(timeout --kill-after=3 15 "${ROS_CMD[@]}" ros2 node list --no-daemon --spin-time 3) \
                 || die "Cannot inspect ROS nodes; gripper preparation was not attempted."
             reject_command_sources "$nodes"
             prepare_gripper
@@ -402,9 +506,12 @@ run_task() {
                 wait_controller
                 wait_topic "$CONTROLLER/tau_m" std_msgs/msg/Float64MultiArray --field data
             fi
-            if ((WITH_CAMERAS)); then
-                wait_topic /front/color/image_raw sensor_msgs/msg/Image --field header
-                wait_topic /wrist/color/image_raw sensor_msgs/msg/Image --field header
+            if ((WITH_FRONT_CAMERA)); then
+                wait_topic /front/color/image_raw sensor_msgs/msg/Image --field header --qos-reliability reliable
+            fi
+            if ((WITH_WRIST_CAMERA)); then
+                wait_topic /wrist/color/image_raw sensor_msgs/msg/Image --field header --qos-reliability reliable
+                check_wrist_controls
             fi
             if ((WITH_TILT)); then
                 wait_topic /camera_tilt/state_deg std_msgs/msg/Float64 --field data \
@@ -461,7 +568,12 @@ if [[ -n "$TASK" ]]; then
     mkdir -p -- "$state_root"
     [[ -O "$state_root" && ! -L "$state_root" ]] || die "Unsafe runtime directory: $state_root"
     exec 9>"$state_root/$TASK.lock"
-    flock -n 9 || die "Task $TASK already has an owner in ROS domain $ROS_DOMAIN_ID."
+    if [[ "$TASK" == ready ]]; then
+        info "Waiting for the readiness lock (up to $WAIT_TIMEOUT s); any existing readiness task must finish first."
+        flock -w "$WAIT_TIMEOUT" 9 || die "Another readiness task did not finish within $WAIT_TIMEOUT s."
+    else
+        flock -n 9 || die "Task $TASK already has an owner in ROS domain $ROS_DOMAIN_ID."
+    fi
     set +e
     (set -e; run_task)
     status=$?
@@ -473,14 +585,26 @@ if [[ -n "$TASK" ]]; then
 fi
 
 preflight
+select_missing_tasks
+if ((${#TASKS[@]} == 0)); then
+    info "All selected services already exist. No tasks started; use --ready-only to verify readiness."
+    exit 0
+fi
+prepare_gripper_network
+if ((${#TASKS[@]} == 1)) && [[ "${TASKS[0]}" == ready ]]; then
+    info "All selected devices already exist; checking readiness in this terminal."
+    exec bash "$SELF" "${ORIGINAL_ARGS[@]}" --checkpoint "$CHECKPOINT" --ready-only
+fi
 command -v gnome-terminal >/dev/null || die "Missing gnome-terminal; use --dry-run to launch tasks manually."
 [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] || die "No graphical session; use --dry-run."
-check_conflicts
-prepare_gripper_network
 print_plan
 option=--window
 for task in "${TASKS[@]}"; do
     open_terminal "$option" "$task"
     ((WINDOWS)) || option=--tab
 done
-info "Preparation tasks opened. Wait for PREPARATION READY in the ready tab."
+if ((WITH_READY_TAB)); then
+    info "Preparation tasks opened. Wait for PREPARATION READY in the ready tab."
+else
+    info "Preparation tasks opened. Run --ready-only to verify readiness before inference."
+fi

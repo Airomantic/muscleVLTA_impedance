@@ -32,11 +32,13 @@ errors and Ctrl+C, waiting for the controller to confirm ``stopped``.
 
 import argparse
 from collections.abc import Sequence
+import contextlib
 import dataclasses
 import functools
 import json
 import logging
 import math
+import os
 import pathlib
 import signal
 import sys
@@ -45,6 +47,11 @@ import time
 from typing import Any
 
 import numpy as np
+
+if __package__:
+    from . import ar3_lift_home as home
+else:
+    import ar3_lift_home as home
 
 _CLIENT_SRC = pathlib.Path(__file__).resolve().parents[1] / "packages" / "openpi-client" / "src"
 if _CLIENT_SRC.is_dir() and str(_CLIENT_SRC) not in sys.path:
@@ -58,7 +65,8 @@ DEFAULT_PROMPT = (
 )
 # Mean TCP pose of the first frame of the 33 recorded episodes: xyz [m] + SDK roll/pitch/yaw [rad] (R = Rz @ Ry @ Rx),
 # gripper fully open. Spread across episodes <= 13.5 mm / 0.033 rad. The recorded motion reaches 0.43 m from it.
-DATASET_START_POSE = (0.1650, -0.3853, 0.1348, -2.0216, 0.4905, -3.0251)
+DATASET_START_POSE = (0.1650, -0.3853, 0.1348, -2.0216, 0.4905, -3.0251)  # Historical reference, not the homing target.
+BASE_FRAME = "AR3-3_07R-W4C5C5_base"
 TASK_REACH_M = 0.43
 GRIPPER_OPEN = 1000.0
 STATE_SIZE = 30  # controller state: pose6 (xyz + rpy) + wrench6 + K6 + D6 + M6
@@ -449,6 +457,7 @@ class Ar3Robot:
         self._session_parameters: np.ndarray | None = None
         self._origin: np.ndarray | None = None
         self._streaming = False
+        self._home_limits: Limits | None = None
         self._armed = False
         self._sdk_active = False
         self._stopping = False
@@ -483,7 +492,9 @@ class Ar3Robot:
         # Ctrl+C must reach the main thread (which stops the arm), not shut ROS down underneath it.
         rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
         node = rclpy.create_node("ar3_lift_robot_client")
-        image_qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+        # The Orbbec publishers are reliable. Raw 640x480 RGB frames lose fragments with best-effort DDS on
+        # this PC; reliable delivery restores 30 Hz. Keep only the newest frame, with the same freshness limit.
+        image_qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1, reliability=ReliabilityPolicy.RELIABLE)
         node.create_subscription(Float64MultiArray, self.prefix + "/state", self._on_state, qos_profile_sensor_data)
         node.create_subscription(Float64MultiArray, self.prefix + "/tau_m", self._on_tau_m, qos_profile_sensor_data)
         node.create_subscription(
@@ -520,7 +531,8 @@ class Ar3Robot:
         executor = SingleThreadedExecutor()
         executor.add_node(node)
         self._ros["executor"] = executor
-        threading.Thread(target=self._spin, name="ros", daemon=True).start()
+        self._ros["thread"] = threading.Thread(target=self._spin, name="ros", daemon=True)
+        self._ros["thread"].start()
 
     def _spin(self) -> None:
         try:
@@ -529,14 +541,23 @@ class Ar3Robot:
             with self._lock:
                 self._halt_locked(f"ROS executor failed: {error!r}")
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float = 3.0) -> None:
+        """Wake and join the executor before destroying resources used by its native wait set."""
         if not self._ros:
             return
+        deadline = time.monotonic() + timeout
+        stopped = self._ros["executor"].shutdown(timeout_sec=timeout)
+        thread = self._ros["thread"]
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if thread.is_alive() or not stopped:
+            # Destroying the node/context while spin() is still using them can abort the Python process.
+            # Keep the resources alive so the caller can report the failure and retry cleanup.
+            raise RobotError(f"ROS executor did not stop within {timeout:g} s; its resources were not destroyed")
         try:
-            self._ros["executor"].shutdown(timeout_sec=1.0)
             self._ros["node"].destroy_node()
         finally:
             self._ros["rclpy"].try_shutdown()
+        self._ros = {}
 
     def _call(self, name: str, request: Any, timeout: float = 2.0, idle: Any = None) -> Any:
         """Calls a controller service; ``idle`` runs while waiting (e.g. ``heartbeat`` while streaming)."""
@@ -641,7 +662,7 @@ class Ar3Robot:
 
     def next_command(self, now: float, dt: float) -> np.ndarray:
         """Shapes the next 30-value controller command (call with the lock held); ValueError means stop."""
-        limits = self.limits
+        limits = self._home_limits or self.limits
         if self._state is None or now - self._state_at > limits.feedback_timeout:
             raise ValueError(f"controller state is stale ({now - self._state_at:.3f} s)")
         if self._target is None or now - self._target_at > limits.target_timeout:
@@ -675,19 +696,26 @@ class Ar3Robot:
         with self._lock:
             return self._status
 
-    def wait_ready(self, timeout: float, *, need_tau_m: bool) -> None:
-        """Waits for the controller (state, status, metadata), ``tau_m`` (if used) and both cameras."""
+    def wait_ready(
+        self,
+        timeout: float,
+        *,
+        need_tau_m: bool,
+        max_observation_age: float = 1.0,
+        max_image_age: float = 1.0,
+    ) -> None:
+        """Waits for the controller, force and cameras to satisfy the requested freshness before activation."""
         deadline = time.monotonic() + timeout
         while True:
             now = time.monotonic()
             with self._lock:
-                ages = {self.prefix + "/state": now - self._state_at}
+                ages = {self.prefix + "/state": (now - self._state_at, max_observation_age)}
                 if need_tau_m:
-                    ages[self.prefix + "/tau_m"] = now - self._tau_m_at
+                    ages[self.prefix + "/tau_m"] = (now - self._tau_m_at, max_observation_age)
                 for name, topic in self._camera_topics.items():
-                    ages[topic] = now - self._images.get(name, (None, -math.inf))[1]
+                    ages[topic] = (now - self._images.get(name, (None, -math.inf))[1], max_image_age)
                 status, metadata = self._status, self._metadata
-            missing = [topic for topic, age in ages.items() if age > 1.0]
+            missing = [topic for topic, (age, limit) in ages.items() if age > limit]
             if not status:
                 missing.append(self.prefix + "/status")
             if metadata is None:
@@ -776,6 +804,20 @@ class Ar3Robot:
             self._raise_if_fault_locked()
             measured = pose_from_vector(self._sample_locked(now, 6, self.limits.feedback_timeout)[0])
             return measured, self._last_command, self._target
+
+    @contextlib.contextmanager
+    def return_home_mode(self):
+        """Use the recording's homing profile while retaining the independent tracking/force stops."""
+        with self._lock:
+            self._raise_if_fault_locked()
+            if not self._streaming or self._home_limits is not None:
+                raise RobotError("return home requires an active stream with no other homing operation")
+            self._home_limits = home_limits(self.limits)
+        try:
+            yield self._home_limits
+        finally:
+            with self._lock:
+                self._home_limits = None
 
     def set_target(self, position: np.ndarray, rotation: np.ndarray, *, clamp: bool = True) -> bool:
         """Replaces the streamed TCP target, clamped into the session workspace. Returns whether it was clamped.
@@ -1268,6 +1310,34 @@ def run_chunks(
     return chunks
 
 
+def home_limits(limits: Limits) -> Limits:
+    """The recording's separate homing profile, bounded by this controller's tracking and speed limits."""
+    return dataclasses.replace(
+        limits,
+        max_lead_m=min(limits.max_lead_m, 0.06),
+        max_lead_rad=min(home.HOME_ROTATION_LEAD, 0.8 * limits.max_tracking_error_rad),
+        max_linear_speed=min(limits.max_linear_speed, home.HOME_LINEAR_SPEED),
+        max_angular_speed=min(limits.max_angular_speed, home.HOME_ANGULAR_SPEED),
+    )
+
+
+def plan_home(start, target, limits: Limits, timeout: float) -> home.ReturnHomePath:
+    """Reject invalid or unreachable startup requests before enabling the controller."""
+    if pose_error(start, target)[0] > limits.workspace_radius - limits.workspace_margin:
+        raise RobotError("saved home is outside the available controller workspace from the current TCP")
+    profile = home_limits(limits)
+    try:
+        path = home.ReturnHomePath(start, target, profile.max_linear_speed, profile.max_angular_speed)
+    except ValueError as error:
+        raise RobotError(f"invalid return-home path: {error}") from error
+    if path.duration + home.HOME_SETTLE_TIME >= timeout:
+        raise RobotError(
+            f"return-home path needs at least {path.duration + home.HOME_SETTLE_TIME:.1f} s; "
+            f"--move-timeout is only {timeout:.1f} s"
+        )
+    return path
+
+
 def move_to_start(
     robot: Any,
     gripper: Any,
@@ -1277,37 +1347,86 @@ def move_to_start(
     clock: Any = time.monotonic,
     sleep: Any = time.sleep,
 ) -> None:
-    """Moves the TCP to ``start_pose`` (xyz + SDK rpy) with the streamer's limits and opens the gripper, as recorded."""
+    """Follow the recording's quintic path, pausing for feedback and requiring measured arrival."""
     target = pose_from_vector(start_pose)
-    distance, angle = pose_error(robot.poses()[0], target)
-    logger.info("moving to the start pose: %.0f mm / %.3f rad away", distance * 1000, angle)
-    robot.set_target(*target, clamp=False)
-    if gripper is not None:
-        gripper.command(GRIPPER_OPEN)
-    deadline = clock() + timeout
-    anchor, anchor_at = None, clock()
-    while True:
-        robot.heartbeat()
-        measured, command, _ = robot.poses()
-        now = clock()
-        if anchor is None or any(np.greater(pose_error(measured, anchor), (0.001, 0.005))):
-            anchor, anchor_at = measured, now
-        slewed = command is not None and max(pose_error(command, target)) < 1e-6
-        if slewed and now - anchor_at >= 0.5:
-            break
-        if now > deadline:
-            distance, angle = pose_error(measured, target)
-            raise RobotError(
-                f"start pose not reached within {timeout:.0f} s ({distance * 1000:.0f} mm / {angle:.3f} rad left)"
-            )
-        sleep(0.02)
+    measured, command, _ = robot.poses()
+    path = plan_home(command if command is not None else measured, target, robot.limits, timeout)
     distance, angle = pose_error(measured, target)
-    log = logger.warning if distance > 0.02 or angle > 0.05 else logger.info
-    log("settled %.1f mm / %.3f rad from the start pose", distance * 1000, angle)
-    if gripper is not None:
-        position = gripper.wait_position(GRIPPER_OPEN, tolerance=20, timeout=5.0)
-        if abs(position - GRIPPER_OPEN) > 20:
-            logger.warning("gripper did not open fully (position %.0f)", position)
+    logger.info(
+        "returning to saved home: %.0f mm / %.3f rad away; smooth path %.1f s, timeout %.0f s; "
+        "measured arrival required within %.0f mm / %.3f rad for %.1f s",
+        distance * 1000,
+        angle,
+        path.duration,
+        timeout,
+        home.HOME_POSITION_TOLERANCE * 1000,
+        home.HOME_ROTATION_TOLERANCE,
+        home.HOME_SETTLE_TIME,
+    )
+    with robot.return_home_mode() as limits:
+        if gripper is not None:
+            gripper.command(GRIPPER_OPEN)
+        started = previous = clock()
+        report_at, settled_at = started, None
+        period = 1.0 / limits.rate_hz
+        while True:
+            robot.heartbeat()
+            measured, command, _ = robot.poses()
+            now = clock()
+            dt, previous = min(max(now - previous, 0.0), period), now
+            distance, angle = pose_error(measured, target)
+            if now - started >= timeout:
+                raise RobotError(
+                    f"saved home not reached within {timeout:.0f} s "
+                    f"({distance * 1000:.1f} mm / {angle:.3f} rad left); policy execution was not started"
+                )
+            candidate, elapsed = path.candidate(dt)
+            lead_m, lead_rad = pose_error(candidate, measured)
+            paused = lead_m > limits.max_lead_m + 1e-9 or lead_rad > limits.max_lead_rad + 1e-9
+            if not paused:
+                robot.set_target(*candidate, clamp=False)
+                path.elapsed = elapsed
+            # Do not mistake a stationary arm or a sent command for arrival at the saved pose.
+            arrived = (
+                path.elapsed >= path.duration
+                and command is not None
+                and max(pose_error(command, target)) < 1e-5
+                and distance <= home.HOME_POSITION_TOLERANCE
+                and angle <= home.HOME_ROTATION_TOLERANCE
+            )
+            if not arrived:
+                settled_at = None
+            elif settled_at is None:
+                settled_at = now
+            elif now - settled_at >= home.HOME_SETTLE_TIME:
+                break
+            if now >= report_at:
+                logger.info(
+                    "return-home %.0f%%: %.1f mm / %.3f rad remaining%s",
+                    100 * path.elapsed / path.duration,
+                    distance * 1000,
+                    angle,
+                    "; waiting for measured TCP to follow" if paused else "",
+                )
+                report_at = now + 2.0
+            sleep(period)
+        if gripper is not None:
+            deadline = clock() + 5.0
+            while True:
+                robot.heartbeat()
+                gripper.command(GRIPPER_OPEN)  # Also collects the asynchronous command acknowledgement/errors.
+                position = gripper.read()
+                if abs(position - GRIPPER_OPEN) <= 20:
+                    break
+                if clock() >= deadline:
+                    raise GripperError(
+                        f"gripper did not open for inference (position {position:.0f}); not starting policy"
+                    )
+                sleep(0.05)
+        distance, angle = pose_error(robot.poses()[0], target)
+        if distance > home.HOME_POSITION_TOLERANCE or angle > home.HOME_ROTATION_TOLERANCE:
+            raise RobotError("TCP left the saved-home tolerance while waiting for the gripper; not starting policy")
+        logger.info("saved home reached: measured error %.1f mm / %.3f rad; gripper ready", distance * 1000, angle)
 
 
 CONTROLLER_PARAMETERS = (
@@ -1396,6 +1515,11 @@ class Session:
     def run(self) -> int:
         args, robot = self.args, self.robot
         logger.info("%s run", "EXECUTE" if args.execute else "DRY")
+        logger.info(
+            "Home target from %s: xyz[m], rpy[rad] %s",
+            args.home_file or "explicit --start-pose",
+            np.round(args.start_pose, 6),
+        )
         robot.start(front_topic=args.front_topic, wrist_topic=args.wrist_topic, controller_node=args.controller_node)
         metadata: dict = {}
         policy = None
@@ -1439,6 +1563,14 @@ class Session:
             command_gripper=args.execute and self.gripper is not None,
             assumed_gripper=args.assumed_gripper,
         )
+        # Parameter/gripper setup can outlast the first camera samples. Wait for fresh observations while the
+        # controller is still inactive; execution keeps the normal fail-fast sensor checks and age limits.
+        robot.wait_ready(
+            args.ready_timeout,
+            need_tau_m=args.check or wrench_dim == 6 + TAU_M_SIZE,
+            max_observation_age=args.max_observation_age,
+            max_image_age=args.max_image_age,
+        )
         if args.check:
             self._report()
             return 0
@@ -1460,6 +1592,8 @@ class Session:
         )
         if args.warmup:
             warm_up(robot, self.planner, self.gripper, config)
+        if args.move_to_start and args.execute:
+            plan_home(robot.poses()[0], pose_from_vector(args.start_pose), self.limits, args.move_timeout)
         if args.execute and self.gripper is not None:
             self.gripper.configure()
         robot.activate(service_timeout=args.service_timeout)
@@ -1477,6 +1611,10 @@ class Session:
                     distance * 1000,
                     angle,
                 )
+        logger.info(
+            "Starting policy execution from fresh observations%s",
+            " after confirmed home arrival" if args.execute and args.move_to_start else "",
+        )
         chunks = run_chunks(robot, self.planner, self.gripper, config, self.trace)
         logger.info("finished %d chunks", chunks)
         return 0
@@ -1596,7 +1734,11 @@ class Session:
                 ok = False
             self.gripper.close()
         self.trace.close()
-        self.robot.shutdown()
+        try:
+            self.robot.shutdown()
+        except RobotError as error:
+            logger.error("%s", error)
+            ok = False
         return ok
 
 
@@ -1611,16 +1753,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     run.add_argument(
         "--max-chunks", type=int, default=30, help="1 s action chunks to run (recordings: 30 s); 0 = until Ctrl+C"
     )
-    run.add_argument("--move-to-start", action="store_true", help="first move to --start-pose and open the gripper")
     run.add_argument(
+        "--move-to-start", action="store_true", help="first reach the saved Cartesian home and open the gripper"
+    )
+    start = run.add_mutually_exclusive_group()
+    start.add_argument(
+        "--home-file",
+        type=pathlib.Path,
+        help="saved measured TCP home; default: $INFER_AR3_WS/config/cartesian_home.json in the arm workspace",
+    )
+    start.add_argument(
         "--start-pose",
         type=float,
         nargs=6,
-        default=list(DATASET_START_POSE),
         metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"),
-        help="TCP start pose (m, SDK rpy rad); default: mean recorded start",
+        help="explicit TCP home override (m, SDK rpy rad); mutually exclusive with --home-file",
     )
-    run.add_argument("--move-timeout", type=float, default=60.0)
+    run.add_argument("--move-timeout", type=float, default=home.HOME_TIMEOUT)
     run.add_argument(
         "--reanchor-at-start",
         action=argparse.BooleanOptionalAction,
@@ -1692,13 +1841,36 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "service_timeout",
         "feedback_timeout",
         "target_timeout",
+        "move_timeout",
+        "ready_timeout",
+        "max_linear_speed",
+        "max_angular_speed",
+        "max_lead_m",
+        "max_lead_rad",
+        "max_tracking_error_m",
+        "max_tracking_error_rad",
     ):
-        if not getattr(args, name) > 0:
-            parser.error(f"--{name.replace('_', '-')} must be positive")
+        if not math.isfinite(getattr(args, name)) or not getattr(args, name) > 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive and finite")
     if args.resize < 0 or args.max_chunks < 0:
         parser.error("--resize and --max-chunks must not be negative")
     if not (1 <= args.gripper_speed <= 100 and 20 <= args.gripper_force <= 100):
         parser.error("the DM gripper accepts --gripper-speed 1..100 and --gripper-force 20..100")
+    if args.start_pose is None:
+        if args.home_file is None:
+            arm_workspace = pathlib.Path(
+                os.environ.get(
+                    "INFER_AR3_WS", pathlib.Path(__file__).resolve().parents[2] / "ar3_CartesianImpedanceControl"
+                )
+            )
+            args.home_file = arm_workspace / "config/cartesian_home.json"
+        args.home_file = args.home_file.expanduser().resolve()
+        try:
+            args.start_pose = home.load_home(args.home_file, BASE_FRAME).tolist()
+        except (OSError, ValueError) as error:
+            parser.error(f"cannot load saved home {args.home_file}: {error}")
+    elif not np.isfinite(args.start_pose).all():
+        parser.error("--start-pose requires six finite xyz[m]/RPY[rad] values")
     return args
 
 

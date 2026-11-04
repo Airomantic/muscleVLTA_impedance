@@ -238,7 +238,7 @@ bash scripts/serve_ar3_lift.sh /data/jiang/train_checkpoints/pi05_ar3_lift_react
 ```bash
 ./infer_oneclick.sh                                  # impedance controller, gripper service, cameras, tilt, readiness
 ./infer_oneclick.sh --ready-only --initialize-gripper  # once after gripper power-up (MOVES the fingers)
-scripts/run_ar3_lift_robot.sh --check                # controller, cameras, gripper and policy; no motion
+scripts/run_ar3_lift_robot.sh --check                # controller, cameras and gripper; no motion
 scripts/run_ar3_lift_robot.sh --max-chunks 3         # dry run: targets only on preview_command
 scripts/run_ar3_lift_robot.sh --execute --move-to-start  # MOVES the arm and gripper
 ```
@@ -249,8 +249,58 @@ The client ([scripts/ar3_lift_robot_client.py](scripts/ar3_lift_robot_client.py)
 (`./infer_oneclick.sh` uses a 0.45 m radius; the recorded motions reach 0.43 m) and stops on stale sensors,
 tracking errors, controller faults, policy timeouts and Ctrl+C. Closing tabs is not an emergency stop: keep the
 robot's hardware stop within reach. The robot Python (`INFER_ROBOT_PYTHON`, default the gripper's `.venv-ros`) also
-needs `pip install 'websockets>=11,<18' msgpack typing_extensions pillow`. The TCP wrench component order (assumed
+needs the packages below. The launcher disables user-site packages; installing into the activated model `.venv`
+or `~/.local` does not install them into the robot environment:
+
+```bash
+PYTHONNOUSERSITE=1 ../V3_Gripper/.venv-ros/bin/python -m pip install 'websockets>=11,<18' msgpack typing_extensions pillow
+```
+
+The TCP wrench component order (assumed
 Fx, Fy, Fz, Tx, Ty, Tz) still awaits vendor or physical validation.
+
+**VS Code 本机真机调试**：打开本项目，在“运行和调试”中选择
+`AR3 LIFT：真机推理（回起点并执行）`，点击绿色三角或按 F5。配置位于
+[.vscode/launch.json](.vscode/launch.json)，默认加载 `infer_checkpoint/20000`、GPU 0、ROS domain 111。
+无需先激活 `.venv`：模型服务使用项目 Python 3.11，机器人客户端使用夹爪 Python 3.12 和 ROS Jazzy。
+启动器等待模型服务就绪，复用已有硬件，启动缺少的设备并检查传感器后，执行
+`--execute --move-to-start`（机械臂先回到录制项目保存的原点，随后机械臂和夹爪执行模型动作）。
+真机调试配置显式使用 `../ar3_CartesianImpedanceControl/config/cartesian_home.json`。
+命令行默认读取 `INFER_AR3_WS/config/cartesian_home.json`（未设置时使用上述相邻项目）；
+可用 `--home-file` 指定文件，或用互斥的 `--start-pose X Y Z ROLL PITCH YAW` 显式指定目标。
+归位使用平滑轨迹，速度不超过 `0.02 m/s`、`0.1 rad/s`，反馈落后时暂停轨迹进度。
+路径结束且实测位置误差不超过 `55 mm`、旋转误差不超过 `0.06 rad`，连续保持 `0.3 s` 后，
+才允许进入模型动作执行；归位或夹爪打开失败会终止本次推理。归位期间保留原有外力、跟踪和超时保护。
+模型预热在机械臂使能前完成；实际执行的首块动作使用归位后的新观测。
+可直接按 F5，也可先运行 `bash infer_oneclick.sh` 再按 F5；已有设备会被复用。
+`bash infer_oneclick.sh` 本身也可重复执行：保留已运行的阻抗控制器、相机、云台和夹爪服务，
+只为缺少的设备开新标签页。所有设备已运行时，在当前终端重新检查完整传感器输入并输出
+`PREPARATION READY`。遥操作、其他控制器和正在执行的推理客户端仍会阻止准备。
+相机节点发现等待 3 秒，缺少相机时再次扫描；确实缺少一路时只启动缺少的那一路。
+客户端与 Orbbec 默认发布器使用可靠图像传输、仅保留最新一帧，图像过期阈值仍为 0.2 秒。
+机械臂由相邻的 `../ar3_CartesianImpedanceControl/jazzy.sh` 启动 `cartesian_impedance_node`，
+与 `infer_oneclick.sh` 使用同一套控制器；可用 `INFER_AR3_WS` 指定其路径。
+夹爪上电后的初始化仍需显式运行上面的 `--ready-only --initialize-gripper` 命令。
+
+另有“检查（复用已启动硬件）”和“预览 3 块”配置。检查入口同时验证模型服务健康状态与机器人输入，
+预览入口运行真实模型但只发布预览目标。模型日志在 `logs/ar3_lift_policy_debug_*.log`。
+退出调试时清理本次启动的模型服务，硬件服务继续保留。若 8000 端口已有服务，启动器会报出冲突；
+确认已有服务就是所需模型后，可在 `args` 中的 `--` 之前加入 `--reuse-policy`。
+
+本机手腕 Gemini 305 使用 `outputs/orbbec_wrist_driver/overlay` 中已验证的驱动补丁，
+避免系统驱动重复启动 V4L2 视频流后无图像；该本地目录需保留。
+`INFER_WRIST_DRIVER_OVERLAY` 可指定其他补丁目录。补丁只应用于手腕相机。
+准备流程会读取手腕相机实际帧的 metadata，确认自动曝光和自动白平衡关闭、曝光 `80`、增益 `16`、
+白平衡 `4600 K`；复用已运行相机时也会检查。参数不符会报告实际值；收不到有效 metadata 也会停止准备。
+
+可在 [scripts/ar3_lift_robot_client.py](scripts/ar3_lift_robot_client.py) 中设置断点。
+真机执行时暂停会触发原有超时保护；恢复调试后应重新启动该推理会话。观察动作处理逻辑优先使用预览配置。
+对应的命令行入口是：
+
+```bash
+scripts/ar3_lift_debug_python.sh scripts/debug_ar3_lift_robot.py -- --execute --move-to-start \
+  --home-file ../ar3_CartesianImpedanceControl/config/cartesian_home.json
+```
 
 ## 🙏 Acknowledgements
 
