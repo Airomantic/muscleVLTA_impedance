@@ -74,6 +74,7 @@ class ResidualTargetBuilder:
         action_dim: int,
         action_scale: Sequence[float] | None = None,
         intervention_value: float = DEFAULT_INTERVENTION_VALUE,
+        wrench_dim: int = 6,
     ):
         if batch_size <= 0:
             raise ValueError("Residual target batch size must be positive.")
@@ -81,6 +82,7 @@ class ResidualTargetBuilder:
         self._rollout = rollout
         self._batch_size = batch_size
         self._target_shape = (action_horizon, action_dim)
+        self._wrench_dim = wrench_dim
         self._action_scale = np.asarray(action_scale if action_scale is not None else (1.0,), dtype=np.float32)
         if self._action_scale.ndim != 1 or not 0 < self._action_scale.size <= action_dim:
             raise ValueError(
@@ -189,7 +191,7 @@ class ResidualTargetBuilder:
             raise ValueError(f"Transformed actions have shape {actions.shape}; expected {self._target_shape}.")
 
         if transformed.get("wrench") is None:
-            transformed["wrench"] = np.zeros((self._target_shape[0], 6), dtype=np.float32)
+            transformed["wrench"] = np.zeros((self._target_shape[0], self._wrench_dim), dtype=np.float32)
             transformed["wrench_mask"] = np.asarray(0, dtype=np.bool_)
         else:
             transformed["wrench_mask"] = np.asarray(1, dtype=np.bool_)

@@ -1,14 +1,15 @@
 """Compute normalization statistics after applying a config's data transforms.
 
 Run with --config-name CONFIG after setting its dataset repo_id. Statistics are
-written to <config.assets_dirs>/<repo_id>/norm_stats.json (by default,
-assets/<config>/<repo_id>/norm_stats.json), not to a pretrained checkpoint.
-To train with them, point AssetsConfig.assets_dir at assets/<config> and set
-asset_id to the repo_id. Reuse pretrained statistics only if their observation
-and action conventions match your data.
+written to <config.assets_dirs>/<asset_id>/norm_stats.json (by default,
+assets/<config>/<repo_id>/norm_stats.json; the asset_id defaults to the repo_id),
+not to a pretrained checkpoint. To train with them, point AssetsConfig.assets_dir
+at assets/<config> and keep the same asset_id. Reuse pretrained statistics only if
+their observation and action conventions match your data.
 
 --max-frames optionally limits the dataset scan. State, action, and wrench
 statistics are computed only for fields present in the transformed batches.
+Videos of LeRobot v3.0 datasets are not decoded (the statistics do not use images).
 """
 
 import numpy as np
@@ -37,7 +38,7 @@ def create_torch_dataloader(
 ) -> tuple[_data_loader.Dataset, int]:
     if data_config.repo_id is None:
         raise ValueError("Data config must have a repo_id")
-    dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
+    dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config, decode_videos=False)
     dataset = _data_loader.TransformedDataset(
         dataset,
         [
@@ -82,7 +83,7 @@ def main(config_name: str, max_frames: int | None = None):
 
     norm_stats = {key: stat.get_statistics() for key, stat in stats.items() if stat.count > 1}
 
-    output_path = config.assets_dirs / data_config.repo_id
+    output_path = config.assets_dirs / (data_config.asset_id or data_config.repo_id)
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 

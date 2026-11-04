@@ -18,6 +18,7 @@ from lerobot.common.datasets.utils import get_episode_data_index
 import numpy as np
 import torch
 
+from openpi.data import lerobot_v3 as _lerobot_v3
 import openpi.models.model as _model
 from openpi.shared.episode_schema import CONTROL_FLAG_FEATURE_NAME
 from openpi.shared.episode_schema import CONTROL_FLAG_FEATURE_SPEC
@@ -95,15 +96,50 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+def _create_lerobot_v3_dataset(data_config: _config.DataConfig, action_horizon: int, *, decode_videos: bool) -> Dataset:
+    """LeRobot v3.0 datasets are read natively; the pinned LeRobot v2.1 library cannot load them."""
+    repo_id = data_config.repo_id
+    meta = _lerobot_v3.LeRobotV3Metadata(repo_id)
+    available_features = set(meta.numeric_keys)
+    action_sequence_keys = tuple(key for key in data_config.action_sequence_keys if key in available_features)
+    if missing_keys := tuple(key for key in data_config.action_sequence_keys if key not in available_features):
+        logging.info(
+            "Dataset %s does not contain optional sequence keys %s; loading the available keys only.",
+            repo_id,
+            missing_keys,
+        )
+    if "actions" not in action_sequence_keys:
+        raise ValueError(f"Dataset {repo_id} does not contain the required 'actions' feature.")
+    dataset = _lerobot_v3.LeRobotV3Dataset(
+        repo_id,
+        sequence_keys=action_sequence_keys,
+        sequence_length=action_horizon,
+        options=_lerobot_v3.LeRobotV3Options(decode_videos=decode_videos),
+    )
+    if data_config.prompt_from_task:
+        return TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(meta.tasks)])
+    return dataset
+
+
 def create_torch_dataset(
-    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    model_config: _model.BaseModelConfig,
+    *,
+    decode_videos: bool = True,
 ) -> Dataset:
-    """Create a dataset for training."""
+    """Create a dataset for training.
+
+    ``decode_videos=False`` returns small placeholder images for LeRobot v3.0 datasets (e.g. for normalization
+    statistics, which do not depend on the images).
+    """
     repo_id = data_config.repo_id
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
+    if _lerobot_v3.is_lerobot_v3_dataset(repo_id):
+        return _create_lerobot_v3_dataset(data_config, action_horizon, decode_videos=decode_videos)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     available_features = set(dataset_meta.features)
@@ -838,12 +874,14 @@ class HybridDataLoader:
         sharding: jax.sharding.Sharding | None = None,
         num_batches: int | None = None,
         seed: int = 0,
+        wrench_dim: int = 6,
     ):
         self._dataset = dataset
         self._transform = _transforms.compose(transforms)
         self._local_batch_size = local_batch_size
         self._num_batches = num_batches
         self._rng = np.random.default_rng(seed)
+        self._wrench_dim = wrench_dim
 
         if jax.process_count() > 1:
             raise NotImplementedError("Data loading with multiple processes is not supported.")
@@ -880,7 +918,7 @@ class HybridDataLoader:
                             self._dataset.get_residual_target(is_online=is_online, idx=idx), dtype=np.float32
                         )
                     if item.get("wrench") is None:
-                        item["wrench"] = np.zeros((item["actions"].shape[0], 6), dtype=np.float32)
+                        item["wrench"] = np.zeros((item["actions"].shape[0], self._wrench_dim), dtype=np.float32)
                         wrench_mask.append(False)
                     else:
                         wrench_mask.append(True)
@@ -1032,6 +1070,7 @@ def create_hybrid_data_loader(
             action_dim=config.model.action_dim,
             action_scale=config.model.residual_action_scale,
             intervention_value=config.model.residual_intervention_value,
+            wrench_dim=getattr(config.model, "wrench_dim", 6),
         )
 
     dataset = HybridDataset(
@@ -1066,6 +1105,7 @@ def create_hybrid_data_loader(
         sharding=sharding,
         num_batches=num_batches,
         seed=config.seed,
+        wrench_dim=getattr(config.model, "wrench_dim", 6),
     )
 
     return HybridDataLoaderImpl(data_config, data_loader)

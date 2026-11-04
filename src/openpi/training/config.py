@@ -37,6 +37,7 @@ import tyro
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.tokenizer as _tokenizer
+import openpi.policies.ar3_lift_policy as ar3_lift_policy
 from openpi.policies.flexiv_transforms import ACTION_NAMES
 import openpi.policies.single_iphone_flexiv_policy as single_iphone_flexiv_policy
 import openpi.shared.download as _download
@@ -60,6 +61,14 @@ _DEFAULT_TOWEL_CHECKPOINT_DIR = pathlib.Path(
 ).expanduser()
 _DEFAULT_TOWEL_REPO_ID = os.environ.get("OPENPI_TOWEL_REPO_ID", "flexiv/towelv3_100")
 _DEFAULT_TOWEL_ASSET_ID = os.environ.get("OPENPI_TOWEL_ASSET_ID", "flexiv/towelv3_100")
+# AR3 Cartesian impedance + DM V3 gripper presets (pi05_ar3_lift*): a local LeRobot v3.0 dataset directory, the
+# normalization asset id (assets/<config>/<asset_id>/norm_stats.json; default: the dataset directory name) and the
+# initialization params (default: pi05_base).
+_DEFAULT_AR3_REPO_ID = os.environ.get("OPENPI_AR3_REPO_ID", "/data/jiang/ar3_eef_forceVisuoTactaile_front_wrist")
+_DEFAULT_AR3_ASSET_ID = os.environ.get("OPENPI_AR3_ASSET_ID") or pathlib.Path(_DEFAULT_AR3_REPO_ID).name
+_DEFAULT_AR3_WEIGHT_PATH = os.environ.get(
+    "OPENPI_AR3_WEIGHT_PATH", "/data/jiang/checkpoints/openpi-assets/checkpoints/pi05_base/params"
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -276,6 +285,68 @@ class LeRobotSingleiPhoneFlexivDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotAR3LiftDataConfig(DataConfigFactory):
+    """Map AR3 Cartesian impedance LeRobot v3.0 samples (recorder training_schema "lift") to LIFT policy inputs.
+
+    State is the measured TCP pose (xyz + rotation vector, robot base frame) and gripper opening (0 closed ...
+    1000 open); actions are the accepted absolute TCP targets and gripper targets. As in the LIFT presets,
+    extra_delta_transform makes the actions relative to the observed TCP pose. The wrist camera is the LIFT
+    left wrist image, the front camera fills the base image slot (use_front_camera), and force-aware models
+    receive the measured force_keys sequences (concatenated per step) over the action horizon as wrench.
+    See src/openpi/policies/ar3_lift_policy.py for the robot-client keys used at inference.
+    """
+
+    extra_delta_transform: bool = True
+    use_front_camera: bool = True
+    # Force signals concatenated per step; their total width must equal Pi0Config.wrench_dim.
+    force_keys: tuple[str, ...] = ar3_lift_policy.FORCE_KEYS_WRENCH_TAU_M
+    use_wrench: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig, *args, **kwargs) -> DataConfig:
+        include_wrench = (
+            self.use_wrench
+            or getattr(model_config, "reactive_in_use", False)
+            or getattr(model_config, "residual_policy_in_use", False)
+        )
+        force_keys = tuple(self.force_keys) if include_wrench else ()
+        if include_wrench:
+            wrench_dim = getattr(model_config, "wrench_dim", 6)
+            if ar3_lift_policy.force_dim(force_keys) != wrench_dim:
+                raise ValueError(
+                    f"force_keys {force_keys} give {ar3_lift_policy.force_dim(force_keys)}D force, "
+                    f"but the model expects wrench_dim={wrench_dim}."
+                )
+
+        repack_transform = _transforms.Group(
+            inputs=[ar3_lift_policy.AR3LiftRepack(force_keys=force_keys, use_front_camera=self.use_front_camera)]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[
+                ar3_lift_policy.AR3LiftInputs(
+                    model_type=model_config.model_type,
+                    use_front_camera=self.use_front_camera,
+                    action_horizon=model_config.action_horizon,
+                )
+            ],
+            outputs=[ar3_lift_policy.AR3LiftOutputs()],
+        )
+        if self.extra_delta_transform:
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.IPhoneZeroStateAndRealRelativeActions(bimanual=False)],
+                outputs=[_transforms.IPhoneIdentityActions(bimanual=False)],
+            )
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            action_names=ar3_lift_policy.ACTION_NAMES,
+            action_sequence_keys=("actions", *force_keys),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory()(model_config),
         )
 
 
@@ -501,6 +572,52 @@ pi05_residual_debug = dataclasses.replace(
     residual_dropout_rate=0.0,
     residual_wrench_hidden_dim=32,
 )
+
+# AR3 LIFT presets: the pi05_iPhoneSingle_*_reactive recipe on the AR3 Cartesian impedance dataset. The reactive
+# expert reads the measured TCP wrench and, by default, the 7 measured joint torques tau_m (13D force).
+pi05_ar3_lift_reactive = pi0_config.Pi0Config(
+    pi05=True,
+    action_horizon=10,
+    discrete_state_input=False,
+    reactive_in_use=True,
+    use_state=False,
+    original_head=False,
+    cross_attention_latency=3,
+    wrench_dim=ar3_lift_policy.force_dim(ar3_lift_policy.FORCE_KEYS_WRENCH_TAU_M),
+)
+
+
+def _ar3_lift_train_config(
+    name: str, model: pi0_config.Pi0Config, force_keys: tuple[str, ...] = ar3_lift_policy.FORCE_KEYS_WRENCH_TAU_M
+) -> TrainConfig:
+    """Batch 96 = 32 per GPU with FSDP over 3 GPUs; override --batch-size / --fsdp-devices for other setups."""
+    return TrainConfig(
+        name=name,
+        model=model,
+        data=LeRobotAR3LiftDataConfig(
+            repo_id=_DEFAULT_AR3_REPO_ID,
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+            force_keys=force_keys,
+            assets=AssetsConfig(asset_id=_DEFAULT_AR3_ASSET_ID),
+        ),
+        batch_size=96,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(_DEFAULT_AR3_WEIGHT_PATH),
+        copy_reactive_from_action_expert=model.reactive_in_use,
+        num_train_steps=30_000,
+        keep_period=5000,
+        num_workers=16,
+        fsdp_devices=3,
+    )
+
 
 # Use `get_config` if you need to get a config by name in your
 _CONFIGS = [
@@ -732,6 +849,15 @@ _CONFIGS = [
         fsdp_devices=1,
         online_use_wrench=True,
     ),
+    _ar3_lift_train_config("pi05_ar3_lift_reactive", pi05_ar3_lift_reactive),
+    _ar3_lift_train_config(
+        "pi05_ar3_lift_reactive_wrench6",
+        dataclasses.replace(pi05_ar3_lift_reactive, wrench_dim=6),
+        force_keys=ar3_lift_policy.FORCE_KEYS_WRENCH,
+    ),
+    # Vision-only pi05 (LIFT's offline stage); its params can initialize the reactive presets via
+    # OPENPI_AR3_WEIGHT_PATH, like the Book preset initializes from an offline checkpoint.
+    _ar3_lift_train_config("pi05_ar3_lift", dataclasses.replace(pi05_ar3_lift_reactive, reactive_in_use=False)),
     TrainConfig(
         name="debug",
         data=FakeDataConfig(),
