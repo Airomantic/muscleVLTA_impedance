@@ -1,0 +1,211 @@
+{
+  // AR3 LIFT 真机推理与 DAgger（边缘电脑）。先在终端运行 ./infer_oneclick.sh（DAgger 用 ./infer_oneclick.sh --dagger），
+  // 等到 PREPARATION READY：机械臂由 ../ar3_CartesianImpedanceControl 的笛卡尔阻抗控制器执行。
+  // 策略服务（127.0.0.1:8000）：本机 GPU 用最后一个配置，或在 GPU 服务器运行 bash scripts/serve_ar3_lift.sh <step目录>
+  // 并在边缘电脑 ssh -N -L 8000:127.0.0.1:8000 <user>@<server>。
+  // 机器人侧配置经 scripts/ar3_python.sh 运行：../V3_Gripper/.venv-ros 的 Python 3.12 + ROS 2 Jazzy，ROS 域 111。
+  // 录制（--record-dir）需要该 Python 安装 pyarrow av；录制内容同 lerobot 的 AR3_record_dataset（front/wrist 视频、
+  // tcp_pose、夹爪开度、tcp_wrench、tau_m、7 维 action、control_flag），每段结束后终端询问保存/丢弃。
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // 只读检查：控制器、相机、夹爪和策略服务；不动。
+      "name": "AR3 LIFT: 检查 (--check, 不动)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/scripts/ar3_python.sh",
+      "debugAdapterPython": "/usr/bin/python3",
+      "debugLauncherPython": "/usr/bin/python3",
+      "program": "${workspaceFolder}/scripts/ar3_lift_robot_client.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "subProcess": false,
+      "env": {
+        "INFER_ROBOT_PYTHON": "${workspaceFolder}/../V3_Gripper/.venv-ros/bin/python",
+        "INFER_ROS_SETUP": "/opt/ros/jazzy/setup.bash",
+        "INFER_ROS_DOMAIN_ID": "111",
+        "ROS_LOG_DIR": "${workspaceFolder}/outputs/ros_logs"
+      },
+      "args": ["--check"],
+      "presentation": { "group": "AR3 LIFT", "order": 1 }
+    },
+    {
+      // 试运行：推理 3 个 chunk，目标只发到 preview_command；机械臂和夹爪不动。
+      "name": "AR3 LIFT: 试运行 (3 chunks, 不动)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/scripts/ar3_python.sh",
+      "debugAdapterPython": "/usr/bin/python3",
+      "debugLauncherPython": "/usr/bin/python3",
+      "program": "${workspaceFolder}/scripts/ar3_lift_robot_client.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "subProcess": false,
+      "env": {
+        "INFER_ROBOT_PYTHON": "${workspaceFolder}/../V3_Gripper/.venv-ros/bin/python",
+        "INFER_ROS_SETUP": "/opt/ros/jazzy/setup.bash",
+        "INFER_ROS_DOMAIN_ID": "111",
+        "ROS_LOG_DIR": "${workspaceFolder}/outputs/ros_logs"
+      },
+      "args": ["--max-chunks", "3"],
+      "presentation": { "group": "AR3 LIFT", "order": 2 }
+    },
+    {
+      // LIVE 推理并录制：每段先回到数据集起始位姿再执行策略；终端 Enter 提前结束一段，随后 Enter/s 保存、d 丢弃、q 保存并退出。
+      // 纯策略段 control_flag=1，不参与 DAgger 训练，仅用于评估和回看。
+      "name": "AR3 LIFT: LIVE 推理+录制 (MOVES ARM + GRIPPER)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/scripts/ar3_python.sh",
+      "debugAdapterPython": "/usr/bin/python3",
+      "debugLauncherPython": "/usr/bin/python3",
+      "program": "${workspaceFolder}/scripts/ar3_lift_robot_client.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "subProcess": false,
+      "env": {
+        "INFER_ROBOT_PYTHON": "${workspaceFolder}/../V3_Gripper/.venv-ros/bin/python",
+        "INFER_ROS_SETUP": "/opt/ros/jazzy/setup.bash",
+        "INFER_ROS_DOMAIN_ID": "111",
+        "ROS_LOG_DIR": "${workspaceFolder}/outputs/ros_logs"
+      },
+      "args": ["--execute", "--record-dir", "${workspaceFolder}/outputs/ar3_lift_rollouts"],
+      "presentation": { "group": "AR3 LIFT", "order": 3 }
+    },
+    {
+      // LIVE 单次推理（不录制）：移到起始位姿后执行策略，Ctrl+C 停止。
+      "name": "AR3 LIFT: LIVE 单次不录制 (MOVES ARM + GRIPPER)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/scripts/ar3_python.sh",
+      "debugAdapterPython": "/usr/bin/python3",
+      "debugLauncherPython": "/usr/bin/python3",
+      "program": "${workspaceFolder}/scripts/ar3_lift_robot_client.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "subProcess": false,
+      "env": {
+        "INFER_ROBOT_PYTHON": "${workspaceFolder}/../V3_Gripper/.venv-ros/bin/python",
+        "INFER_ROS_SETUP": "/opt/ros/jazzy/setup.bash",
+        "INFER_ROS_DOMAIN_ID": "111",
+        "ROS_LOG_DIR": "${workspaceFolder}/outputs/ros_logs"
+      },
+      "args": ["--execute", "--move-to-start"],
+      "presentation": { "group": "AR3 LIFT", "order": 4 }
+    },
+    {
+      // DAgger 只读检查（需 ./infer_oneclick.sh --dagger）：遥操作 dry_run=false、离合松开、夹爪只由门控节点驱动。
+      "name": "AR3 LIFT DAgger: 检查 (--check --dagger, 不动)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/scripts/ar3_python.sh",
+      "debugAdapterPython": "/usr/bin/python3",
+      "debugLauncherPython": "/usr/bin/python3",
+      "program": "${workspaceFolder}/scripts/ar3_lift_robot_client.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "subProcess": false,
+      "env": {
+        "INFER_ROBOT_PYTHON": "${workspaceFolder}/../V3_Gripper/.venv-ros/bin/python",
+        "INFER_ROS_SETUP": "/opt/ros/jazzy/setup.bash",
+        "INFER_ROS_DOMAIN_ID": "111",
+        "ROS_LOG_DIR": "${workspaceFolder}/outputs/ros_logs"
+      },
+      "args": ["--check", "--dagger"],
+      "presentation": { "group": "AR3 LIFT", "order": 5 }
+    },
+    {
+      // DAgger 纠正采集：策略执行，发现不好时按住遥操作离合（/clutch/right）立即接管机械臂；扳机先对齐手指开度后夹爪才跟随。
+      // 完成任务后松开离合即结束本段，终端选择保存/丢弃。只有全程人工控制的 action chunk（control_flag=-1）用于训练。
+      "name": "AR3 LIFT DAgger: 推理+接管纠正采集 (MOVES ARM + GRIPPER)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/scripts/ar3_python.sh",
+      "debugAdapterPython": "/usr/bin/python3",
+      "debugLauncherPython": "/usr/bin/python3",
+      "program": "${workspaceFolder}/scripts/ar3_lift_robot_client.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "subProcess": false,
+      "env": {
+        "INFER_ROBOT_PYTHON": "${workspaceFolder}/../V3_Gripper/.venv-ros/bin/python",
+        "INFER_ROS_SETUP": "/opt/ros/jazzy/setup.bash",
+        "INFER_ROS_DOMAIN_ID": "111",
+        "ROS_LOG_DIR": "${workspaceFolder}/outputs/ros_logs"
+      },
+      "args": ["--execute", "--dagger", "--record-dir", "${input:ar3LiftDaggerDir}"],
+      "presentation": { "group": "AR3 LIFT", "order": 6 }
+    },
+    {
+      // DAgger 夹爪门控只读检查：读夹爪、打印扳机 -> 目标开度 10 s，不写夹爪。门控本身由 ./infer_oneclick.sh --dagger 启动。
+      "name": "AR3 LIFT DAgger: 夹爪门控检查 (--check, 不动)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/scripts/ar3_python.sh",
+      "debugAdapterPython": "/usr/bin/python3",
+      "debugLauncherPython": "/usr/bin/python3",
+      "program": "${workspaceFolder}/scripts/ar3_dagger_gripper_teleop.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "subProcess": false,
+      "env": {
+        "INFER_ROBOT_PYTHON": "${workspaceFolder}/../V3_Gripper/.venv-ros/bin/python",
+        "INFER_ROS_SETUP": "/opt/ros/jazzy/setup.bash",
+        "INFER_ROS_DOMAIN_ID": "111",
+        "ROS_LOG_DIR": "${workspaceFolder}/outputs/ros_logs"
+      },
+      "args": ["--check"],
+      "presentation": { "group": "AR3 LIFT", "order": 7 }
+    },
+    {
+      // 在本机 GPU 0 上服务策略（同 scripts/serve_ar3_lift.sh；需本仓库 .venv 和 ~/.cache/openpi/big_vision/paligemma_tokenizer.model）。
+      // DAgger 训练出的 checkpoint 也用 pi05_ar3_lift_reactive 服务。
+      "name": "AR3 LIFT: 本机 GPU 服务策略 (127.0.0.1:8000)",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "program": "${workspaceFolder}/scripts/serve_policy.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "subProcess": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/src:${workspaceFolder}/packages/openpi-client/src",
+        "PYTHONUNBUFFERED": "1",
+        "LD_LIBRARY_PATH": "",
+        "CUDA_VISIBLE_DEVICES": "0",
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false"
+      },
+      "args": [
+        "--config-name", "pi05_ar3_lift_reactive",
+        "--checkpoint-dir", "${input:ar3LiftCheckpoint}",
+        "--host", "127.0.0.1",
+        "--port", "8000",
+        "--default-prompt",
+        "Unplug the white charging plug from the white socket and place it on the table, don't bump your fingers into other objects"
+      ],
+      "presentation": { "group": "AR3 LIFT", "order": 8 }
+    }
+  ],
+  "inputs": [
+    {
+      "id": "ar3LiftDaggerDir",
+      "type": "promptString",
+      "description": "DAgger 纠正数据集目录（LeRobot v3.0，已存在则追加；建议每轮一个；相对路径相对本仓库）",
+      "default": "outputs/ar3_lift_dagger/round1"
+    },
+    {
+      "id": "ar3LiftCheckpoint",
+      "type": "promptString",
+      "description": "策略 checkpoint 的 step 目录（含 params/ 和 assets/；相对路径相对本仓库）",
+      "default": "infer_checkpoint/29999"
+    }
+  ]
+}

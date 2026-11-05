@@ -403,3 +403,32 @@ def test_gripper_gate_runner_checks_the_gripper_modules_and_runs_in_a_clean_ros_
     assert not any(line.startswith("PYTHONPATH=") for line in lines)
     gate = ROOT / "scripts/ar3_dagger_gripper_teleop.py"
     assert lines[-1] == f"ARGS -u {gate} --gripper-address 10.0.0.9:50008 --check"
+
+
+def test_debugger_python_passes_every_argument_through_and_keeps_only_debugger_variables(environment, tmp_path):
+    log = tmp_path / "python-calls"
+    environment["INFER_ROBOT_PYTHON"] = str(
+        _executable(
+            tmp_path / "robot-python",
+            f'#!/bin/bash\n{{ env; printf "ARGS %s\\n" "$*"; }} >> {shlex.quote(str(log))}\n',
+        )
+    )
+    environment.update(
+        {
+            "DEBUGPY_LOG_DIR": "/debug/logs",
+            "PYDEVD_USE_FRAME_EVAL": "NO",
+            "ROS_LOG_DIR": "/ros/logs",
+            "PYTHONPATH": "/model/src",
+            "VIRTUAL_ENV": "/model/.venv",
+        }
+    )
+    client = ROOT / "scripts/ar3_lift_robot_client.py"
+    args = ["/ext/debugpy", "--connect", "127.0.0.1:5678", str(client), "--check", "--dagger"]
+    result = run(environment, *args, script=ROOT / "scripts/ar3_python.sh")
+    assert result.returncode == 0, result.stderr
+    lines = log.read_text().splitlines()
+    for kept in ("DEBUGPY_LOG_DIR=/debug/logs", "PYDEVD_USE_FRAME_EVAL=NO", "ROS_LOG_DIR=/ros/logs", "DISPLAY=:mock"):
+        assert kept in lines
+    assert "ROS_DOMAIN_ID=111" in lines
+    assert not any(line.startswith(("PYTHONPATH=", "VIRTUAL_ENV=")) for line in lines)
+    assert lines[-1] == "ARGS " + " ".join(args)

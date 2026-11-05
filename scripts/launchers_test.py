@@ -1,10 +1,15 @@
+import json
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
 
 import pytest
+
+from scripts import ar3_dagger_gripper_teleop as gate
+from scripts import ar3_lift_robot_client as client
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 
@@ -147,3 +152,18 @@ def test_ar3_dagger_launcher_continues_offline_checkpoint(launcher_env, tmp_path
     result = run_launcher("train_ar3_lift_dagger_gpu012.sh", launcher_env, str(step), str(tmp_path / "missing"))
     assert result.returncode == 1
     assert "not a LeRobot v3.0 recording" in result.stderr
+
+
+def test_vscode_robot_configurations_run_the_ros_python_with_arguments_the_scripts_accept():
+    root = SCRIPTS_DIR.parent
+    text = (root / ".vscode" / "launch.json").read_text()
+    # VS Code accepts comments in launch.json; this file only has whole-line comments.
+    launch = json.loads("\n".join(line for line in text.splitlines() if not line.lstrip().startswith("//")))
+    parsers = {"ar3_lift_robot_client.py": client.parse_args, "ar3_dagger_gripper_teleop.py": gate.parse_args}
+    robot = [config for config in launch["configurations"] if config["python"].endswith("/scripts/ar3_python.sh")]
+    assert robot
+    for config in robot:
+        program = Path(config["program"].replace("${workspaceFolder}", str(root)))
+        assert program.is_file(), config["name"]
+        parsers[program.name](config["args"])
+    assert set(re.findall(r"\$\{input:(\w+)\}", text)) == {item["id"] for item in launch["inputs"]}
