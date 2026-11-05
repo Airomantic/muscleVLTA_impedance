@@ -1,6 +1,7 @@
 # Local data and model artifacts.
 assets/
 checkpoints/
+infer_checkpoint/
 /data/
 wandb/
 artifacts/
@@ -18,6 +19,7 @@ __pycache__/
 .env.*
 
 # Local logs and generated reports.
+logs/
 *.log
 *.tmp
 *.swp

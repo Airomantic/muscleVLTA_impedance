@@ -1784,7 +1784,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     policy.add_argument("--port", type=int, default=8000)
     policy.add_argument("--api-key", default=None)
     policy.add_argument("--connect-timeout", type=float, default=120.0)
-    policy.add_argument("--prompt", default=DEFAULT_PROMPT)
+    policy.add_argument(
+        "--task",
+        "--prompt",
+        dest="prompt",
+        default=DEFAULT_PROMPT,
+        help="task instruction sent to the policy for warm-up and every action chunk",
+    )
     policy.add_argument(
         "--mode", choices=("auto", "reactive", "infer"), default="auto", help="auto: reactive for force-reactive models"
     )

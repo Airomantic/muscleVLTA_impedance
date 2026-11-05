@@ -227,8 +227,23 @@ def main(argv: list[str] | None = None) -> int:
             log_path = log_dir / f"ar3_lift_policy_debug_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}.log"
             log_file = log_path.open("w")
             LOGGER.info("Loading %s; policy output: %s", args.checkpoint, log_path)
+            # VS Code can SIGKILL the debuggee, bypassing finally. Bind the model
+            # to this owner before exec while retaining its separate process group.
+            owned_serve = [
+                sys.executable,
+                str(ROOT / "scripts/ar3_lift_policy_process.py"),
+                "--parent-pid",
+                str(os.getpid()),
+                "--",
+                *serve,
+            ]
             process = subprocess.Popen(
-                serve, cwd=ROOT, env=environment, stdout=log_file, stderr=subprocess.STDOUT, start_new_session=True
+                owned_serve,
+                cwd=ROOT,
+                env=environment,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
             )
             deadline = time.monotonic() + args.policy_start_timeout
             next_status = time.monotonic() + 15

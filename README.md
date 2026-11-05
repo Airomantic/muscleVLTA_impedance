@@ -262,6 +262,9 @@ Fx, Fy, Fz, Tx, Ty, Tz) still awaits vendor or physical validation.
 **VS Code 本机真机调试**：打开本项目，在“运行和调试”中选择
 `AR3 LIFT：真机推理（回起点并执行）`，点击绿色三角或按 F5。配置位于
 [.vscode/launch.json](.vscode/launch.json)，默认加载 `infer_checkpoint/20000`、GPU 0、ROS domain 111。
+每个 Debug 配置的 `args` 都显式包含 `--task=Unplug ...`；切换任务时修改等号后的整段提示词，
+保留为一个 JSON 字符串，并放在参数分隔符 `--` 后。该提示词用于模型预热和每块动作推理；
+命令行的 `--prompt` 仍可作为同义参数使用。
 无需先激活 `.venv`：模型服务使用项目 Python 3.11，机器人客户端使用夹爪 Python 3.12 和 ROS Jazzy。
 启动器等待模型服务就绪，复用已有硬件，启动缺少的设备并检查传感器后，执行
 `--execute --move-to-start`（机械臂先回到录制项目保存的原点，随后机械臂和夹爪执行模型动作）。
@@ -284,7 +287,9 @@ Fx, Fy, Fz, Tx, Ty, Tz) still awaits vendor or physical validation.
 
 另有“检查（复用已启动硬件）”和“预览 3 块”配置。检查入口同时验证模型服务健康状态与机器人输入，
 预览入口运行真实模型但只发布预览目标。模型日志在 `logs/ar3_lift_policy_debug_*.log`。
-退出调试时清理本次启动的模型服务，硬件服务继续保留。若 8000 端口已有服务，启动器会报出冲突；
+退出调试时清理本次启动的模型服务，硬件服务继续保留；模型进程在启动前绑定调试进程的生命周期，
+即使 VS Code 强制结束调试，也会自动结束该模型进程，避免遗留端口和 GPU 占用。
+若 8000 端口已有其他服务，启动器会报出冲突；
 确认已有服务就是所需模型后，可在 `args` 中的 `--` 之前加入 `--reuse-policy`。
 
 本机手腕 Gemini 305 使用 `outputs/orbbec_wrist_driver/overlay` 中已验证的驱动补丁，

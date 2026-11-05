@@ -1,0 +1,75 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "AR3 LIFT：真机推理（回起点并执行）",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/scripts/ar3_lift_debug_python.sh",
+            "program": "${workspaceFolder}/scripts/debug_ar3_lift_robot.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "subProcess": false,
+            "env": {
+                "INFER_ROS_DOMAIN_ID": "111",
+                "INFER_AR3_WS": "${workspaceFolder}/../ar3_CartesianImpedanceControl",
+                "OPENPI_PYTHON": "${workspaceFolder}/.venv/bin/python",
+                "OPENPI_SERVE_GPU": "0"
+            },
+            "args": [
+                "--checkpoint", "${workspaceFolder}/infer_checkpoint/20000",
+                "--hardware", "auto",
+                "--", "--execute", "--move-to-start",
+                "--home-file", "${workspaceFolder}/../ar3_CartesianImpedanceControl/config/cartesian_home.json",
+                "--task=Unplug the white charging plug from the white socket and place it on the table, don't bump your fingers into other objects"
+            ]
+        },
+        {
+            "name": "AR3 LIFT：检查（复用已启动硬件）",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/scripts/ar3_lift_debug_python.sh",
+            "program": "${workspaceFolder}/scripts/debug_ar3_lift_robot.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "subProcess": false,
+            "env": {
+                "INFER_ROS_DOMAIN_ID": "111",
+                "INFER_AR3_WS": "${workspaceFolder}/../ar3_CartesianImpedanceControl",
+                "OPENPI_PYTHON": "${workspaceFolder}/.venv/bin/python",
+                "OPENPI_SERVE_GPU": "0"
+            },
+            "args": [
+                "--checkpoint", "${workspaceFolder}/infer_checkpoint/20000",
+                "--hardware", "skip",
+                "--", "--check",
+                "--task=Unplug the white charging plug from the white socket and place it on the table, don't bump your fingers into other objects"
+            ]
+        },
+        {
+            "name": "AR3 LIFT：预览 3 块（不执行机械臂和夹爪动作）",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/scripts/ar3_lift_debug_python.sh",
+            "program": "${workspaceFolder}/scripts/debug_ar3_lift_robot.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "subProcess": false,
+            "env": {
+                "INFER_ROS_DOMAIN_ID": "111",
+                "INFER_AR3_WS": "${workspaceFolder}/../ar3_CartesianImpedanceControl",
+                "OPENPI_PYTHON": "${workspaceFolder}/.venv/bin/python",
+                "OPENPI_SERVE_GPU": "0"
+            },
+            "args": [
+                "--checkpoint", "${workspaceFolder}/infer_checkpoint/20000",
+                "--hardware", "auto",
+                "--", "--max-chunks", "3",
+                "--task=Unplug the white charging plug from the white socket and place it on the table, don't bump your fingers into other objects"
+            ]
+        }
+    ]
+}
