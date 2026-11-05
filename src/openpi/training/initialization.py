@@ -118,6 +118,13 @@ def init_train_state(
     state_sharding = sharding.fsdp_sharding(train_state_shape, mesh, log=True)
 
     if resume and not getattr(config.model, "residual_policy_in_use", False):
+        # Attach the current mesh's sharding so Orbax reshards on restore (e.g. resuming a 3-GPU run on 4 GPUs);
+        # otherwise it restores the saved layout, which fails under a different fsdp mesh.
+        train_state_shape = jax.tree.map(
+            lambda shape, shard: jax.ShapeDtypeStruct(shape.shape, shape.dtype, sharding=shard),
+            train_state_shape,
+            state_sharding,
+        )
         return train_state_shape, state_sharding
 
     partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.params.to_pure_dict())

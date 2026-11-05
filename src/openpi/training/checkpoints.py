@@ -104,12 +104,19 @@ def restore_state(
         # Split params that can be used for inference into a separate item.
         checkpoint_state = _filter_checkpoint_params(state, params_filter)
         train_state, params = _split_params(checkpoint_state)
+        params = {"params": params}
+        # Explicit restore_args make Orbax place arrays with the target shardings, so a run saved on N GPUs can be
+        # resumed on a different FSDP mesh; without them Orbax reuses the sharding stored in the checkpoint.
         restored = checkpoint_manager.restore(
             step,
-            items={
-                "train_state": train_state,
-                "params": {"params": params},
-            },
+            args=ocp.args.Composite(
+                train_state=ocp.args.PyTreeRestore(
+                    item=train_state, restore_args=ocp.checkpoint_utils.construct_restore_args(train_state)
+                ),
+                params=ocp.args.PyTreeRestore(
+                    item=params, restore_args=ocp.checkpoint_utils.construct_restore_args(params)
+                ),
+            ),
         )
         restored_state = _merge_params(restored["train_state"], restored["params"])
         if params_filter is not None:
