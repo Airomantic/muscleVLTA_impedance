@@ -326,3 +326,23 @@ def test_robot_runner_runs_the_client_in_a_clean_ros_environment(environment, tm
     assert not any(line.startswith(("PYTHONPATH=", "OPENPI_")) for line in lines)
     client = ROOT / "scripts/ar3_lift_robot_client.py"
     assert lines[-1] == f"ARGS -u {client} --host 10.0.0.5 --port 8100 --check --port 9000"
+
+
+def test_gripper_gate_runner_checks_the_gripper_modules_and_runs_in_a_clean_ros_environment(environment, tmp_path):
+    log = tmp_path / "gate-calls"
+    environment["INFER_ROBOT_PYTHON"] = str(
+        _executable(
+            tmp_path / "robot-python",
+            f'#!/bin/bash\n{{ env; printf "ARGS %s\\n" "$*"; }} >> {shlex.quote(str(log))}\n',
+        )
+    )
+    environment.update({"INFER_GRIPPER_HOST": "10.0.0.9", "PYTHONPATH": "/model/src"})
+    result = run(environment, "--check", script=ROOT / "scripts/ar3_dagger_gripper_teleop.sh")
+    assert result.returncode == 0, result.stderr
+    text = log.read_text()
+    assert "rclpy numpy grpc DM_V3Gripper.gripper_pb2" in text
+    lines = text.splitlines()
+    assert "ROS_DOMAIN_ID=111" in lines
+    assert not any(line.startswith("PYTHONPATH=") for line in lines)
+    gate = ROOT / "scripts/ar3_dagger_gripper_teleop.py"
+    assert lines[-1] == f"ARGS -u {gate} --gripper-address 10.0.0.9:50008 --check"
