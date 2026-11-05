@@ -95,7 +95,8 @@ def test_print_plan_never_contacts_devices_or_starts_processes(monkeypatch):
 @pytest.fixture
 def fake_client(monkeypatch):
     client = SimpleNamespace(
-        parse_args=lambda _: SimpleNamespace(host="127.0.0.1", port=8000), main=mock.Mock(return_value=0)
+        parse_args=lambda _: SimpleNamespace(host="127.0.0.1", port=8000, dagger=False, record_dir=None),
+        main=mock.Mock(return_value=0),
     )
     monkeypatch.setattr(debug.importlib, "import_module", lambda _: client)
     return client
@@ -136,6 +137,39 @@ def test_explicit_policy_reuse_never_stops_the_existing_server(monkeypatch, fake
     assert debug.main(["--reuse-policy", "--hardware", "skip", "--", "--check"]) == 0
     fake_client.main.assert_called_once()
     kill.assert_not_called()
+
+
+def test_dagger_reuses_the_teleoperation_prepared_by_infer_oneclick(monkeypatch, fake_client):
+    fake_client.parse_args = lambda _: SimpleNamespace(host="127.0.0.1", port=8000, dagger=True, record_dir=None)
+    run = mock.Mock()
+    monkeypatch.setattr(debug.subprocess, "run", run)
+    monkeypatch.setattr(debug, "policy_healthy", lambda *_: True)
+    for hardware in ("auto", "ready"):
+        assert debug.main(["--reuse-policy", "--hardware", hardware, "--", "--execute", "--dagger"]) == 1
+    run.assert_not_called()
+    fake_client.main.assert_not_called()
+    assert debug.main(["--reuse-policy", "--hardware", "skip", "--", "--execute", "--dagger"]) == 0
+    fake_client.main.assert_called_once()
+
+
+def test_recording_checks_its_modules_before_loading_the_policy(monkeypatch, fake_client, caplog):
+    fake_client.parse_args = lambda _: SimpleNamespace(
+        host="127.0.0.1", port=8000, dagger=False, record_dir=Path("rollouts")
+    )
+
+    def import_module(name):
+        if name == "av":
+            raise ImportError("No module named 'av'")
+        return fake_client
+
+    monkeypatch.setattr(debug.importlib, "import_module", import_module)
+    started = mock.Mock()
+    monkeypatch.setattr(debug.subprocess, "run", started)
+    monkeypatch.setattr(debug.subprocess, "Popen", started)
+    assert debug.main(["--", "--execute", "--record-dir", "rollouts"]) == 1
+    started.assert_not_called()
+    fake_client.main.assert_not_called()
+    assert "pip install pyarrow av" in caplog.text
 
 
 def test_owned_policy_is_stopped_if_hardware_preparation_fails(monkeypatch, fake_client, tmp_path):

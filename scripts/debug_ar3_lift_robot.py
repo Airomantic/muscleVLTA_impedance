@@ -206,6 +206,18 @@ def main(argv: list[str] | None = None) -> int:
         client_options = client.parse_args(client_args)
         if (client_options.host, client_options.port) != (args.host, args.port):
             raise RuntimeError("Pass policy --host/--port before -- so startup and client use the same endpoint.")
+        if client_options.dagger and args.hardware != "skip":
+            # auto/ready treat the DAgger teleoperation as a conflicting command source.
+            raise RuntimeError("--dagger: run ./infer_oneclick.sh --dagger first, then pass --hardware skip before --.")
+        if client_options.record_dir is not None:
+            try:
+                importlib.import_module("pyarrow")
+                importlib.import_module("av")
+            except ImportError as error:
+                raise RuntimeError(
+                    f"--record-dir needs pyarrow and PyAV ({error}): "
+                    f"PYTHONNOUSERSITE=1 {sys.executable} -m pip install pyarrow av"
+                ) from error
         environment = model_environment()
         environment.update(OPENPI_HOST=args.host, OPENPI_PORT=str(args.port))
         if args.reuse_policy:
