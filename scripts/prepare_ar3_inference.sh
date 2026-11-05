@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Prepare the AR3 LIFT inference devices; never starts teleoperation, recording or policy action execution.
+# Prepare the AR3 LIFT inference devices; never records or executes policy actions. Only --dagger starts the
+# operator's teleoperation (MessageBridge, Puppetry, AR3 Cartesian teleoperation) and the gated gripper teleoperation.
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -12,6 +13,13 @@ TILT_DIR="${INFER_TILT_DIR:-$UPPERLIMB/../../huanEr}"
 SERVO_PYTHON="${INFER_SERVO_PYTHON:-$HOME/anaconda3/envs/qwen3VL/bin/python}"
 ROS_SETUP="${INFER_ROS_SETUP:-/opt/ros/jazzy/setup.bash}"
 CAMERA_LAUNCH_DIR="${INFER_CAMERA_LAUNCH_DIR:-/opt/ros/jazzy/share/orbbec_camera/launch}"
+# --dagger: the recordings' teleoperation (lerobot oneClick.sh) takes over from the policy.
+REMOTE_DIR="${INFER_REMOTE_DIR:-$UPPERLIMB/remote/pp_ubuntu24.04_V1.1.2.38_202606301404_release_ros2_x86_jazzy}"
+BRIDGE_DIR="${INFER_BRIDGE_DIR:-$REMOTE_DIR/x86/standalone/bin/ROS_2}"
+PUPPETRY_DIR="${INFER_PUPPETRY_DIR:-$REMOTE_DIR/x86/standalone/bin/Puppetry}"
+TELEOP_NODE=/ar3_cartesian_impedance_teleop
+GATE_NODE=/ar3_dagger_gripper_gate
+TRIGGER_TOPIC=/trigger_positions
 ARM_INTERFACE="${INFER_ARM_INTERFACE:-enp132s0}"
 ARM_CIDR="${INFER_ARM_CIDR:-192.168.0.100/24}"
 ARM_IP="${INFER_ARM_IP:-192.168.0.160}"
@@ -42,7 +50,7 @@ RT_PARAMS=install/ar3_cartesian_impedance/share/ar3_cartesian_impedance/config/r
 WRIST_COLOR=(enable_color_auto_exposure:=false color_exposure:=80 color_gain:=16
     enable_color_auto_white_balance:=false color_white_balance:=4600)
 
-WITH_ARM=1 WITH_SSH=1 WITH_CAMERAS=1 WITH_TILT=1 WITH_POLICY=0
+WITH_ARM=1 WITH_SSH=1 WITH_CAMERAS=1 WITH_TILT=1 WITH_POLICY=0 WITH_DAGGER=0
 WINDOWS=0 MODE=start TASK=""
 INITIALIZE_GRIPPER=0
 ORIGINAL_ARGS=("$@")
@@ -65,6 +73,10 @@ Usage: ./infer_oneclick.sh [OPTIONS]
   --no-tilt          Do not start or move the camera tilt servo.
   --with-policy      Also serve the policy on this PC (scripts/serve_ar3_lift.sh; needs a GPU).
   --no-policy        Do not launch/check the policy server (default; serve it on the GPU server).
+  --dagger           Also start the teleoperation for DAgger takeovers: MessageBridge, Puppetry,
+                     the AR3 Cartesian teleoperation (the ready task sets dry_run=false: it
+                     MOVES the arm while the clutch is pressed) and the gated gripper
+                     teleoperation (scripts/ar3_dagger_gripper_teleop.sh).
   --windows          Separate GNOME windows instead of tabs in one new window.
   -h, --help         Show this help.
 
@@ -74,15 +86,20 @@ Orbbec RGB, 40-degree camera tilt and a readiness tab, ROS domain 111. The contr
 only monitors until a client enables it; it then switches to automatic mode and
 POWERS the arm. The tilt servo MOVES. The readiness task connects the gripper's CAN
 interface if disconnected, preserving it for the robot client. Calibration requires
---initialize-gripper. No teleoperation, recording or policy action is run.
+--initialize-gripper. Without --dagger no teleoperation, recording or policy action is run.
 After PREPARATION READY run the robot client (it MOVES the arm only with --execute):
   scripts/run_ar3_lift_robot.sh --check
   scripts/run_ar3_lift_robot.sh --max-chunks 3                 (dry run)
   scripts/run_ar3_lift_robot.sh --execute --move-to-start
+With --dagger (each episode: the policy until the clutch is pressed, then the operator
+finishes the task; releasing the clutch ends the episode):
+  scripts/run_ar3_lift_robot.sh --check --dagger
+  scripts/run_ar3_lift_robot.sh --execute --dagger --record-dir DIR
 Stop teleoperation, recording and other arm controllers first. One owner per camera.
 
 Paths: INFER_AR3_WS, INFER_GRIPPER_DIR, INFER_ROBOT_PYTHON, INFER_TILT_DIR,
-INFER_SERVO_PYTHON, INFER_ROS_SETUP, INFER_CAMERA_LAUNCH_DIR.
+INFER_SERVO_PYTHON, INFER_ROS_SETUP, INFER_CAMERA_LAUNCH_DIR, INFER_REMOTE_DIR,
+INFER_BRIDGE_DIR (MessageBridge), INFER_PUPPETRY_DIR (Puppetry).
 Devices: INFER_ARM_INTERFACE, INFER_ARM_CIDR, INFER_ARM_IP, INFER_WORKSPACE_RADIUS,
 INFER_GRIPPER_INTERFACE, INFER_GRIPPER_CIDR, INFER_GRIPPER_HOST, INFER_GRIPPER_USER,
 INFER_GRIPPER_CHANNEL, INFER_GRIPPER_MOTOR_ID, INFER_FRONT_SERIAL, INFER_WRIST_SERIAL,
@@ -125,6 +142,7 @@ while (($#)); do
         --no-tilt) WITH_TILT=0 ;;
         --with-policy) WITH_POLICY=1 ;;
         --no-policy) WITH_POLICY=0 ;;
+        --dagger) WITH_DAGGER=1 ;;
         --windows) WINDOWS=1 ;;
         --task)
             [[ $# -ge 2 ]] || die "--task requires a name."
@@ -161,6 +179,7 @@ TASKS=()
 ((WITH_SSH)) && TASKS+=(gripper)
 ((WITH_CAMERAS)) && TASKS+=(front wrist)
 ((WITH_TILT)) && TASKS+=(tilt)
+((WITH_DAGGER)) && TASKS+=(bridge puppetry teleop gate)
 ((WITH_POLICY)) && TASKS+=(policy)
 TASKS+=(ready)
 
@@ -202,6 +221,27 @@ command_for() {
             COMMAND=(env -u PYTHONPATH -u PYTHONHOME -u LD_LIBRARY_PATH -u AMENT_PREFIX_PATH
                 -u COLCON_PREFIX_PATH -u CMAKE_PREFIX_PATH -u ROS_PACKAGE_PATH
                 bash "$ROOT/scripts/serve_ar3_lift.sh" "$CHECKPOINT") ;;
+        bridge|puppetry)
+            # As in the recordings' oneClick.sh: the vendor binary from its directory with ROS sourced, keeping the
+            # desktop session (Puppetry opens a window) but not the model's Python or other ROS overlays.
+            local binary=./MessageBridge
+            TASK_CWD="$BRIDGE_DIR"
+            [[ "$1" == bridge ]] || { binary=./Puppetry; TASK_CWD="$PUPPETRY_DIR"; }
+            COMMAND=(env -u PYTHONPATH -u PYTHONHOME -u LD_LIBRARY_PATH -u AMENT_PREFIX_PATH -u COLCON_PREFIX_PATH
+                -u CMAKE_PREFIX_PATH -u ROS_PACKAGE_PATH "ROS_DOMAIN_ID=$ROS_DOMAIN_ID"
+                bash --noprofile --norc -c 'set -e; source "$1"; shift; exec "$@"' _ "$ROS_SETUP" "$binary") ;;
+        teleop)
+            TASK_CWD="$AR3_WS"
+            # The recordings' teleoperation; its return-home range matches the controller's workspace radius. It
+            # starts with dry_run=true and the ready task enables it.
+            COMMAND=(bash "$AR3_WS/jazzy.sh" impedance-teleop -p return_home_position_tolerance_m:=0.055
+                -p return_home_rotation_tolerance_rad:=0.06 -p return_home_timeout_s:=75.0
+                -p return_home_max_rotation_lead_rad:=0.10 -p "return_home_workspace_radius_m:=$WORKSPACE_RADIUS") ;;
+        gate)
+            # It waits for the gripper the ready task connects (after its own checks).
+            COMMAND=(env "INFER_ROBOT_PYTHON=$ROBOT_PYTHON" "INFER_ROS_SETUP=$ROS_SETUP"
+                "INFER_ROS_DOMAIN_ID=$ROS_DOMAIN_ID" bash "$ROOT/scripts/ar3_dagger_gripper_teleop.sh"
+                --wait "$((2 * WAIT_TIMEOUT))" --gripper-address "$GRIPPER_HOST:$GRIPPER_PORT") ;;
         ready) COMMAND=() ;;
         *) die "Unknown task: $1" ;;
     esac
@@ -248,6 +288,15 @@ preflight() {
         files+=("$TILT_DIR/camera_tilt_ros2.py" "$TILT_DIR/usb_servo.py")
         executables+=("$SERVO_PYTHON")
     fi
+    if ((WITH_DAGGER)); then
+        command -v pgrep >/dev/null || die "Missing command: pgrep"
+        files+=("$BRIDGE_DIR/config/MessageBridge.yaml" "$AR3_WS/jazzy.sh"
+            "$AR3_WS/scripts/ar3_cartesian_impedance_teleop.py" "$ROOT/scripts/ar3_dagger_gripper_teleop.py"
+            "$ROOT/scripts/ar3_dagger_gripper_teleop.sh")
+        executables+=("$BRIDGE_DIR/MessageBridge" "$PUPPETRY_DIR/Puppetry")
+        # jazzy.sh impedance-teleop keeps its per-domain lock there.
+        [[ -d "$AR3_WS/.venv-teleop" ]] || die "Missing $AR3_WS/.venv-teleop (the AR3 teleoperation environment)."
+    fi
     if ((WITH_POLICY)); then
         command -v curl >/dev/null || die "Missing command: curl"
         files+=("${OPENPI_DATA_HOME:-$HOME/.cache/openpi}/big_vision/paligemma_tokenizer.model")
@@ -272,6 +321,7 @@ preflight() {
 print_plan() {
     info "ROS domain $ROS_DOMAIN_ID; arm $ARM_IP (workspace radius $WORKSPACE_RADIUS m); gripper $GRIPPER_HOST:$GRIPPER_PORT"
     ((WITH_POLICY)) && info "Policy: $CHECKPOINT on GPU ${OPENPI_SERVE_GPU:-0}, ws://$OPENPI_HOST:$OPENPI_PORT"
+    ((WITH_DAGGER)) && info "DAgger: MessageBridge, Puppetry, the AR3 teleoperation (enabled by the ready task: it MOVES the arm while the clutch is pressed) and the gated gripper teleoperation."
     if [[ "$TASK" == ready ]]; then
         info "Recheck existing services; require gripper $GRIPPER_HOST via $GRIPPER_INTERFACE src $GRIPPER_LOCAL_IP. No new tabs."
     else
@@ -292,6 +342,8 @@ print_plan() {
             ((WITH_ARM)) && printf '  Wait for the controller RT state, metadata and status, then %s/tau_m.\n' "$CONTROLLER"
             ((WITH_CAMERAS)) && printf '  Wait for /front/color/image_raw and /wrist/color/image_raw samples.\n'
             ((WITH_TILT)) && printf '  Wait for measured /camera_tilt/state_deg within %s +/- 2 degrees.\n' "$TILT_ANGLE"
+            ((WITH_DAGGER)) && printf '  Wait for %s, set %s dry_run=false and verify it, wait for %s.\n' \
+                "$TRIGGER_TOPIC" "$TELEOP_NODE" "$GATE_NODE"
             ((WITH_POLICY)) && printf '  Wait for http://%s:%s/healthz.\n' "$OPENPI_HOST" "$OPENPI_PORT"
         else
             printf '  '; printf '%q ' "${COMMAND[@]}"; printf '\n'
@@ -299,6 +351,9 @@ print_plan() {
         case "$task" in
             arm) printf '  Add %s to %s only if absent; verify route and ping; refuse old joint drivers.\n' "$ARM_CIDR" "$ARM_INTERFACE" ;;
             gripper) printf '  Reuse the service if %s:%s already listens.\n' "$GRIPPER_HOST" "$GRIPPER_PORT" ;;
+            bridge|puppetry) printf '  Reuse it if it already runs.\n' ;;
+            teleop) printf '  Start after the controller is ready, with dry_run=true; the ready task enables it.\n' ;;
+            gate) printf '  Drives the gripper only during DAgger takeovers; never stops or disconnects it.\n' ;;
         esac
     done
     ((WITH_SSH)) || info "Remote startup skipped; the gripper gRPC service must already run."
@@ -315,6 +370,35 @@ wait_topic() {
     timeout --signal=TERM --kill-after=3 "$WAIT_TIMEOUT" "${ROS_CMD[@]}" ros2 topic echo \
         "$topic" "$type" --once --no-daemon --qos-reliability best_effort "$@" \
         || die "No qualifying sample on $topic; inspect its task tab and ROS domain."
+}
+
+wait_node() {
+    local deadline=$((SECONDS + WAIT_TIMEOUT)) nodes
+    info "Waiting for the ROS node $1"
+    until nodes=$(timeout --kill-after=3 15 "${ROS_CMD[@]}" ros2 node list --no-daemon) \
+        && grep -qxF -- "$1" <<<"$nodes"; do
+        ((SECONDS < deadline)) || die "No $1 node; inspect its task tab."
+        sleep 2
+    done
+}
+
+enable_teleop() {
+    local deadline=$((SECONDS + WAIT_TIMEOUT)) result=""
+    info "Waiting for $TELEOP_NODE, then setting dry_run=false"
+    while ((SECONDS < deadline)); do
+        # Jazzy's param set may exit 0 when the parameter is rejected: check its message.
+        if result=$(timeout --kill-after=3 10 bash "$AR3_WS/jazzy.sh" ros2 param set "$TELEOP_NODE" dry_run false \
+            --no-daemon --timeout 2 2>&1) && [[ "$result" == *"Set parameter successful"* ]]; then
+            result=$(timeout --kill-after=3 10 bash "$AR3_WS/jazzy.sh" ros2 param get "$TELEOP_NODE" dry_run \
+                --no-daemon 2>&1) || true
+            [[ "$result" == *"Boolean value is: False"* ]] || die "Could not verify dry_run=false: $result"
+            info "The AR3 teleoperation is enabled (dry_run=false): the clutch takes over the arm."
+            return
+        fi
+        sleep 2
+    done
+    printf '%s\n' "$result" >&2
+    die "The AR3 teleoperation did not accept dry_run=false; inspect its tab."
 }
 
 wait_controller() {
@@ -340,10 +424,17 @@ check_conflicts() {
     if ((WITH_POLICY)) && tcp_ready "$OPENPI_HOST" "$OPENPI_PORT"; then
         die "Policy port is occupied; use --no-policy or choose another OPENPI_PORT."
     fi
+    if ((WITH_DAGGER)) && [[ "$nodes" == *ar3_dagger_gripper_gate* ]]; then
+        die "The DAgger gripper gate already runs; stop it first."
+    fi
 }
 
 reject_command_sources() {
-    [[ "$1" != *ar3_cartesian_impedance_teleop* && "$1" != *ar3r_cartesian_retargeting* && "$1" != *gripper_teleop* ]] \
+    # With --dagger the ready task expects the AR3 teleoperation started by this script (not a gripper teleoperation).
+    if [[ "$TASK" != ready || $WITH_DAGGER == 0 ]] && [[ "$1" == *ar3_cartesian_impedance_teleop* ]]; then
+        die "Teleoperation is running. Stop it before inference preparation."
+    fi
+    [[ "$1" != *ar3r_cartesian_retargeting* && "$1" != *gripper_teleop* ]] \
         || die "Teleoperation is running. Stop it before inference preparation."
     [[ "$1" != *ar3_lift_robot_client* ]] \
         || die "The AR3 LIFT robot client is running. Stop it before gripper preparation."
@@ -369,7 +460,7 @@ prepare_gripper_network() {
 }
 
 run_task() {
-    local addresses route nodes deadline
+    local addresses route nodes deadline binary
     case "$TASK" in
         gripper|ready) check_gripper_route ;;
     esac
@@ -393,6 +484,14 @@ run_task() {
                 info "Reusing the gripper service listening on $GRIPPER_HOST:$GRIPPER_PORT; the ready tab checks it."
                 return
             fi ;;
+        bridge|puppetry)
+            binary=MessageBridge
+            [[ "$TASK" == bridge ]] || binary=Puppetry
+            if pgrep -x "$binary" >/dev/null; then
+                info "Reusing the running $binary."
+                return
+            fi ;;
+        teleop) wait_controller ;;
         ready)
             nodes=$(timeout --kill-after=3 15 "${ROS_CMD[@]}" ros2 node list --no-daemon) \
                 || die "Cannot inspect ROS nodes; gripper preparation was not attempted."
@@ -412,6 +511,11 @@ run_task() {
                     --filter "abs(m - $TILT_ANGLE) <= 2.0"
             fi
             check_gripper
+            if ((WITH_DAGGER)); then
+                wait_topic "$TRIGGER_TOPIC" std_msgs/msg/Float64MultiArray --field data
+                enable_teleop
+                wait_node "$GATE_NODE"
+            fi
             if ((WITH_POLICY)); then
                 deadline=$((SECONDS + WAIT_TIMEOUT))
                 until curl --fail --silent --show-error --noproxy '*' --max-time 2 \
@@ -422,7 +526,12 @@ run_task() {
             fi
             info "PREPARATION READY for the selected services. No policy action was executed."
             info "Gripper feedback is valid and fresh; its CAN connection is retained for inference."
-            info "Next: scripts/run_ar3_lift_robot.sh --check, a dry run (--max-chunks 3), then --execute --move-to-start."
+            if ((WITH_DAGGER)); then
+                info "DAgger teleoperation is live: the clutch takes over the arm; the trigger takes the gripper once it meets the fingers."
+                info "Next: scripts/run_ar3_lift_robot.sh --check --dagger, then --execute --dagger --record-dir DIR."
+            else
+                info "Next: scripts/run_ar3_lift_robot.sh --check, a dry run (--max-chunks 3), then --execute --move-to-start."
+            fi
             return ;;
     esac
     command_for "$TASK"

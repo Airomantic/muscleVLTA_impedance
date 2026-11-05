@@ -33,6 +33,8 @@ def environment(tmp_path):
         arm / "install/local_setup.bash",
         arm / "install/ar3_cartesian_impedance/share/ar3_cartesian_impedance/config/rt.yaml",
         arm / "scripts/ar3_wait_cartesian_state.py",
+        arm / "scripts/ar3_cartesian_impedance_teleop.py",
+        base / "bridge/config/MessageBridge.yaml",
         tilt / "camera_tilt_ros2.py",
         tilt / "usb_servo.py",
         cameras / "gemini_330_series.launch.py",
@@ -44,6 +46,9 @@ def environment(tmp_path):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()
     (checkpoint / "params").mkdir()
+    (arm / ".venv-teleop").mkdir()
+    _executable(base / "bridge/MessageBridge")
+    _executable(base / "puppetry/Puppetry")
     _executable(arm / "install/ar3_cartesian_impedance/lib/ar3_cartesian_impedance/cartesian_impedance_node")
     # Import checks (-c) are local and not logged; helper runs are.
     _executable(
@@ -96,6 +101,10 @@ elif [[ "$*" == *"/dev/tcp/"* ]]; then
     exit "${INFER_TEST_TCP_EXIT:-0}"
 elif [[ "$*" == *"${INFER_TEST_FAIL:-__none__}"* ]]; then
     exit 1
+elif [[ "$*" == *"param set"* ]]; then
+    printf 'Set parameter successful\n'
+elif [[ "$*" == *"param get"* ]]; then
+    printf 'Boolean value is: False\n'
 fi
 """,
     )
@@ -115,6 +124,8 @@ printf '\\n' >> "$INFER_TEST_CALLS"
             "INFER_TILT_DIR": str(tilt),
             "INFER_SERVO_PYTHON": str(servo_python),
             "INFER_CAMERA_LAUNCH_DIR": str(cameras),
+            "INFER_BRIDGE_DIR": str(base / "bridge"),
+            "INFER_PUPPETRY_DIR": str(base / "puppetry"),
             "INFER_ROS_SETUP": str(base / "setup.bash"),
             "INFER_ARM_INTERFACE": "lo",
             "INFER_CHECKPOINT": str(checkpoint),
@@ -287,6 +298,52 @@ def test_any_failed_readiness_step_never_reports_ready(environment, variable, va
     assert "PREPARATION READY" not in result.stdout
     if variable == "INFER_TEST_GRIPPER_PREPARE_EXIT":
         assert not any("topic echo" in line for line in calls(environment))
+
+
+def test_dagger_adds_teleoperation_and_gated_gripper_tasks_but_rejects_running_ones(environment):
+    result = run(environment, "--dagger")
+    assert result.returncode == 0, result.stderr
+    log = calls(environment)
+    tasks = [shlex.split(line)[-1] for line in log if line.startswith("terminal ")]
+    assert tasks == ["arm", "gripper", "front", "wrist", "tilt", "bridge", "puppetry", "teleop", "gate", "ready"]
+    assert "./MessageBridge" in result.stdout
+    assert "./Puppetry" in result.stdout
+    teleop = next(line for line in result.stdout.splitlines() if "impedance-teleop" in line)
+    assert "return_home_workspace_radius_m:=0.45" in teleop
+    gate = next(line for line in result.stdout.splitlines() if "ar3_dagger_gripper_teleop.sh" in line)
+    assert "--wait 360 --gripper-address 192.168.127.10:50008" in gate
+    assert "ar3_lift_robot_client" not in result.stdout
+    for nodes, message in [
+        ("/ar3_cartesian_impedance_teleop", "Teleoperation is running"),
+        ("/ar3_dagger_gripper_gate", "gripper gate already runs"),
+    ]:
+        environment["INFER_TEST_NODES"] = nodes
+        result = run(environment, "--dagger")
+        assert result.returncode != 0
+        assert message in result.stderr
+
+
+def test_dagger_readiness_enables_the_teleoperation_after_every_input_and_waits_for_the_gate(environment):
+    environment["INFER_TEST_NODES"] = "/ar3_cartesian_impedance_teleop\n/ar3_dagger_gripper_gate"
+    result = run(environment, "--task", "ready", "--dagger")
+    assert result.returncode == 0, result.stderr
+    assert "PREPARATION READY" in result.stdout
+    assert "--check --dagger" in result.stdout
+    log = calls(environment)
+
+    def index(text):
+        return next(i for i, line in enumerate(log) if text in line)
+
+    order = [
+        index("prepare_ar3_gripper.py --connect"),
+        index("prepare_ar3_gripper.py --check"),
+        index("/trigger_positions std_msgs/msg/Float64MultiArray"),
+        index("param set /ar3_cartesian_impedance_teleop dry_run false"),
+        index("param get /ar3_cartesian_impedance_teleop dry_run"),
+        max(i for i, line in enumerate(log) if "node list" in line),
+    ]
+    assert order == sorted(order)
+    assert order[-1] > order[-2]
 
 
 def test_robot_runner_requires_client_dependencies_before_starting_the_client(environment, tmp_path):
