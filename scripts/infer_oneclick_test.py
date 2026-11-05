@@ -1,14 +1,24 @@
+import fcntl
+import json
 import os
 from pathlib import Path
 import shlex
 import subprocess
 import sys
+import time
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = ROOT / "infer_oneclick.sh"
 RUNNER = ROOT / "scripts/run_ar3_lift_robot.sh"
+WRIST_METADATA = {
+    "auto_exposure": 0,
+    "exposure": 80,
+    "gain": 16,
+    "auto_white_balance": 0,
+    "white_balance": 4600,
+}
 
 
 def _executable(path, contents="#!/bin/bash\nexit 0\n"):
@@ -91,11 +101,18 @@ exec "$@"
         """#!/bin/bash
 printf '%s\\n' "$*" >> "$INFER_TEST_CALLS"
 if [[ "$*" == *"node list"* ]]; then
-    printf '%s\\n' "${INFER_TEST_NODES:-}"
+    if [[ -v INFER_TEST_NODES_SECOND && -f "$INFER_TEST_NODE_QUERY_MARKER" ]]; then
+        printf '%s\\n' "$INFER_TEST_NODES_SECOND"
+    else
+        printf '%s\\n' "${INFER_TEST_NODES:-}"
+        [[ ! -v INFER_TEST_NODES_SECOND ]] || touch "$INFER_TEST_NODE_QUERY_MARKER"
+    fi
 elif [[ "$*" == *"/dev/tcp/"* ]]; then
-    exit "${INFER_TEST_TCP_EXIT:-0}"
+    exit "${INFER_TEST_TCP_EXIT:-1}"
 elif [[ "$*" == *"${INFER_TEST_FAIL:-__none__}"* ]]; then
     exit 1
+elif [[ "$*" == *"/wrist/color/metadata"* ]]; then
+    printf '%s\\n---\\n' "$INFER_TEST_WRIST_METADATA"
 fi
 """,
     )
@@ -115,11 +132,14 @@ printf '\\n' >> "$INFER_TEST_CALLS"
             "INFER_TILT_DIR": str(tilt),
             "INFER_SERVO_PYTHON": str(servo_python),
             "INFER_CAMERA_LAUNCH_DIR": str(cameras),
+            "INFER_WRIST_DRIVER_OVERLAY": "",
             "INFER_ROS_SETUP": str(base / "setup.bash"),
             "INFER_ARM_INTERFACE": "lo",
             "INFER_CHECKPOINT": str(checkpoint),
             "INFER_TEST_CALLS": str(tmp_path / "calls"),
             "INFER_TEST_IP_ADDED": str(tmp_path / "gripper-address-added"),
+            "INFER_TEST_NODE_QUERY_MARKER": str(tmp_path / "node-query-seen"),
+            "INFER_TEST_WRIST_METADATA": json.dumps(WRIST_METADATA),
             "OPENPI_DATA_HOME": str(data_home),
             "OPENPI_PYTHON": sys.executable,
             "PATH": f"{mock_bin}:{env['PATH']}",
@@ -137,6 +157,14 @@ def run(env, *args, cwd="/tmp", script=LAUNCHER):
 def calls(env):
     path = Path(env["INFER_TEST_CALLS"])
     return path.read_text().splitlines() if path.exists() else []
+
+
+def terminal_commands(env):
+    return [shlex.split(line.removeprefix("terminal ")) for line in calls(env) if line.startswith("terminal ")]
+
+
+def terminal_tasks(env):
+    return [command[command.index("--task") + 1] for command in terminal_commands(env)]
 
 
 def test_default_plan_starts_impedance_controller_without_teleoperation_or_policy_actions(environment):
@@ -157,6 +185,7 @@ def test_default_plan_starts_impedance_controller_without_teleoperation_or_polic
     assert "enable_color_auto_exposure:=false" not in front
     assert "color_format:=YUYV" in wrist
     assert "enable_color_auto_exposure:=false" in wrist
+    assert "enable_ir_auto_exposure:=false" in wrist
     assert "color_white_balance:=4600" in wrist
     assert "startup_angle_deg:=40.0" in result.stdout
     assert "deploy.sh" in result.stdout
@@ -166,6 +195,87 @@ def test_default_plan_starts_impedance_controller_without_teleoperation_or_polic
     commands = "\n".join(line for line in lines if line.startswith("  "))
     for absent in ("--execute", "ar3_lift_robot_client", "teleop"):
         assert absent not in commands
+    assert not calls(environment)
+
+
+def _wrist_overlay(path):
+    for relative, contents in {
+        "lib/liborbbec_camera.so": "test library",
+        "share/ament_index/resource_index/packages/orbbec_camera": "",
+        "share/ament_index/resource_index/rclcpp_components/orbbec_camera": "orbbec_camera::OBCameraNodeDriver;lib/liborbbec_camera.so\n",
+        "wrist_driver.json": '{"g305_v4l2_single_start": true}\n',
+    }.items():
+        target = path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(contents)
+    return path
+
+
+def test_wrist_overlay_is_applied_after_ros_setup_and_does_not_affect_front(environment, tmp_path):
+    overlay = _wrist_overlay(tmp_path / "wrist driver overlay")
+    environment["INFER_WRIST_DRIVER_OVERLAY"] = str(overlay)
+    mock_bin = tmp_path / "mock ros"
+    output = tmp_path / "ros calls"
+    _executable(
+        mock_bin / "ros2",
+        f'#!/bin/bash\nprintf "%s\\n" "$AMENT_PREFIX_PATH" >> {shlex.quote(str(output))}\n',
+    )
+    Path(environment["INFER_ROS_SETUP"]).write_text(
+        f'export AMENT_PREFIX_PATH=/system/ros:/existing/prefix\nexport PATH={shlex.quote(str(mock_bin))}:"$PATH"\n'
+    )
+    for task in ("wrist", "front"):
+        result = run(environment, "--task", task)
+        assert result.returncode == 0, result.stderr
+    assert output.read_text().splitlines() == [
+        f"{overlay}:/system/ros:/existing/prefix",
+        "/system/ros:/existing/prefix",
+    ]
+    result = run(environment, "--dry-run")
+    commands = [shlex.split(line.strip()) for line in result.stdout.splitlines() if line.startswith("  env ")]
+    wrist = next(command for command in commands if "camera_name:=wrist" in command)
+    front = next(command for command in commands if "camera_name:=front" in command)
+    assert str(overlay) in wrist
+    assert str(overlay) not in front
+    assert "Wrist camera driver:" in result.stdout
+    assert not calls(environment)
+
+
+@pytest.mark.parametrize(
+    "missing", [None, "lib/liborbbec_camera.so", "share/ament_index/resource_index/rclcpp_components/orbbec_camera"]
+)
+def test_invalid_wrist_overlay_blocks_startup_before_external_access(environment, tmp_path, missing):
+    overlay = tmp_path / "invalid wrist overlay"
+    if missing is not None:
+        _wrist_overlay(overlay)
+        (overlay / missing).unlink()
+    environment["INFER_WRIST_DRIVER_OVERLAY"] = str(overlay)
+    result = run(environment, "--check")
+    assert result.returncode != 0
+    assert "wrist driver overlay" in result.stderr
+    assert not calls(environment)
+    # The direct task entry point must also validate the overlay before executing ros2.
+    result = run(environment, "--task", "wrist")
+    assert result.returncode != 0
+    assert "wrist driver overlay" in result.stderr
+    assert not calls(environment)
+
+
+def test_project_wrist_overlay_is_detected_by_default_but_can_be_disabled(environment, tmp_path):
+    project = tmp_path / "project"
+    script = project / "scripts/prepare_ar3_inference.sh"
+    script.parent.mkdir(parents=True)
+    script.write_text((ROOT / "scripts/prepare_ar3_inference.sh").read_text())
+    overlay = _wrist_overlay(project / "outputs/orbbec_wrist_driver/overlay")
+    environment.pop("INFER_WRIST_DRIVER_OVERLAY")
+    result = run(environment, "--dry-run", script=script)
+    assert result.returncode == 0, result.stderr
+    wrist = next(shlex.split(line.strip()) for line in result.stdout.splitlines() if "camera_name:=wrist" in line)
+    assert str(overlay) in wrist
+    environment["INFER_WRIST_DRIVER_OVERLAY"] = ""
+    result = run(environment, "--dry-run", script=script)
+    assert result.returncode == 0, result.stderr
+    assert str(overlay) not in result.stdout
+    assert "Wrist camera driver: system ROS driver" in result.stdout
     assert not calls(environment)
 
 
@@ -195,10 +305,11 @@ def test_rejects_unsafe_workspace_radius_even_in_dry_run(environment, value):
         ("/ar3_cartesian_impedance_teleop", "Teleoperation is running"),
         ("/gripper_teleop", "Teleoperation is running"),
         ("/ar3_lift_robot_client", "robot client is running"),
-        ("/cartesian_impedance_node", "arm controller already exists"),
+        ("/controller_manager", "controller"),
+        ("/rokae_driver7", "controller"),
     ],
 )
-def test_command_sources_or_existing_controller_block_startup_before_any_terminal(environment, nodes, message):
+def test_conflicting_command_sources_block_startup_before_any_terminal(environment, nodes, message):
     environment["INFER_TEST_NODES"] = nodes
     result = run(environment)
     assert result.returncode != 0
@@ -208,6 +319,181 @@ def test_command_sources_or_existing_controller_block_startup_before_any_termina
     assert "terminal " not in log
     assert "sudo " not in log
     assert "robot-python" not in log
+
+
+@pytest.mark.parametrize(("existing", "missing"), [("front", "wrist"), ("wrist", "front")])
+def test_only_missing_camera_is_started_without_replacing_the_existing_owner(environment, existing, missing):
+    environment["INFER_TEST_NODES"] = f"/{existing}/{existing}"
+    result = run(environment, "--no-arm", "--no-ssh", "--no-tilt", "--no-ready-tab", f"--no-{existing}-camera")
+    assert result.returncode == 0, result.stderr
+    terminals = [
+        shlex.split(line.removeprefix("terminal ")) for line in calls(environment) if line.startswith("terminal ")
+    ]
+    assert [args[args.index("--task") + 1] for args in terminals] == [missing]
+
+
+@pytest.mark.parametrize("camera", ["front", "wrist"])
+def test_selected_camera_with_an_existing_owner_is_reused_without_manual_skip_flags(environment, camera):
+    environment["INFER_TEST_NODES"] = f"/{camera}/{camera}"
+    result = run(environment, "--no-arm", "--no-ssh", "--no-tilt", "--no-ready-tab")
+    assert result.returncode == 0, result.stderr
+    assert terminal_tasks(environment) == ["wrist" if camera == "front" else "front"]
+    assert "reus" in result.stdout.lower()
+
+
+def test_manual_startup_reuses_wrist_and_still_starts_other_devices_and_checks_every_sensor(environment):
+    environment["INFER_TEST_NODES"] = "/wrist/wrist"
+    result = run(environment)
+    assert result.returncode == 0, result.stderr
+    assert terminal_tasks(environment) == ["arm", "gripper", "front", "tilt", "ready"]
+    ready_command = next(command for command in terminal_commands(environment) if command[-1] == "ready")
+    assert "--no-cameras" not in ready_command
+    assert "--no-wrist-camera" not in ready_command
+    assert "--no-front-camera" not in ready_command
+    assert "Wait for /front/color/image_raw" in result.stdout
+    assert "Wait for /wrist/color/image_raw" in result.stdout
+
+
+def test_existing_impedance_controller_is_reused(environment):
+    environment["INFER_TEST_NODES"] = "/cartesian_impedance_node"
+    result = run(environment)
+    assert result.returncode == 0, result.stderr
+    assert terminal_tasks(environment) == ["gripper", "front", "wrist", "tilt", "ready"]
+    assert "Wait for the controller RT state" in result.stdout
+
+
+def _all_devices_ready(environment):
+    environment["INFER_TEST_NODES"] = "/cartesian_impedance_node\n/front/front\n/wrist/wrist\n/camera_tilt_servo"
+    environment["INFER_TEST_TCP_EXIT"] = "0"
+
+
+def test_manual_startup_reuses_all_devices_and_checks_all_inputs_in_the_same_terminal(environment):
+    _all_devices_ready(environment)
+    result = run(environment)
+    assert result.returncode == 0, result.stderr
+    assert not terminal_commands(environment)
+    assert "PREPARATION READY" in result.stdout
+    log = "\n".join(calls(environment))
+    for required in (
+        "prepare_ar3_gripper.py --connect",
+        "impedance-wait-state --timeout 180",
+        "/ar3/cartesian_impedance/tau_m",
+        "/front/color/image_raw",
+        "/wrist/color/image_raw",
+        "/wrist/color/metadata",
+        "/camera_tilt/state_deg",
+        "prepare_ar3_gripper.py --check",
+    ):
+        assert required in log
+    assert "--initialize" not in log
+    assert "Wrist frame metadata verified" in result.stdout
+
+
+@pytest.mark.parametrize(("key", "value"), [("auto_white_balance", 1), ("white_balance", 4500), ("gain", None)])
+def test_reused_wrist_with_wrong_or_missing_control_metadata_cannot_report_ready(environment, key, value):
+    _all_devices_ready(environment)
+    metadata = dict(WRIST_METADATA)
+    if value is None:
+        metadata.pop(key)
+    else:
+        metadata[key] = value
+    environment["INFER_TEST_WRIST_METADATA"] = json.dumps(metadata)
+    result = run(environment)
+    assert result.returncode != 0
+    assert f"{key}: expected" in result.stderr
+    assert f"got {value!r}" in result.stderr
+    assert "PREPARATION READY" not in result.stdout
+    assert not terminal_commands(environment)
+
+
+@pytest.mark.parametrize("mode", ["timeout", "empty", "invalid_json"])
+def test_wrist_metadata_without_a_valid_sample_cannot_report_ready(environment, mode):
+    _all_devices_ready(environment)
+    if mode == "timeout":
+        environment["INFER_TEST_FAIL"] = "/wrist/color/metadata"
+    else:
+        environment["INFER_TEST_WRIST_METADATA"] = "" if mode == "empty" else "not JSON"
+    result = run(environment)
+    assert result.returncode != 0
+    expected = "No wrist frame metadata" if mode == "timeout" else "Invalid wrist frame metadata"
+    assert expected in result.stderr
+    assert "PREPARATION READY" not in result.stdout
+    assert not terminal_commands(environment)
+
+
+def test_reused_devices_must_still_pass_readiness(environment):
+    _all_devices_ready(environment)
+    environment["INFER_TEST_FAIL"] = "/wrist/color/image_raw"
+    result = run(environment)
+    assert result.returncode != 0
+    assert "No qualifying sample" in result.stderr
+    assert "PREPARATION READY" not in result.stdout
+    assert not terminal_commands(environment)
+
+
+def test_supervisor_reusing_all_devices_can_defer_readiness(environment):
+    _all_devices_ready(environment)
+    result = run(environment, "--no-ready-tab")
+    assert result.returncode == 0, result.stderr
+    assert not terminal_commands(environment)
+    assert not any("robot-python" in line for line in calls(environment))
+
+
+def test_two_camera_discovery_snapshots_are_merged_before_reusing_devices(environment):
+    _all_devices_ready(environment)
+    environment["INFER_TEST_NODES"] = "/cartesian_impedance_node\n/wrist/wrist\n/camera_tilt_servo"
+    environment["INFER_TEST_NODES_SECOND"] = "/front/front"
+    result = run(environment)
+    assert result.returncode == 0, result.stderr
+    assert not terminal_commands(environment)
+    assert "PREPARATION READY" in result.stdout
+    assert sum("node list --no-daemon --spin-time 3" in line for line in calls(environment)) >= 3
+
+
+def test_conflicting_command_source_discovered_on_second_scan_still_blocks_startup(environment):
+    environment["INFER_TEST_NODES"] = "/wrist/wrist"
+    environment["INFER_TEST_NODES_SECOND"] = "/ar3_cartesian_impedance_teleop"
+    result = run(environment)
+    assert result.returncode != 0
+    assert "Teleoperation is running" in result.stderr
+    assert not terminal_commands(environment)
+    assert not any("robot-python" in line for line in calls(environment))
+
+
+def test_occupied_policy_port_is_not_silently_reused(environment):
+    _all_devices_ready(environment)
+    result = run(environment, "--with-policy")
+    assert result.returncode != 0
+    assert "Policy port is occupied" in result.stderr
+    assert not terminal_commands(environment)
+    assert not any("robot-python" in line for line in calls(environment))
+
+
+@pytest.mark.parametrize(
+    ("skip", "unused_launch"),
+    [("front", "gemini_330_series.launch.py"), ("wrist", "gemini305.launch.py")],
+)
+def test_camera_preflight_only_requires_selected_camera_files(environment, skip, unused_launch, tmp_path):
+    (Path(environment["INFER_CAMERA_LAUNCH_DIR"]) / unused_launch).unlink()
+    if skip == "wrist":
+        environment["INFER_WRIST_DRIVER_OVERLAY"] = str(tmp_path / "unused missing overlay")
+    result = run(environment, "--check", f"--no-{skip}-camera")
+    assert result.returncode == 0, result.stderr
+    assert not calls(environment)
+
+
+@pytest.mark.parametrize(
+    ("flag", "expected_cameras"),
+    [("--no-front-camera", ["wrist"]), ("--no-wrist-camera", ["front"]), ("--no-cameras", [])],
+)
+def test_readiness_only_waits_for_selected_cameras(environment, flag, expected_cameras):
+    result = run(environment, "--ready-only", flag)
+    assert result.returncode == 0, result.stderr
+    assert "PREPARATION READY" in result.stdout
+    log = "\n".join(calls(environment))
+    for camera in ("front", "wrist"):
+        assert (f"/{camera}/color/image_raw" in log) == (camera in expected_cameras)
+    assert ("/wrist/color/metadata" in log) == ("wrist" in expected_cameras)
 
 
 def test_terminal_children_receive_absolute_checkpoint_and_network_is_prepared_first(environment, tmp_path):
@@ -247,6 +533,7 @@ def test_readiness_connects_gripper_then_waits_for_every_input_and_ends_with_rea
         index("/ar3/cartesian_impedance/tau_m std_msgs/msg/Float64MultiArray"),
         index("/front/color/image_raw"),
         index("/wrist/color/image_raw"),
+        index("/wrist/color/metadata"),
         index("--filter abs(m - 40.0) <= 2.0"),
         index("prepare_ar3_gripper.py --check"),
     ]
@@ -256,6 +543,73 @@ def test_readiness_connects_gripper_then_waits_for_every_input_and_ends_with_rea
         assert argument in prepare
     assert "--initialize" not in "\n".join(log)
     assert "--execute" not in "\n".join(log)
+
+
+def test_supervisor_can_start_devices_without_a_competing_readiness_tab(environment):
+    result = run(environment, "--no-ready-tab")
+    assert result.returncode == 0, result.stderr
+    terminals = [
+        shlex.split(line.removeprefix("terminal ")) for line in calls(environment) if line.startswith("terminal ")
+    ]
+    tasks = [args[args.index("--task") + 1] for args in terminals]
+    assert tasks == ["arm", "gripper", "front", "wrist", "tilt"]
+    assert "Run --ready-only" in result.stdout
+    result = run(environment, "--no-ready-tab", "--ready-only")
+    assert result.returncode == 0, result.stderr
+    assert "PREPARATION READY" in result.stdout
+
+
+def test_readiness_waits_for_its_existing_owner_before_connecting_gripper(environment, tmp_path):
+    state_root = Path(environment["XDG_RUNTIME_DIR"]) / f"ar3-lift-infer-{os.getuid()}-111"
+    state_root.mkdir()
+    environment["INFER_TIMEOUT"] = "5"
+    output_path = tmp_path / "waiting-readiness.log"
+    with (state_root / "ready.lock").open("w") as owner, output_path.open("w") as output:
+        fcntl.flock(owner, fcntl.LOCK_EX)
+        process = subprocess.Popen(
+            ["bash", str(LAUNCHER), "--ready-only"],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            deadline = time.monotonic() + 3
+            while "Waiting for the readiness lock" not in output_path.read_text() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert "Waiting for the readiness lock" in output_path.read_text()
+            assert process.poll() is None
+            assert not any("robot-python" in line for line in calls(environment))
+            fcntl.flock(owner, fcntl.LOCK_UN)
+            assert process.wait(timeout=5) == 0, output_path.read_text()
+        finally:
+            fcntl.flock(owner, fcntl.LOCK_UN)
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+    log = calls(environment)
+    assert sum("prepare_ar3_gripper.py --connect" in line for line in log) == 1
+    assert any("node list --no-daemon --spin-time 3" in line for line in log)
+    assert "PREPARATION READY" in output_path.read_text()
+
+
+@pytest.mark.parametrize("task", ["arm", "front", "wrist", "tilt"])
+def test_device_task_locks_still_refuse_a_second_owner_immediately(environment, task):
+    state_root = Path(environment["XDG_RUNTIME_DIR"]) / f"ar3-lift-infer-{os.getuid()}-111"
+    state_root.mkdir()
+    with (state_root / f"{task}.lock").open("w") as owner:
+        fcntl.flock(owner, fcntl.LOCK_EX)
+        result = subprocess.run(
+            ["bash", str(LAUNCHER), "--task", task],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    assert result.returncode != 0
+    assert f"Task {task} already has an owner" in result.stderr
+    assert not calls(environment)
 
 
 def test_explicit_gripper_initialization_only_reaches_preparation(environment):

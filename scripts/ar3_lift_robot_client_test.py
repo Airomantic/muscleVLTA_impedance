@@ -334,6 +334,92 @@ def _robot(*, execute=True, **limits):
     return robot, measured
 
 
+@pytest.mark.parametrize("stale", ["state", "tau_m", "front", "wrist"])
+def test_wait_ready_waits_for_new_samples_at_requested_age_limits(monkeypatch, stale):
+    robot = client.Ar3Robot(execute=False, limits=client.Limits())
+    robot._status, robot._metadata = "monitoring:", CONTRACT
+    robot._state_at = robot._tau_m_at = 9.9
+    robot._images = {"front": (None, 9.9), "wrist": (None, 9.9)}
+    clock = FakeClock()
+    clock.now = 10.0
+    sleeps = []
+
+    def set_sample(timestamp):
+        if stale in ("state", "tau_m"):
+            setattr(robot, f"_{stale}_at", timestamp)
+        else:
+            robot._images[stale] = (None, timestamp)
+
+    def fresh_sample(seconds):
+        sleeps.append(seconds)
+        clock.sleep(seconds)
+        set_sample(clock())
+
+    set_sample(9.7)
+    monkeypatch.setattr(client.time, "monotonic", clock)
+    monkeypatch.setattr(client.time, "sleep", fresh_sample)
+    robot.wait_ready(1.0, need_tau_m=True)  # Backward-compatible initial discovery accepts ages below 1 s.
+    assert not sleeps
+    robot.wait_ready(1.0, need_tau_m=True, max_observation_age=0.25, max_image_age=0.2)
+    assert sleeps == [0.05]
+    assert not robot._armed
+    assert not robot._streaming
+
+
+def test_wait_ready_times_out_when_fresh_camera_frames_never_arrive(monkeypatch):
+    robot = client.Ar3Robot(execute=False, limits=client.Limits())
+    robot._status, robot._metadata = "monitoring:", CONTRACT
+    robot._state_at = robot._tau_m_at = 10.0
+    robot._images = {"front": (None, 9.7), "wrist": (None, 10.0)}
+    clock = FakeClock()
+    clock.now = 10.0
+    monkeypatch.setattr(client.time, "monotonic", clock)
+    monkeypatch.setattr(client.time, "sleep", clock.sleep)
+    with pytest.raises(client.RobotError, match="/front/color/image_raw"):
+        robot.wait_ready(0.1, need_tau_m=True, max_observation_age=0.25, max_image_age=0.2)
+    assert clock.now < 10.2
+    assert not robot._armed
+    assert not robot._streaming
+
+
+@pytest.mark.parametrize("check", [False, True])
+def test_session_refreshes_observations_after_setup_before_report_or_warmup(monkeypatch, check):
+    session = client.Session(client.parse_args([*(["--check"] if check else []), "--start-pose", *["0"] * 6]))
+    events = []
+    waits = []
+
+    def wait_ready(timeout, **kwargs):
+        waits.append(kwargs)
+        events.append("wait")
+
+    session.robot = types.SimpleNamespace(start=lambda **kwargs: None, wait_ready=wait_ready)
+    monkeypatch.setattr(session, "_configure_limits", lambda: events.append("parameters"))
+    gripper = types.SimpleNamespace(read=lambda: events.append("gripper") or 1000.0)
+    monkeypatch.setattr(client.DMGripper, "connect", lambda *args, **kwargs: gripper)
+    policy = types.SimpleNamespace(
+        get_server_metadata=lambda: {"reactive": True, "wrench_dim": 13, "action_horizon": 10}
+    )
+    monkeypatch.setattr(client, "connect_policy", lambda *args: policy)
+    monkeypatch.setattr(client, "ChunkPlanner", lambda *args, **kwargs: types.SimpleNamespace(horizon=10, latency=0))
+
+    def observe_after_setup(*args):
+        assert events == ["wait", "parameters", "gripper", "wait"]
+        assert waits == [
+            {"need_tau_m": True},
+            {"need_tau_m": True, "max_observation_age": 0.25, "max_image_age": 0.2},
+        ]
+        if not check:
+            raise RuntimeError("stop before activation")
+
+    monkeypatch.setattr(session, "_report", observe_after_setup)
+    monkeypatch.setattr(client, "warm_up", observe_after_setup)
+    if check:
+        assert session.run() == 0
+    else:
+        with pytest.raises(RuntimeError, match="stop before activation"):
+            session.run()
+
+
 def test_streamer_applies_teleoperation_lead_slew_and_session_parameters():
     robot, measured = _robot()
     target = (measured[0] + [0.2, 0.0, 0.0], Rotation.from_rotvec([0.5, 0, 0]).as_matrix() @ measured[1])
@@ -475,7 +561,7 @@ def test_controller_parameters_bound_the_command_shaping():
         "max_velocity": client.parameter_value(velocity),
         "command_timeout_s": 0.5,
     }
-    session = client.Session(client.parse_args([]))
+    session = client.Session(client.parse_args(["--start-pose", *["0"] * 6]))
     session.robot.controller_parameters = lambda names, timeout: {name: parameters.get(name) for name in names}
     session._configure_limits()
     assert session.limits.max_linear_speed == pytest.approx(0.03)
@@ -484,6 +570,70 @@ def test_controller_parameters_bound_the_command_shaping():
     parameters["command_timeout_s"] = 0.015
     with pytest.raises(client.RobotError, match="command_timeout_s"):
         session._configure_limits()
+
+
+def test_ros_shutdown_joins_spin_before_destroying_resources():
+    robot = client.Ar3Robot(execute=False, limits=client.Limits())
+    wake = threading.Event()
+    events = []
+
+    def spin():
+        wake.wait()
+        events.append("spin exited")
+
+    thread = threading.Thread(target=spin)
+
+    def stop_executor(*, timeout_sec):
+        events.append("shutdown")
+        wake.set()
+        return True
+
+    def destroy_node():
+        assert not thread.is_alive()
+        events.append("destroy node")
+
+    robot._ros = {
+        "executor": types.SimpleNamespace(shutdown=stop_executor),
+        "thread": thread,
+        "node": types.SimpleNamespace(destroy_node=destroy_node),
+        "rclpy": types.SimpleNamespace(try_shutdown=lambda: events.append("shutdown context")),
+    }
+    thread.start()
+    try:
+        robot.shutdown()
+        robot.shutdown()  # Repeated cleanup must not touch destroyed ROS resources.
+        assert events == ["shutdown", "spin exited", "destroy node", "shutdown context"]
+        assert robot._ros == {}
+    finally:
+        wake.set()
+        thread.join(timeout=1.0)
+
+
+def test_ros_shutdown_timeout_preserves_live_resources_and_reports_failure(monkeypatch):
+    session = client.Session(client.parse_args(["--start-pose", *["0"] * 6]))
+    robot = session.robot
+    release = threading.Event()
+    destroyed = []
+    thread = threading.Thread(target=release.wait)
+    robot._ros = {
+        "executor": types.SimpleNamespace(shutdown=lambda **kwargs: True),
+        "thread": thread,
+        "node": types.SimpleNamespace(destroy_node=lambda: destroyed.append("node")),
+        "rclpy": types.SimpleNamespace(try_shutdown=lambda: destroyed.append("context")),
+    }
+    shutdown = robot.shutdown
+    monkeypatch.setattr(robot, "shutdown", lambda: shutdown(timeout=0.01))
+    monkeypatch.setattr(client.signal, "signal", lambda *args: None)
+    thread.start()
+    try:
+        assert not session.close()
+        assert not destroyed
+        assert robot._ros["thread"] is thread
+    finally:
+        release.set()
+        thread.join(timeout=1.0)
+        shutdown()
+    assert destroyed == ["node", "context"]
 
 
 @dataclasses.dataclass
