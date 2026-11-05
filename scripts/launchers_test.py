@@ -117,3 +117,33 @@ def test_ratio_ablation_is_strict_and_uses_selected_task_name(launcher_env):
     assert "--no-allow-offline-warm-start" in arguments
     assert arguments[arguments.index("--exp-name") + 1].startswith("custom_task_ratio_1to2_")
     assert arguments[arguments.index("--task-description") + 1] == ""
+
+
+def test_ar3_dagger_launcher_continues_offline_checkpoint(launcher_env, tmp_path):
+    step = tmp_path / "ckpt" / "29999"
+    (step / "params").mkdir(parents=True)
+    (step / "assets" / "ar3_offline").mkdir(parents=True)
+    (step / "assets" / "ar3_offline" / "norm_stats.json").write_text("{}")
+    rounds = [tmp_path / "round 1", tmp_path / "round2"]
+    for directory in [tmp_path / "offline", *rounds]:
+        (directory / "meta").mkdir(parents=True)
+        (directory / "meta" / "info.json").write_text("{}")
+    (tmp_path / "home" / "big_vision").mkdir(parents=True)
+    (tmp_path / "home" / "big_vision" / "paligemma_tokenizer.model").write_text("")
+    launcher_env.update({"OPENPI_AR3_REPO_ID": str(tmp_path / "offline"), "OPENPI_DATA_HOME": str(tmp_path / "home")})
+
+    result = run_launcher("train_ar3_lift_dagger_gpu012.sh", launcher_env, str(step), *map(str, rounds))
+    assert result.returncode == 0, result.stderr
+    assert f"Initialization: {step}/params (norm stats: {step}/assets/ar3_offline)" in result.stdout
+    assert f"DAgger data:    {rounds[0]} {rounds[1]} (ratio 0.5 per batch)" in result.stdout
+    train = shlex.split(next(line for line in result.stdout.splitlines() if "scripts/train.py" in line)[2:])
+    assert train[2] == "pi05_ar3_lift_reactive_dagger"
+    assert train[train.index("--num-train-steps") + 1] == "10000"
+    assert train[train.index("--fsdp-devices") + 1] == "3"
+
+    result = run_launcher("train_ar3_lift_dagger_gpu012.sh", launcher_env, str(step))
+    assert result.returncode == 2
+    assert "Usage" in result.stderr
+    result = run_launcher("train_ar3_lift_dagger_gpu012.sh", launcher_env, str(step), str(tmp_path / "missing"))
+    assert result.returncode == 1
+    assert "not a LeRobot v3.0 recording" in result.stderr

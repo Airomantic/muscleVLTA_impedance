@@ -96,9 +96,16 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
-def _create_lerobot_v3_dataset(data_config: _config.DataConfig, action_horizon: int, *, decode_videos: bool) -> Dataset:
+def _create_lerobot_v3_dataset(
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    *,
+    decode_videos: bool,
+    repo_id: str | None = None,
+    intervention_only: bool = False,
+) -> Dataset:
     """LeRobot v3.0 datasets are read natively; the pinned LeRobot v2.1 library cannot load them."""
-    repo_id = data_config.repo_id
+    repo_id = repo_id or data_config.repo_id
     meta = _lerobot_v3.LeRobotV3Metadata(repo_id)
     available_features = set(meta.numeric_keys)
     action_sequence_keys = tuple(key for key in data_config.action_sequence_keys if key in available_features)
@@ -114,11 +121,86 @@ def _create_lerobot_v3_dataset(data_config: _config.DataConfig, action_horizon: 
         repo_id,
         sequence_keys=action_sequence_keys,
         sequence_length=action_horizon,
-        options=_lerobot_v3.LeRobotV3Options(decode_videos=decode_videos),
+        options=_lerobot_v3.LeRobotV3Options(decode_videos=decode_videos, intervention_only=intervention_only),
     )
     if data_config.prompt_from_task:
         return TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(meta.tasks)])
     return dataset
+
+
+class MixtureDataset(Dataset):
+    """A primary (offline) dataset followed by secondary (DAgger) datasets; ``MixtureSampler`` sets the ratio."""
+
+    def __init__(self, primary: Dataset, secondary: Sequence[Dataset]):
+        if not secondary:
+            raise ValueError("MixtureDataset needs at least one secondary dataset.")
+        self._datasets = [primary, *secondary]
+        self._offsets = np.cumsum([0, *(len(dataset) for dataset in self._datasets)])
+        self.primary_size = len(primary)
+        self.secondary_size = int(self._offsets[-1]) - self.primary_size
+
+    def __getitem__(self, index: SupportsIndex):
+        index = index.__index__()
+        if not 0 <= index < len(self):
+            raise IndexError(f"Index {index} out of range for dataset of length {len(self)}")
+        position = int(np.searchsorted(self._offsets, index, side="right")) - 1
+        return self._datasets[position][index - int(self._offsets[position])]
+
+    def __len__(self) -> int:
+        return int(self._offsets[-1])
+
+
+class MixtureSampler(torch.utils.data.Sampler[int]):
+    """Indices of a ``MixtureDataset`` in consecutive batches with exactly ``round(batch_size * ratio)`` secondary items.
+
+    LIFT samples every batch with a fixed offline:online ratio (1:1, ratio 0.5) instead of concatenating the data. An
+    epoch covers the primary dataset once (minus the remainder); the secondary items are reshuffled passes over the
+    secondary dataset. Every ``__iter__`` (TorchDataLoader restarts the loader after each epoch) is a new epoch.
+    """
+
+    def __init__(self, primary_size: int, secondary_size: int, batch_size: int, ratio: float, *, seed: int = 0):
+        self._secondary_per_batch = round(batch_size * ratio)
+        if not 0 < self._secondary_per_batch < batch_size:
+            raise ValueError(f"DAgger ratio {ratio} gives {self._secondary_per_batch} of {batch_size} items per batch.")
+        if secondary_size <= 0:
+            raise ValueError("The DAgger datasets have no samples.")
+        self._primary_per_batch = batch_size - self._secondary_per_batch
+        self._num_batches = primary_size // self._primary_per_batch
+        if self._num_batches == 0:
+            raise ValueError(f"The offline dataset ({primary_size} samples) is smaller than one batch share.")
+        self._primary_size = primary_size
+        self._secondary_size = secondary_size
+        self._batch_size = batch_size
+        self._seed = seed
+        self._epoch = 0
+        logging.info(
+            "DAgger mixture: %d offline + %d DAgger samples per batch of %d (%d offline, %d DAgger samples)",
+            self._primary_per_batch,
+            self._secondary_per_batch,
+            batch_size,
+            primary_size,
+            secondary_size,
+        )
+
+    def __len__(self) -> int:
+        return self._num_batches * self._batch_size
+
+    def __iter__(self) -> Iterator[int]:
+        rng = np.random.default_rng((self._seed, self._epoch))
+        self._epoch += 1
+        primary = rng.permutation(self._primary_size)[: self._num_batches * self._primary_per_batch]
+        needed = self._num_batches * self._secondary_per_batch
+        passes = -(-needed // self._secondary_size)
+        secondary = np.concatenate([rng.permutation(self._secondary_size) for _ in range(passes)])[:needed]
+        batches = np.concatenate(
+            [
+                primary.reshape(self._num_batches, self._primary_per_batch),
+                self._primary_size + secondary.reshape(self._num_batches, self._secondary_per_batch),
+            ],
+            axis=1,
+        )
+        # Shuffle within every batch, so each device shard gets a mixture as well.
+        yield from rng.permuted(batches, axis=1).reshape(-1).tolist()
 
 
 def create_torch_dataset(
@@ -139,7 +221,18 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
     if _lerobot_v3.is_lerobot_v3_dataset(repo_id):
-        return _create_lerobot_v3_dataset(data_config, action_horizon, decode_videos=decode_videos)
+        dataset = _create_lerobot_v3_dataset(data_config, action_horizon, decode_videos=decode_videos)
+        if not data_config.dagger_repo_ids:
+            return dataset
+        dagger = [
+            _create_lerobot_v3_dataset(
+                data_config, action_horizon, decode_videos=decode_videos, repo_id=dagger_repo_id, intervention_only=True
+            )
+            for dagger_repo_id in data_config.dagger_repo_ids
+        ]
+        return MixtureDataset(dataset, dagger)
+    if data_config.dagger_repo_ids:
+        raise ValueError("dagger_repo_ids are only supported with a LeRobot v3.0 offline dataset.")
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     available_features = set(dataset_meta.features)
@@ -260,6 +353,7 @@ def create_torch_data_loader(
         seed: The seed to use for shuffling the data.
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
+    mixture = dataset if isinstance(dataset, MixtureDataset) else None
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # Use TorchDataLoader for both frameworks
@@ -267,6 +361,8 @@ def create_torch_data_loader(
     # For JAX, divide by process count
     sampler = None
     if framework == "pytorch":
+        if mixture is not None:
+            raise NotImplementedError("DAgger mixtures (dagger_repo_ids) are only supported by the JAX trainer.")
         if torch.distributed.is_initialized():
             sampler = torch.utils.data.distributed.DistributedSampler(
                 dataset,
@@ -280,6 +376,10 @@ def create_torch_data_loader(
             local_batch_size = batch_size
     else:
         local_batch_size = batch_size // jax.process_count()
+        if mixture is not None:
+            sampler = MixtureSampler(
+                mixture.primary_size, mixture.secondary_size, local_batch_size, data_config.dagger_ratio, seed=seed
+            )
 
     logging.info(f"local_batch_size: {local_batch_size}")
     data_loader = TorchDataLoader(

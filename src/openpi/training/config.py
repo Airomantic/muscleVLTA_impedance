@@ -69,6 +69,18 @@ _DEFAULT_AR3_ASSET_ID = os.environ.get("OPENPI_AR3_ASSET_ID") or pathlib.Path(_D
 _DEFAULT_AR3_WEIGHT_PATH = os.environ.get(
     "OPENPI_AR3_WEIGHT_PATH", "/data/jiang/checkpoints/openpi-assets/checkpoints/pi05_base/params"
 )
+# AR3 DAgger post-training presets (pi05_ar3_lift*_dagger, scripts/train_ar3_lift_dagger_gpu012.sh): ':'-separated
+# LeRobot v3.0 recordings of scripts/ar3_lift_robot_client.py --dagger, the per-batch share of their human-correction
+# chunks (LIFT 1:1 offline:online = 0.5), the offline checkpoint params to continue from and its assets directory
+# (<step>/assets, so the offline normalization statistics are reused).
+_DEFAULT_AR3_DAGGER_REPO_IDS = tuple(
+    path for path in os.environ.get("OPENPI_AR3_DAGGER_REPO_IDS", "").split(":") if path
+)
+_DEFAULT_AR3_DAGGER_RATIO = float(os.environ.get("OPENPI_AR3_DAGGER_RATIO", "0.5"))
+_DEFAULT_AR3_DAGGER_INIT_PARAMS = os.environ.get(
+    "OPENPI_AR3_DAGGER_INIT_PARAMS", "<set OPENPI_AR3_DAGGER_INIT_PARAMS to the offline checkpoint <step>/params>"
+)
+_DEFAULT_AR3_DAGGER_ASSETS_DIR = os.environ.get("OPENPI_AR3_DAGGER_ASSETS_DIR") or None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -127,6 +139,12 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+
+    # DAgger post-training (LIFT stage two, LeRobot v3.0 only): robot rollout recordings with human corrections. Only
+    # chunks recorded entirely under human control (control_flag == -1, LIFT --online-intervention-only) are used, and
+    # every batch holds exactly round(batch_size * dagger_ratio) of them (LIFT: 1:1 offline:online, i.e. 0.5).
+    dagger_repo_ids: tuple[str, ...] = ()
+    dagger_ratio: float = 0.5
 
 
 class GroupFactory(Protocol):
@@ -619,6 +637,40 @@ def _ar3_lift_train_config(
     )
 
 
+def _ar3_lift_dagger_train_config(
+    name: str, model: pi0_config.Pi0Config, force_keys: tuple[str, ...] = ar3_lift_policy.FORCE_KEYS_WRENCH_TAU_M
+) -> TrainConfig:
+    """LIFT stage two on the AR3: continue an offline checkpoint on 1:1 offline + DAgger human-correction batches.
+
+    Like LIFT's online trainer, it starts from the complete offline params (its trained reactive expert is kept, not
+    copied from the action expert again), reuses the offline normalization statistics and keeps the constant 5e-5
+    learning rate (after a short warmup for the fresh optimizer state).
+    """
+    config = _ar3_lift_train_config(name, model, force_keys)
+    return dataclasses.replace(
+        config,
+        data=dataclasses.replace(
+            config.data,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                dagger_repo_ids=_DEFAULT_AR3_DAGGER_REPO_IDS,
+                dagger_ratio=_DEFAULT_AR3_DAGGER_RATIO,
+            ),
+            assets=AssetsConfig(assets_dir=_DEFAULT_AR3_DAGGER_ASSETS_DIR, asset_id=_DEFAULT_AR3_ASSET_ID),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(_DEFAULT_AR3_DAGGER_INIT_PARAMS),
+        copy_reactive_from_action_expert=False,
+        num_train_steps=10_000,
+        keep_period=2_000,
+    )
+
+
 # Use `get_config` if you need to get a config by name in your
 _CONFIGS = [
     TrainConfig(
@@ -858,6 +910,14 @@ _CONFIGS = [
     # Vision-only pi05 (LIFT's offline stage); its params can initialize the reactive presets via
     # OPENPI_AR3_WEIGHT_PATH, like the Book preset initializes from an offline checkpoint.
     _ar3_lift_train_config("pi05_ar3_lift", dataclasses.replace(pi05_ar3_lift_reactive, reactive_in_use=False)),
+    # DAgger post-training of the presets above (scripts/train_ar3_lift_dagger_gpu012.sh). Serve the resulting
+    # checkpoints with the matching offline preset name (same model; normalization statistics in the checkpoint).
+    _ar3_lift_dagger_train_config("pi05_ar3_lift_reactive_dagger", pi05_ar3_lift_reactive),
+    _ar3_lift_dagger_train_config(
+        "pi05_ar3_lift_reactive_wrench6_dagger",
+        dataclasses.replace(pi05_ar3_lift_reactive, wrench_dim=6),
+        force_keys=ar3_lift_policy.FORCE_KEYS_WRENCH,
+    ),
     TrainConfig(
         name="debug",
         data=FakeDataConfig(),
