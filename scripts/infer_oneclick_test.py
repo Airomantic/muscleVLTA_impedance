@@ -43,6 +43,8 @@ def environment(tmp_path):
         arm / "install/local_setup.bash",
         arm / "install/ar3_cartesian_impedance/share/ar3_cartesian_impedance/config/rt.yaml",
         arm / "scripts/ar3_wait_cartesian_state.py",
+        arm / "scripts/ar3_cartesian_impedance_teleop.py",
+        base / "bridge/config/MessageBridge.yaml",
         tilt / "camera_tilt_ros2.py",
         tilt / "usb_servo.py",
         cameras / "gemini_330_series.launch.py",
@@ -54,6 +56,9 @@ def environment(tmp_path):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()
     (checkpoint / "params").mkdir()
+    (arm / ".venv-teleop").mkdir()
+    _executable(base / "bridge/MessageBridge")
+    _executable(base / "puppetry/Puppetry")
     _executable(arm / "install/ar3_cartesian_impedance/lib/ar3_cartesian_impedance/cartesian_impedance_node")
     # Import checks (-c) are local and not logged; helper runs are.
     _executable(
@@ -113,6 +118,10 @@ elif [[ "$*" == *"${INFER_TEST_FAIL:-__none__}"* ]]; then
     exit 1
 elif [[ "$*" == *"/wrist/color/metadata"* ]]; then
     printf '%s\\n---\\n' "$INFER_TEST_WRIST_METADATA"
+elif [[ "$*" == *"param set"* ]]; then
+    printf 'Set parameter successful\n'
+elif [[ "$*" == *"param get"* ]]; then
+    printf 'Boolean value is: False\n'
 fi
 """,
     )
@@ -133,6 +142,8 @@ printf '\\n' >> "$INFER_TEST_CALLS"
             "INFER_SERVO_PYTHON": str(servo_python),
             "INFER_CAMERA_LAUNCH_DIR": str(cameras),
             "INFER_WRIST_DRIVER_OVERLAY": "",
+            "INFER_BRIDGE_DIR": str(base / "bridge"),
+            "INFER_PUPPETRY_DIR": str(base / "puppetry"),
             "INFER_ROS_SETUP": str(base / "setup.bash"),
             "INFER_ARM_INTERFACE": "lo",
             "INFER_CHECKPOINT": str(checkpoint),
@@ -643,6 +654,52 @@ def test_any_failed_readiness_step_never_reports_ready(environment, variable, va
         assert not any("topic echo" in line for line in calls(environment))
 
 
+def test_dagger_adds_teleoperation_and_gated_gripper_tasks_but_rejects_running_ones(environment):
+    result = run(environment, "--dagger")
+    assert result.returncode == 0, result.stderr
+    log = calls(environment)
+    tasks = [shlex.split(line)[-1] for line in log if line.startswith("terminal ")]
+    assert tasks == ["arm", "gripper", "front", "wrist", "tilt", "bridge", "puppetry", "teleop", "gate", "ready"]
+    assert "./MessageBridge" in result.stdout
+    assert "./Puppetry" in result.stdout
+    teleop = next(line for line in result.stdout.splitlines() if "impedance-teleop" in line)
+    assert "return_home_workspace_radius_m:=0.45" in teleop
+    gate = next(line for line in result.stdout.splitlines() if "ar3_dagger_gripper_teleop.sh" in line)
+    assert "--wait 360 --gripper-address 192.168.127.10:50008" in gate
+    assert "ar3_lift_robot_client" not in result.stdout
+    for nodes, message in [
+        ("/ar3_cartesian_impedance_teleop", "Teleoperation is running"),
+        ("/ar3_dagger_gripper_gate", "gripper gate already runs"),
+    ]:
+        environment["INFER_TEST_NODES"] = nodes
+        result = run(environment, "--dagger")
+        assert result.returncode != 0
+        assert message in result.stderr
+
+
+def test_dagger_readiness_enables_the_teleoperation_after_every_input_and_waits_for_the_gate(environment):
+    environment["INFER_TEST_NODES"] = "/ar3_cartesian_impedance_teleop\n/ar3_dagger_gripper_gate"
+    result = run(environment, "--task", "ready", "--dagger")
+    assert result.returncode == 0, result.stderr
+    assert "PREPARATION READY" in result.stdout
+    assert "--check --dagger" in result.stdout
+    log = calls(environment)
+
+    def index(text):
+        return next(i for i, line in enumerate(log) if text in line)
+
+    order = [
+        index("prepare_ar3_gripper.py --connect"),
+        index("prepare_ar3_gripper.py --check"),
+        index("/trigger_positions std_msgs/msg/Float64MultiArray"),
+        index("param set /ar3_cartesian_impedance_teleop dry_run false"),
+        index("param get /ar3_cartesian_impedance_teleop dry_run"),
+        max(i for i, line in enumerate(log) if "node list" in line),
+    ]
+    assert order == sorted(order)
+    assert order[-1] > order[-2]
+
+
 def test_robot_runner_requires_client_dependencies_before_starting_the_client(environment, tmp_path):
     log = tmp_path / "robot-calls"
     environment["INFER_ROBOT_PYTHON"] = str(
@@ -657,7 +714,11 @@ def test_robot_runner_requires_client_dependencies_before_starting_the_client(en
     text = log.read_text()
     assert "rclpy" in text
     assert "DM_V3Gripper.gripper_pb2" in text
+    assert "pyarrow" not in text
     assert "ar3_lift_robot_client.py" not in text
+    result = run(environment, "--execute", "--dagger", "--record-dir=rollouts", script=RUNNER)
+    assert result.returncode != 0
+    assert "pyarrow.parquet av" in log.read_text().splitlines()[-1]
 
 
 def test_robot_runner_runs_the_client_in_a_clean_ros_environment(environment, tmp_path):
@@ -676,3 +737,52 @@ def test_robot_runner_runs_the_client_in_a_clean_ros_environment(environment, tm
     assert not any(line.startswith(("PYTHONPATH=", "OPENPI_")) for line in lines)
     client = ROOT / "scripts/ar3_lift_robot_client.py"
     assert lines[-1] == f"ARGS -u {client} --host 10.0.0.5 --port 8100 --check --port 9000"
+
+
+def test_gripper_gate_runner_checks_the_gripper_modules_and_runs_in_a_clean_ros_environment(environment, tmp_path):
+    log = tmp_path / "gate-calls"
+    environment["INFER_ROBOT_PYTHON"] = str(
+        _executable(
+            tmp_path / "robot-python",
+            f'#!/bin/bash\n{{ env; printf "ARGS %s\\n" "$*"; }} >> {shlex.quote(str(log))}\n',
+        )
+    )
+    environment.update({"INFER_GRIPPER_HOST": "10.0.0.9", "PYTHONPATH": "/model/src"})
+    result = run(environment, "--check", script=ROOT / "scripts/ar3_dagger_gripper_teleop.sh")
+    assert result.returncode == 0, result.stderr
+    text = log.read_text()
+    assert "rclpy numpy grpc DM_V3Gripper.gripper_pb2" in text
+    lines = text.splitlines()
+    assert "ROS_DOMAIN_ID=111" in lines
+    assert not any(line.startswith("PYTHONPATH=") for line in lines)
+    gate = ROOT / "scripts/ar3_dagger_gripper_teleop.py"
+    assert lines[-1] == f"ARGS -u {gate} --gripper-address 10.0.0.9:50008 --check"
+
+
+def test_debugger_python_passes_every_argument_through_and_keeps_only_debugger_variables(environment, tmp_path):
+    log = tmp_path / "python-calls"
+    environment["INFER_ROBOT_PYTHON"] = str(
+        _executable(
+            tmp_path / "robot-python",
+            f'#!/bin/bash\n{{ env; printf "ARGS %s\\n" "$*"; }} >> {shlex.quote(str(log))}\n',
+        )
+    )
+    environment.update(
+        {
+            "DEBUGPY_LOG_DIR": "/debug/logs",
+            "PYDEVD_USE_FRAME_EVAL": "NO",
+            "ROS_LOG_DIR": "/ros/logs",
+            "PYTHONPATH": "/model/src",
+            "VIRTUAL_ENV": "/model/.venv",
+        }
+    )
+    client = ROOT / "scripts/ar3_lift_robot_client.py"
+    args = ["/ext/debugpy", "--connect", "127.0.0.1:5678", str(client), "--check", "--dagger"]
+    result = run(environment, *args, script=ROOT / "scripts/ar3_python.sh")
+    assert result.returncode == 0, result.stderr
+    lines = log.read_text().splitlines()
+    for kept in ("DEBUGPY_LOG_DIR=/debug/logs", "PYDEVD_USE_FRAME_EVAL=NO", "ROS_LOG_DIR=/ros/logs", "DISPLAY=:mock"):
+        assert kept in lines
+    assert "ROS_DOMAIN_ID=111" in lines
+    assert not any(line.startswith(("PYTHONPATH=", "VIRTUAL_ENV=")) for line in lines)
+    assert lines[-1] == "ARGS " + " ".join(args)

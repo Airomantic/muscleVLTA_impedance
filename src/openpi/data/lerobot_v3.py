@@ -58,6 +58,12 @@ class LeRobotV3Options:
     episodes: tuple[int, ...] | None = None
     # Number of video files kept open per (worker) process.
     max_open_videos: int = 16
+    # DAgger corrections (LIFT ``--online-intervention-only``): keep only samples whose whole chunk of
+    # ``sequence_length`` frames (clamped at the episode end) was recorded under human control, i.e. every
+    # ``intervention_key`` value equals ``intervention_value`` (control_flag: -1 human, +1 policy).
+    intervention_only: bool = False
+    intervention_key: str = "control_flag"
+    intervention_value: float = -1.0
 
 
 def is_lerobot_v3_dataset(repo_id_or_root: str | os.PathLike[str]) -> bool:
@@ -282,11 +288,21 @@ class LeRobotV3Dataset:
                 if key.endswith("_valid") and key in self._arrays:
                     flags = self._arrays[key]
                     valid &= np.all(flags.reshape(len(flags), -1) >= 0.5, axis=-1)
+        if self.options.intervention_only:
+            valid &= self._intervention_chunks()
         self._samples = np.flatnonzero(valid)
         if not len(self._samples):
-            raise ValueError(f"No valid frames in {self.meta.root}")
+            suffix = (
+                " (intervention_only: no chunk is entirely human-controlled)" if self.options.intervention_only else ""
+            )
+            raise ValueError(f"No valid frames in {self.meta.root}{suffix}")
         if skipped := len(valid) - len(self._samples):
-            logger.info("Skipping %d of %d frames whose *_valid flags are not set", skipped, len(valid))
+            logger.info(
+                "Skipping %d of %d frames (unset *_valid flags%s)",
+                skipped,
+                len(valid),
+                ", or chunks not entirely human-controlled" if self.options.intervention_only else "",
+            )
 
         self._warned_missing_videos: set[str] = set()
         self._video_decoder: _VideoDecoder | None = None
@@ -318,6 +334,18 @@ class LeRobotV3Dataset:
     def episode_bounds(self, episode_index: int) -> tuple[int, int]:
         """Returns the [start, end) row range of an episode in the frame table of this dataset."""
         return self._episode_bounds[episode_index]
+
+    def _intervention_chunks(self) -> np.ndarray:
+        key = self.options.intervention_key
+        if key not in self._arrays:
+            raise ValueError(f"intervention_only needs the '{key}' feature, which {self.meta.root} does not provide")
+        flags = self._arrays[key]
+        human = np.all(np.isclose(flags.reshape(len(flags), -1), self.options.intervention_value), axis=-1)
+        # Non-human rows before each row: rows [row, last] are all human iff the count does not change over them.
+        before = np.concatenate(([0], np.cumsum(~human)))
+        rows = np.arange(len(human))
+        last = np.minimum(rows + self.sequence_length - 1, self._episode_last_row)
+        return before[last + 1] == before[rows]
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         index = int(index)

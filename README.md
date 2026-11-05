@@ -307,6 +307,28 @@ scripts/ar3_lift_debug_python.sh scripts/debug_ar3_lift_robot.py -- --execute --
   --home-file ../ar3_CartesianImpedanceControl/config/cartesian_home.json
 ```
 
+**Record rollouts and DAgger corrections** (LIFT stage two). `--record-dir DIR` appends every episode the operator
+keeps to a LeRobot v3.0 dataset with the offline dataset's features (front/wrist video, TCP pose, gripper opening,
+TCP wrench, `tau_m`, the commanded 7D action) and `control_flag` (1 = policy, −1 = human); the robot Python also needs
+`pip install pyarrow av`. With `--dagger`, each episode starts at the recorded start pose and runs the policy; pressing
+the teleoperation clutch hands the arm to the operator at once, and the gripper follows the trigger once the trigger
+has matched the fingers' opening ([scripts/ar3_dagger_gripper_teleop.py](scripts/ar3_dagger_gripper_teleop.py)).
+Releasing the clutch ends the episode; the terminal then asks whether to save it.
+
+```bash
+./infer_oneclick.sh --dagger    # also MessageBridge, Puppetry, the Cartesian teleoperation and the gated gripper
+scripts/run_ar3_lift_robot.sh --check --dagger
+scripts/run_ar3_lift_robot.sh --execute --dagger --record-dir outputs/ar3_lift_dagger/round1  # MOVES; clutch = takeover
+# GPU server (after copying the round's dataset): the offline checkpoint plus every correction dataset so far
+bash scripts/train_ar3_lift_dagger_gpu012.sh <offline step dir> /data/jiang/ar3_dagger/round1
+```
+
+As in LIFT, training uses only action chunks recorded entirely under human control and samples offline
+demonstrations and corrections 1:1 in every batch; serve the result with `scripts/serve_ar3_lift.sh` and repeat
+collection and training for several rounds. [.vscode/launch.json](.vscode/launch.json) has debug configurations for
+these client modes, the gripper gate check and local serving; the robot side runs through
+[scripts/ar3_python.sh](scripts/ar3_python.sh).
+
 ## 🙏 Acknowledgements
 
 LIFT is built on [OpenPI (π₀/π₀.₅)](https://github.com/Physical-Intelligence/openpi).
