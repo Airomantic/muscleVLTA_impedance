@@ -310,9 +310,10 @@ scripts/ar3_lift_debug_python.sh scripts/debug_ar3_lift_robot.py -- --execute --
 **Record rollouts and DAgger corrections** (LIFT stage two). `--record-dir DIR` appends every episode the operator
 keeps to a LeRobot v3.0 dataset with the offline dataset's features (front/wrist video, TCP pose, gripper opening,
 TCP wrench, `tau_m`, the commanded 7D action) and `control_flag` (1 = policy, −1 = human); the robot Python also needs
-`pip install pyarrow av`. With `--dagger`, each episode starts at the recorded start pose and runs the policy; pressing
-the teleoperation clutch hands the arm to the operator at once, and the gripper follows the trigger once the trigger
-has matched the fingers' opening ([scripts/ar3_dagger_gripper_teleop.py](scripts/ar3_dagger_gripper_teleop.py)).
+`pip install pyarrow av`. With `--dagger`, each episode starts at the saved home (as `--move-to-start`) and runs the
+policy; pressing the teleoperation clutch hands the arm to the operator at once, and the gripper follows the trigger
+once the trigger has matched the fingers' opening
+([scripts/ar3_dagger_gripper_teleop.py](scripts/ar3_dagger_gripper_teleop.py)).
 Releasing the clutch ends the episode; the terminal then asks whether to save it.
 
 ```bash
@@ -325,9 +326,19 @@ bash scripts/train_ar3_lift_dagger_gpu012.sh <offline step dir> /data/jiang/ar3_
 
 As in LIFT, training uses only action chunks recorded entirely under human control and samples offline
 demonstrations and corrections 1:1 in every batch; serve the result with `scripts/serve_ar3_lift.sh` and repeat
-collection and training for several rounds. [.vscode/launch.json](.vscode/launch.json) has debug configurations for
-these client modes, the gripper gate check and local serving; the robot side runs through
-[scripts/ar3_python.sh](scripts/ar3_python.sh).
+collection and training for several rounds.
+
+In VS Code, `AR3 LIFT：真机推理并录制回合` records policy rollouts to `outputs/ar3_lift_rollouts`. For DAgger, run
+`./infer_oneclick.sh --dagger` in a terminal first, then `AR3 LIFT DAgger：检查` and
+`AR3 LIFT DAgger：推理+接管纠正采集` (it asks for the dataset directory). Both load the local policy like the
+configurations above but use `--hardware skip`: device preparation would refuse the running teleoperation as a
+conflicting command source. `AR3 LIFT DAgger：夹爪门控检查` prints the trigger → gripper target mapping without
+moving the gripper. The command line equivalent of the collection is:
+
+```bash
+scripts/ar3_lift_debug_python.sh scripts/debug_ar3_lift_robot.py --hardware skip -- --execute --dagger \
+  --record-dir outputs/ar3_lift_dagger/round1 --home-file ../ar3_CartesianImpedanceControl/config/cartesian_home.json
+```
 
 ## 🙏 Acknowledgements
 

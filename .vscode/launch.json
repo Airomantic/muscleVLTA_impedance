@@ -70,6 +70,102 @@
                 "--", "--max-chunks", "3",
                 "--task=Unplug the white charging plug from the white socket and place it on the table, don't bump your fingers into other objects"
             ]
+        },
+        {
+            "name": "AR3 LIFT：真机推理并录制回合（每回合回起点并执行）",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/scripts/ar3_lift_debug_python.sh",
+            "program": "${workspaceFolder}/scripts/debug_ar3_lift_robot.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "subProcess": false,
+            "env": {
+                "INFER_ROS_DOMAIN_ID": "111",
+                "INFER_AR3_WS": "${workspaceFolder}/../ar3_CartesianImpedanceControl",
+                "OPENPI_PYTHON": "${workspaceFolder}/.venv/bin/python",
+                "OPENPI_SERVE_GPU": "0"
+            },
+            "args": [
+                "--checkpoint", "${workspaceFolder}/infer_checkpoint/20000",
+                "--hardware", "auto",
+                "--", "--execute",
+                "--record-dir", "${workspaceFolder}/outputs/ar3_lift_rollouts",
+                "--home-file", "${workspaceFolder}/../ar3_CartesianImpedanceControl/config/cartesian_home.json",
+                "--task=Unplug the white charging plug from the white socket and place it on the table, don't bump your fingers into other objects"
+            ]
+        },
+        {
+            "name": "AR3 LIFT DAgger：检查（先运行 ./infer_oneclick.sh --dagger）",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/scripts/ar3_lift_debug_python.sh",
+            "program": "${workspaceFolder}/scripts/debug_ar3_lift_robot.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "subProcess": false,
+            "env": {
+                "INFER_ROS_DOMAIN_ID": "111",
+                "INFER_AR3_WS": "${workspaceFolder}/../ar3_CartesianImpedanceControl",
+                "OPENPI_PYTHON": "${workspaceFolder}/.venv/bin/python",
+                "OPENPI_SERVE_GPU": "0"
+            },
+            "args": [
+                "--checkpoint", "${workspaceFolder}/infer_checkpoint/20000",
+                "--hardware", "skip",
+                "--", "--check", "--dagger",
+                "--task=Unplug the white charging plug from the white socket and place it on the table, don't bump your fingers into other objects"
+            ]
+        },
+        {
+            "name": "AR3 LIFT DAgger：推理+接管纠正采集（先运行 ./infer_oneclick.sh --dagger）",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/scripts/ar3_lift_debug_python.sh",
+            "program": "${workspaceFolder}/scripts/debug_ar3_lift_robot.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "subProcess": false,
+            "env": {
+                "INFER_ROS_DOMAIN_ID": "111",
+                "INFER_AR3_WS": "${workspaceFolder}/../ar3_CartesianImpedanceControl",
+                "OPENPI_PYTHON": "${workspaceFolder}/.venv/bin/python",
+                "OPENPI_SERVE_GPU": "0"
+            },
+            "args": [
+                "--checkpoint", "${workspaceFolder}/infer_checkpoint/20000",
+                "--hardware", "skip",
+                "--", "--execute", "--dagger",
+                "--record-dir", "${input:ar3LiftDaggerDir}",
+                "--home-file", "${workspaceFolder}/../ar3_CartesianImpedanceControl/config/cartesian_home.json",
+                "--task=Unplug the white charging plug from the white socket and place it on the table, don't bump your fingers into other objects"
+            ]
+        },
+        {
+            "name": "AR3 LIFT DAgger：夹爪门控检查（不动）",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/scripts/ar3_lift_debug_python.sh",
+            "program": "${workspaceFolder}/scripts/ar3_dagger_gripper_teleop.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "subProcess": false,
+            "env": {
+                "INFER_ROS_DOMAIN_ID": "111"
+            },
+            "args": ["--check"]
+        }
+    ],
+    "inputs": [
+        {
+            "id": "ar3LiftDaggerDir",
+            "type": "promptString",
+            "description": "DAgger 纠正数据集目录（LeRobot v3.0，已存在则追加；建议每轮一个；相对路径相对本仓库）",
+            "default": "outputs/ar3_lift_dagger/round1"
         }
     ]
 }

@@ -177,16 +177,19 @@ def test_vscode_configurations_pass_arguments_the_launcher_and_scripts_accept(tm
         if name.startswith(("INFER_", "OPENPI_")):
             monkeypatch.delenv(name)
     parsers = {"ar3_dagger_gripper_teleop.py": gate.parse_args}
+    inputs = {f"${{input:{item['id']}}}": item["default"] for item in launch.get("inputs", [])}
     assert launch["configurations"]
     for config in launch["configurations"]:
         program = Path(config["program"].replace("${workspaceFolder}", str(root)))
         assert program.is_file(), config["name"]
         for name, value in config.get("env", {}).items():
             monkeypatch.setenv(name, value.replace("${workspaceFolder}", str(workspace)))
-        args = [arg.replace("${workspaceFolder}", str(workspace)) for arg in config["args"]]
+        args = [inputs.get(arg, arg).replace("${workspaceFolder}", str(workspace)) for arg in config["args"]]
         if program.name == "debug_ar3_lift_robot.py":
-            _, client_args = debug.parse_args(args)
-            client.parse_args(client_args)
+            launcher, client_args = debug.parse_args(args)
+            options = client.parse_args(client_args)
+            # DAgger reuses the teleoperation of ./infer_oneclick.sh --dagger (auto/ready refuse it).
+            assert not options.dagger or launcher.hardware == "skip", config["name"]
         else:
             parsers[program.name](args)
     assert set(re.findall(r"\$\{input:(\w+)\}", text)) == {item["id"] for item in launch.get("inputs", [])}
