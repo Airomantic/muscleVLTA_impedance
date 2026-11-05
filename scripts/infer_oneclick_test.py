@@ -303,7 +303,11 @@ def test_robot_runner_requires_client_dependencies_before_starting_the_client(en
     text = log.read_text()
     assert "rclpy" in text
     assert "DM_V3Gripper.gripper_pb2" in text
+    assert "pyarrow" not in text
     assert "ar3_lift_robot_client.py" not in text
+    result = run(environment, "--execute", "--dagger", "--record-dir=rollouts", script=RUNNER)
+    assert result.returncode != 0
+    assert "pyarrow.parquet av" in log.read_text().splitlines()[-1]
 
 
 def test_robot_runner_runs_the_client_in_a_clean_ros_environment(environment, tmp_path):

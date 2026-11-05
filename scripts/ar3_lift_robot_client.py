@@ -26,11 +26,23 @@ Each action chunk follows the recording / training layout (10 Hz, action horizon
 
 Safety: without ``--execute`` it is a dry run (targets only on ``preview_command``; no enable, no gripper writes). It
 never takes over a controller session it does not own, refuses to run next to another arm command source (the
-teleoperation), and stops on stale sensors, tracking-limit violations, controller faults, policy timeouts, gripper
-errors and Ctrl+C, waiting for the controller to confirm ``stopped``.
+teleoperation, except with ``--dagger``), and stops on stale sensors, tracking-limit violations, controller faults,
+policy timeouts, gripper errors and Ctrl+C, waiting for the controller to confirm ``stopped``.
+
+Recording and DAgger (``--record-dir DIR``, ``--dagger``): episodes (move to the start pose, policy rollout, operator
+prompt to save or discard) are appended to a LeRobot v3.0 dataset with the features of the lerobot AR3 recordings
+(``scripts/ar3_lift_recorder.py``: front / wrist videos, TCP pose, gripper position, TCP wrench, ``tau_m``, the
+accepted TCP target + gripper target as ``actions``, ``control_flag``). With ``--dagger`` the AR3 teleoperation runs
+next to the client for LIFT's human-in-the-loop corrections: pressing its clutch takes over at once (the client stops
+commanding; the teleoperation continues the same controller session from the measured TCP, and the gated gripper
+teleoperation ``scripts/ar3_dagger_gripper_teleop.sh`` gets the gripper once its trigger matches the fingers).
+Releasing the clutch ends the episode (the teleoperation stops the arm). Frames commanded by the operator get
+``control_flag`` -1, policy frames +1; ``scripts/train_ar3_lift_dagger_gpu012.sh`` trains on the human chunks 1:1 with
+the offline demonstrations.
 """
 
 import argparse
+import collections
 from collections.abc import Sequence
 import dataclasses
 import functools
@@ -38,11 +50,12 @@ import json
 import logging
 import math
 import pathlib
+import queue
 import signal
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 
@@ -73,12 +86,46 @@ RT_CONTRACT = {
 }
 RPY_CONVENTION = "TCP xyz[m],rpy[rad];Rz*Ry*Rx"
 WORKSPACE_RECENTER = "active_hold_once_v1"
+TELEOP_NODE = "ar3_cartesian_impedance_teleop"
 # Other arm command sources: the impedance teleoperation and the legacy joint driver.
-CONFLICTING_NODES = frozenset({"ar3_cartesian_impedance_teleop", "rokae_driver7"})
+CONFLICTING_NODES = frozenset({TELEOP_NODE, "rokae_driver7"})
 GRIPPER_RPC_PREFIX = "/gripper.GripperService/"
 GRIPPER_PREPARATION = (
     "Prepare the gripper first: ./infer_oneclick.sh --ready-only "
     "(add --initialize-gripper once after power-up; it moves the fingers)."
+)
+# Recording / DAgger.
+RECORD_FPS = 10  # frame rate of the training data
+HUMAN_FLAG, POLICY_FLAG = -1, 1  # control_flag of the recordings: teleoperated / policy-controlled frame
+# Latched Bool: tells the gated gripper teleoperation (scripts/ar3_dagger_gripper_teleop.py) when the operator has
+# taken over.
+HUMAN_CONTROL_TOPIC = "/ar3_lift/human_control"
+GRIPPER_ACTION_TOPIC = "/v3_gripper/action"  # gripper teleoperation target (JointState position, 0..1 = SDK / 1000)
+GRIPPER_GATE_NODE = "ar3_dagger_gripper_gate"
+# V3_Gripper's teleop_gripper.py (lerobot scripts/ar3_gripper_teleop.sh): it always follows the trigger.
+UNGATED_GRIPPER_NODES = frozenset({"v3_gripper_teleop"})
+# Like the lerobot recorder, a frame describes host time T = now - SYNC_DELAY, so all inputs around T have arrived.
+SYNC_DELAY = 0.1
+# Inputs older than this (camera frames: further from T) give the frame the policy flag (it is not trained on).
+STALE_LIMITS = {"state": 0.1, "tau_m": 0.1, "action": 0.2, "gripper": 0.3, "camera": 0.1}
+TELEOP_ACTIVITY = 0.1  # a teleoperated frame needs a teleoperation command within this time before T
+# Sample history per input (state / tau_m / accepted_command up to 1 kHz, commands 100 Hz, cameras 30 Hz).
+STREAM_SIZES = {
+    "state": 4096,
+    "tau_m": 4096,
+    "accepted": 4096,
+    "commanded": 512,
+    "front": 16,
+    "wrist": 16,
+    "control": 64,
+    "teleop": 512,
+    "human_gripper": 128,
+}
+DAGGER_HELP = (
+    "DAgger: each episode moves the arm to the start pose and runs the policy. When it goes wrong, press the "
+    "teleoperation clutch: you control the arm at once (the gripper follows once its trigger matches the fingers). "
+    "Finish the task and release the clutch to end the episode. Enter = end the episode without a takeover, Ctrl+C = "
+    "abort. Do not press the clutch between episodes."
 )
 
 
@@ -92,6 +139,10 @@ class GripperError(RuntimeError):
 
 class PolicyError(RuntimeError):
     """The policy server failed or was too slow."""
+
+
+class HumanTakeover(Exception):  # noqa: N818
+    """DAgger: the operator pressed the teleoperation clutch, so the policy no longer commands the robot."""
 
 
 # Pose math. Poses are (xyz [m], 3x3 rotation matrix); the controller uses SDK roll/pitch/yaw, R = Rz @ Ry @ Rx.
@@ -193,10 +244,15 @@ def pose_from_vector(pose6: Sequence[float]) -> tuple[np.ndarray, np.ndarray]:
     return pose6[:3].copy(), rpy_matrix(pose6[3:6])
 
 
+def pose_rotvec(pose6: Sequence[float]) -> np.ndarray:
+    """Controller pose (xyz + SDK rpy) -> xyz + rotation vector: the pose layout of the recordings."""
+    position, rotation = pose_from_vector(pose6)
+    return np.concatenate([position, matrix_rotvec(rotation)])
+
+
 def policy_state(pose6: Sequence[float], gripper_position: float) -> np.ndarray:
     """``observation/state`` as recorded: TCP xyz + rotation vector (of the SDK rpy) + gripper position 0..1000."""
-    position, rotation = pose_from_vector(pose6)
-    return np.concatenate([position, matrix_rotvec(rotation), [float(gripper_position)]]).astype(np.float32)
+    return np.concatenate([pose_rotvec(pose6), [float(gripper_position)]]).astype(np.float32)
 
 
 def absolute_target(action: Sequence[float], state: Sequence[float]) -> tuple[np.ndarray, np.ndarray]:
@@ -295,6 +351,8 @@ class DMGripper:
         self._pending: Any = None
         self._last_sent: int | None = None
         self._touched = False
+        # Newest target of the policy (recorded as the gripper action of policy frames).
+        self.target: float | None = None
 
     @classmethod
     def connect(cls, address: str, *, writable: bool, **kwargs: Any) -> "DMGripper":
@@ -341,6 +399,7 @@ class DMGripper:
         if not math.isfinite(position):
             raise GripperError(f"non-finite gripper action {position}")
         target = round(min(max(float(position), 0.0), GRIPPER_OPEN))
+        self.target = float(target)
         if self._pending is not None:
             if not self._pending.done():
                 return
@@ -351,12 +410,20 @@ class DMGripper:
         self._pending = self._operations["SetTargetPosition"].future(self._encode(target), timeout=self._rpc_timeout)
         self._last_sent = target
 
-    def wait_position(self, target: float, *, tolerance: float, timeout: float) -> float:
+    def forget_target(self) -> None:
+        """Someone else (the gripper teleoperation) may have moved the fingers: send the next target in any case."""
+        self._last_sent = None
+        self.target = None
+
+    def wait_position(self, target: float, *, tolerance: float, timeout: float, idle: Any = None) -> float:
+        """Waits for the fingers to reach ``target``; ``idle()`` runs while waiting (e.g. the robot heartbeat)."""
         deadline = time.monotonic() + timeout
         while True:
             position = self.read()
             if abs(position - target) <= tolerance or time.monotonic() > deadline:
                 return position
+            if idle is not None:
+                idle()
             time.sleep(0.05)
 
     def stop(self) -> None:
@@ -419,6 +486,46 @@ class Limits:
     workspace_margin: float = 0.02
 
 
+class Sample(NamedTuple):
+    received: float  # host monotonic time of receipt
+    value: Any
+    stamp: float = 0.0  # source time stamp (ROS header / wall clock), 0 if unknown
+    index: int = 0  # message counter (camera frames)
+
+
+class Stream:
+    """Recent samples of one recorded input, in receipt order (guarded by the owner's lock)."""
+
+    def __init__(self, maxlen: int) -> None:
+        self._samples: collections.deque[Sample] = collections.deque(maxlen=maxlen)
+
+    def add(self, sample: Sample) -> None:
+        self._samples.append(sample)
+
+    def before(self, t: float) -> Sample | None:
+        """Newest sample received at or before ``t``."""
+        for sample in reversed(self._samples):
+            if sample.received <= t:
+                return sample
+        return None
+
+    def at(self, t: float) -> Sample | None:
+        """Value at ``t``: the newest sample up to ``t``, else the oldest one."""
+        sample = self.before(t)
+        return sample if sample is not None or not self._samples else self._samples[0]
+
+    def nearest(self, t: float) -> Sample | None:
+        return min(self._samples, key=lambda sample: abs(sample.received - t), default=None)
+
+    def clear(self) -> None:
+        self._samples.clear()
+
+
+def _stamp(message: Any) -> float:
+    stamp = message.header.stamp
+    return stamp.sec + stamp.nanosec * 1e-9
+
+
 class Ar3Robot:
     """ROS 2 side: sensors, controller status / services and the 100 Hz command streamer.
 
@@ -426,12 +533,24 @@ class Ar3Robot:
     previous command at ``max_*_speed``; previous and new commands must stay within the tracking limits (else stop).
     Commands carry the session's stiffness / damping / mass (``state[12:]``) and zero desired wrench. All of this is
     the AR3 teleoperation's shaping, so the policy commands the arm the way the training data was produced.
+
+    ``record`` keeps a short history of every input for ``RolloutRecorder``. ``dagger``: the AR3 teleoperation runs
+    alongside; its clutch hands the active controller session over to it (``HumanTakeover``) without stopping it.
     """
 
-    def __init__(self, *, execute: bool, limits: Limits, prefix: str = "/ar3/cartesian_impedance") -> None:
+    def __init__(
+        self,
+        *,
+        execute: bool,
+        limits: Limits,
+        prefix: str = "/ar3/cartesian_impedance",
+        dagger: bool = False,
+        record: bool = False,
+    ) -> None:
         self.execute = execute
         self.limits = limits
         self.prefix = prefix.rstrip("/")
+        self.dagger = dagger
         self._lock = threading.RLock()
         self._state: np.ndarray | None = None
         self._state_at = -math.inf
@@ -456,9 +575,20 @@ class Ar3Robot:
         self._last_tick = time.monotonic()
         self._clamp_logged_at = -math.inf
         self._ros: dict[str, Any] = {}
+        self._streams = {name: Stream(size) for name, size in STREAM_SIZES.items()} if record else {}
+        self._camera_counts: dict[str, int] = {}
+        # DAgger takeover: clutch state, press / release host times, teleoperation commands since the press.
+        self._clutch = False
+        self._takeover_at: float | None = None
+        self._released_at: float | None = None
+        self._teleop_commands = 0
+        self._published: collections.deque[tuple[float, ...]] = collections.deque(maxlen=8)
+        self._teleop_status: dict | None = None
 
     # ROS wiring (rclpy is imported lazily so the logic is testable without ROS).
-    def start(self, *, front_topic: str, wrist_topic: str, controller_node: str) -> None:
+    def start(
+        self, *, front_topic: str, wrist_topic: str, controller_node: str, clutch_topic: str = "/clutch/right"
+    ) -> None:
         try:
             from rcl_interfaces.srv import GetParameters
             import rclpy
@@ -470,6 +600,8 @@ class Ar3Robot:
             from rclpy.qos import qos_profile_sensor_data
             from rclpy.signals import SignalHandlerOptions
             from sensor_msgs.msg import Image
+            from sensor_msgs.msg import JointState
+            from std_msgs.msg import Bool
             from std_msgs.msg import Float64MultiArray
             from std_msgs.msg import String
             from std_srvs.srv import SetBool
@@ -501,6 +633,21 @@ class Ar3Robot:
         self._camera_topics = {"front": front_topic, "wrist": wrist_topic}
         for name, topic in self._camera_topics.items():
             node.create_subscription(Image, topic, functools.partial(self._on_image, name), image_qos)
+        if self._streams:
+            node.create_subscription(
+                Float64MultiArray, self.prefix + "/accepted_command", self._on_accepted, qos_profile_sensor_data
+            )
+        latched = QoSProfile(
+            depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL
+        )
+        if self.dagger:
+            # Same QoS as the teleoperation's subscriptions / publishers.
+            node.create_subscription(Bool, clutch_topic, self._on_clutch, 10)
+            node.create_subscription(Float64MultiArray, self.prefix + "/command", self._on_command, 10)
+            node.create_subscription(JointState, GRIPPER_ACTION_TOPIC, self._on_gripper_action, 10)
+            node.create_subscription(
+                String, self.prefix + "/teleop/return_home_status", self._on_teleop_status, latched
+            )
         self._ros = {
             "rclpy": rclpy,
             "node": node,
@@ -516,6 +663,10 @@ class Ar3Robot:
             "Trigger": Trigger,
             "GetParameters": GetParameters,
         }
+        if self.dagger:
+            self._ros["Bool"] = Bool
+            self._ros["human_control"] = node.create_publisher(Bool, HUMAN_CONTROL_TOPIC, latched)
+            self._publish_human_control(active=False)
         node.create_timer(1.0 / self.limits.rate_hz, self._tick)
         executor = SingleThreadedExecutor()
         executor.add_node(node)
@@ -533,10 +684,16 @@ class Ar3Robot:
         if not self._ros:
             return
         try:
+            self._publish_human_control(active=False)
             self._ros["executor"].shutdown(timeout_sec=1.0)
             self._ros["node"].destroy_node()
         finally:
             self._ros["rclpy"].try_shutdown()
+
+    def _publish_human_control(self, *, active: bool) -> None:
+        publisher = self._ros.get("human_control")
+        if publisher is not None:
+            publisher.publish(self._ros["Bool"](data=active))
 
     def _call(self, name: str, request: Any, timeout: float = 2.0, idle: Any = None) -> Any:
         """Calls a controller service; ``idle`` runs while waiting (e.g. ``heartbeat`` while streaming)."""
@@ -566,16 +723,88 @@ class Ar3Robot:
                 self._halt_locked("invalid controller state message")
                 return
             self._state, self._state_at = values, time.monotonic()
+            self._add_locked("state", Sample(self._state_at, values))
 
     def _on_tau_m(self, message: Any) -> None:
         values = np.asarray(message.data, dtype=float)
         if values.shape == (TAU_M_SIZE,) and np.isfinite(values).all():
             with self._lock:
                 self._tau_m, self._tau_m_at = values, time.monotonic()
+                self._add_locked("tau_m", Sample(self._tau_m_at, values))
 
     def _on_image(self, name: str, message: Any) -> None:
+        now = time.monotonic()
         with self._lock:
-            self._images[name] = (message, time.monotonic())
+            self._images[name] = (message, now)
+            if self._streams:
+                index = self._camera_counts[name] = self._camera_counts.get(name, -1) + 1
+                self._add_locked(name, Sample(now, message, _stamp(message), index))
+
+    def _on_accepted(self, message: Any) -> None:
+        values = np.asarray(message.data, dtype=float)
+        if values.shape == (STATE_SIZE,) and np.isfinite(values).all():
+            with self._lock:
+                self._add_locked("accepted", Sample(time.monotonic(), values[:6].copy()))
+
+    def _on_clutch(self, message: Any) -> None:
+        pressed = bool(message.data)
+        now = time.monotonic()
+        with self._lock:
+            was, self._clutch = self._clutch, pressed
+            if pressed and not was:
+                if self._takeover_at is None and (self._streaming or (self._armed and not self._stopping)):
+                    self._take_over_locked(now)
+            elif was and not pressed and self._takeover_at is not None and self._released_at is None:
+                # The teleoperation now stops the arm (its clutch release ends a session it did not start).
+                self._released_at = now
+                self._add_locked("control", Sample(now, POLICY_FLAG))
+                self._publish_human_control(active=False)
+                logger.info("clutch released: the takeover ended")
+
+    def _take_over_locked(self, now: float) -> None:
+        """Stops commanding at once without stopping the controller: the teleoperation continues the session (its
+        enable keeps an armed session, and both send the session stiffness with zero desired wrench)."""
+        self._streaming = self._armed = self._sdk_active = self._stopping = False
+        self._target = None
+        self._takeover_at, self._released_at, self._teleop_commands = now, None, 0
+        self._add_locked("control", Sample(now, HUMAN_FLAG))
+        self._publish_human_control(active=True)
+        logger.warning("clutch pressed: the operator controls the robot (DAgger takeover)")
+
+    def _on_command(self, message: Any) -> None:
+        values = tuple(message.data)
+        now = time.monotonic()
+        with self._lock:
+            # Only teleoperation commands: not before the takeover, after the release, or this client's own.
+            if self._takeover_at is None or self._released_at is not None or values in self._published:
+                return
+            self._teleop_commands += 1
+            self._add_locked("teleop", Sample(now, None))
+
+    def _on_gripper_action(self, message: Any) -> None:
+        if not len(message.position):
+            return
+        position = float(message.position[0]) * GRIPPER_OPEN
+        if not math.isfinite(position):
+            return
+        now = time.monotonic()
+        with self._lock:
+            if self._takeover_at is not None and self._released_at is None:
+                self._add_locked("human_gripper", Sample(now, min(max(position, 0.0), GRIPPER_OPEN), _stamp(message)))
+
+    def _on_teleop_status(self, message: Any) -> None:
+        try:
+            status = json.loads(message.data)
+        except ValueError:
+            return
+        if isinstance(status, dict):
+            with self._lock:
+                self._teleop_status = status
+
+    def _add_locked(self, name: str, sample: Sample) -> None:
+        stream = self._streams.get(name)
+        if stream is not None:
+            stream.add(sample)
 
     def _on_metadata(self, message: Any) -> None:
         try:
@@ -638,6 +867,9 @@ class Ar3Robot:
             self._ros["preview"].publish(message)
             if self.execute:
                 self._ros["command"].publish(message)
+            if self.dagger:
+                self._published.append(tuple(message.data))
+            self._add_locked("commanded", Sample(now, values[:6].copy()))
 
     def next_command(self, now: float, dt: float) -> np.ndarray:
         """Shapes the next 30-value controller command (call with the lock held); ValueError means stop."""
@@ -719,10 +951,15 @@ class Ar3Robot:
             return dict(self._metadata or {})
 
     def command_sources(self) -> tuple[int, list[str]]:
-        """Other publishers on ``{prefix}/command`` and running conflicting nodes (teleoperation, legacy driver)."""
+        """Other publishers on ``{prefix}/command`` and running conflicting nodes (teleoperation, legacy driver).
+
+        With ``dagger`` the AR3 teleoperation is expected: it only commands while its clutch is pressed.
+        """
         node = self._ros["node"]
-        others = node.count_publishers(self.prefix + "/command") - int(self.execute)
-        conflicts = sorted({name for name, _ in node.get_node_names_and_namespaces()} & CONFLICTING_NODES)
+        allowed = {TELEOP_NODE} if self.dagger else set()
+        publishers = node.get_publishers_info_by_topic(self.prefix + "/command")
+        others = sum(info.node_name not in allowed for info in publishers) - int(self.execute)
+        conflicts = sorted({name for name, _ in node.get_node_names_and_namespaces()} & CONFLICTING_NODES - allowed)
         return others, conflicts
 
     def check_ownership(self) -> None:
@@ -831,6 +1068,8 @@ class Ar3Robot:
         A new controller session anchors its workspace sphere (``workspace_radius_m``) at the measured TCP pose.
         """
         if self.execute:
+            if self.dagger and self.clutch_pressed:
+                raise HumanTakeover
             self.check_ownership()
             deadline = time.monotonic() + idle_timeout
             while not self.status.startswith(IDLE_STATUS):
@@ -864,6 +1103,9 @@ class Ar3Robot:
             with self._lock:
                 self._halt_locked(f"enable failed: {error}")
             raise
+        with self._lock:
+            # The clutch was pressed while enable was pending: the teleoperation owns the session now.
+            self._raise_if_fault_locked()
         if not response.success or "existing session retained" in response.message:
             with self._lock:
                 self._armed = False
@@ -896,6 +1138,18 @@ class Ar3Robot:
                 return
             # The controller leaves the RT session now (e.g. "monitoring:"); that is not a fault of this stop.
             self._stopping, self._sdk_active = True, False
+        self._confirm_stop(timeout)
+
+    def stop_controller(self, timeout: float = 10.0) -> None:
+        """Stops the controller whoever commands it (DAgger: a session the teleoperation holds after its clutch)."""
+        with self._lock:
+            self._streaming = False
+            self._target = None
+            if self._armed:
+                self._stopping, self._sdk_active = True, False
+        self._confirm_stop(timeout)
+
+    def _confirm_stop(self, timeout: float) -> None:
         deadline = time.monotonic() + timeout
         message = ""
         while True:
@@ -960,9 +1214,83 @@ class Ar3Robot:
     def _clamp_radius(self) -> float:
         return max(self.limits.workspace_radius - self.limits.workspace_margin, 0.0)
 
+    # DAgger / recording.
+    def check_teleoperation(self, timeout: float) -> None:
+        """DAgger preconditions: the AR3 teleoperation runs for real with its clutch released, and a gripper
+        teleoperation (if any) is the gated one (``scripts/ar3_dagger_gripper_teleop.sh``)."""
+        topic = self.prefix + "/teleop/return_home_status"
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._lock:
+                status = self._teleop_status
+            if status is not None:
+                break
+            if time.monotonic() > deadline:
+                raise RobotError(
+                    f"no AR3 teleoperation status on {topic} after {timeout:.0f} s: start the teleoperation "
+                    "(scripts/prepare_ar3_inference.sh --dagger) with the same ROS_DOMAIN_ID"
+                )
+            time.sleep(0.05)
+        if status.get("dry_run") is not False:
+            raise RobotError(
+                f"the AR3 teleoperation is in dry run mode, so it cannot take over: ros2 param set /{TELEOP_NODE} "
+                "dry_run false (scripts/prepare_ar3_inference.sh --dagger does this)"
+            )
+        if status.get("clutch_pressed") or self.clutch_pressed:
+            raise RobotError("the teleoperation clutch is pressed: release it before starting")
+        node = self._ros["node"]
+        names = {name for name, _ in node.get_node_names_and_namespaces()}
+        publishers = {info.node_name for info in node.get_publishers_info_by_topic(GRIPPER_ACTION_TOPIC)}
+        ungated = sorted((names & UNGATED_GRIPPER_NODES) | (publishers - {GRIPPER_GATE_NODE}))
+        if ungated:
+            raise RobotError(
+                f"an ungated gripper teleoperation runs ({', '.join(ungated)}): it would fight the policy. Stop it "
+                "(e.g. lerobot's scripts/ar3_gripper_teleop.sh) and run scripts/ar3_dagger_gripper_teleop.sh instead"
+            )
+        if GRIPPER_GATE_NODE not in names:
+            logger.warning(
+                "no gated gripper teleoperation (scripts/ar3_dagger_gripper_teleop.sh) is running: during takeovers "
+                "the gripper keeps the policy's last target"
+            )
+
+    @property
+    def clutch_pressed(self) -> bool:
+        with self._lock:
+            return self._clutch
+
+    def takeover(self) -> tuple[float | None, float | None, int]:
+        """Host times of the current takeover's clutch press and release, and the teleoperation commands since."""
+        with self._lock:
+            return self._takeover_at, self._released_at, self._teleop_commands
+
+    def end_takeover(self) -> None:
+        """Hands the robot back to the policy after a takeover (call once the controller is idle again)."""
+        now = time.monotonic()
+        with self._lock:
+            if self._takeover_at is None:
+                return
+            if self._released_at is None:
+                self._add_locked("control", Sample(now, POLICY_FLAG))
+            self._takeover_at = self._released_at = None
+            self._teleop_commands = 0
+            if "human_gripper" in self._streams:
+                self._streams["human_gripper"].clear()
+        self._publish_human_control(active=False)
+
+    def recording_samples(self, t: float) -> dict[str, Sample | None]:
+        """The input samples describing host time ``t`` (``record``)."""
+        with self._lock:
+            streams = self._streams
+            samples = {name: streams[name].at(t) for name in ("state", "tau_m", "accepted", "commanded")}
+            samples.update({name: streams[name].before(t) for name in ("control", "teleop", "human_gripper")})
+            samples.update({name: streams[name].nearest(t) for name in ("front", "wrist")})
+        return samples
+
     def _raise_if_fault_locked(self) -> None:
         if self._fault is not None:
             raise RobotError(self._fault)
+        if self._takeover_at is not None:
+            raise HumanTakeover
 
     def _sample_locked(self, now: float, wrench_dim: int, max_age: float) -> tuple[np.ndarray, np.ndarray]:
         """Measured pose [6] and force reading [wrench_dim]: TCP wrench (+ ``tau_m``), as recorded."""
@@ -1215,10 +1543,16 @@ def run_chunks(
     *,
     clock: Any = time.monotonic,
     sleep: Any = time.sleep,
+    should_stop: Any = None,
 ) -> int:
-    """Closed loop at ``1 / period`` Hz, one action chunk at a time (as recorded). Returns the completed chunks."""
+    """Closed loop at ``1 / period`` Hz, one action chunk at a time (as recorded). Returns the completed chunks.
+
+    ``should_stop()`` is asked before every chunk (e.g. whether the operator ended the episode).
+    """
     chunks = 0
     while config.max_chunks <= 0 or chunks < config.max_chunks:
+        if should_stop is not None and should_stop():
+            break
         observation = robot.observe(
             wrench_dim=config.wrench_dim or 6, max_age=config.max_observation_age, max_image_age=config.max_image_age
         )
@@ -1305,9 +1639,239 @@ def move_to_start(
     log = logger.warning if distance > 0.02 or angle > 0.05 else logger.info
     log("settled %.1f mm / %.3f rad from the start pose", distance * 1000, angle)
     if gripper is not None:
-        position = gripper.wait_position(GRIPPER_OPEN, tolerance=20, timeout=5.0)
+        # The heartbeat keeps the start pose target fresh (and notices faults / takeovers) while the fingers open.
+        position = gripper.wait_position(GRIPPER_OPEN, tolerance=20, timeout=5.0, idle=robot.heartbeat)
         if abs(position - GRIPPER_OPEN) > 20:
             logger.warning("gripper did not open fully (position %.0f)", position)
+
+
+def frame_values(samples: dict[str, Sample | None], t: float) -> tuple[dict[str, Any], list[str]]:
+    """Values of the recorded frame describing host time ``t`` (``EpisodeRecorder.add_frame``, without images).
+
+    ``samples``: ``Ar3Robot.recording_samples(t)`` + ``gripper`` (value: position, policy target). Also returns the
+    inputs that were missing or stale at ``t``. ``control_flag`` is -1 (trained on by LIFT) only while the operator
+    has taken over, the teleoperation is commanding and every input is fresh.
+    """
+    state, gripper = samples["state"], samples["gripper"]
+    if state is None or gripper is None or samples["front"] is None or samples["wrist"] is None:
+        raise RobotError("recording needs the controller state, the gripper position and both cameras")
+
+    def age(sample: Sample | None) -> float:
+        return math.inf if sample is None else abs(t - sample.received)
+
+    limits = {"state": "state", "tau_m": "tau_m", "gripper": "gripper", "front": "camera", "wrist": "camera"}
+    problems = [name for name, limit in limits.items() if age(samples[name]) > STALE_LIMITS[limit]]
+    # The accepted TCP target, as in the recordings; else this client's command or the measured pose.
+    action = samples["accepted"]
+    if age(action) > STALE_LIMITS["action"]:
+        problems.append("action")
+        action = samples["commanded"] if age(samples["commanded"]) <= STALE_LIMITS["action"] else state
+    position, policy_target = gripper.value
+    control, teleop, human_gripper = samples["control"], samples["teleop"], samples["human_gripper"]
+    human = control is not None and control.value == HUMAN_FLAG
+    if human and human_gripper is not None:
+        target, target_sample = human_gripper.value, human_gripper
+    else:
+        target, target_sample = (position if policy_target is None else policy_target), gripper
+    teleoperated = human and teleop is not None and t - teleop.received <= TELEOP_ACTIVITY
+    tau_m = samples["tau_m"]
+    values: dict[str, Any] = {
+        "observation.tcp_pose": pose_rotvec(state.value[:6]),
+        "observation.gripper_position": [position],
+        "observation.tcp_wrench": state.value[6:12],
+        "actions": [*pose_rotvec(action.value[:6]), target],
+        "control_flag": [HUMAN_FLAG if teleoperated and not problems else POLICY_FLAG],
+        "observation.tau_m": np.zeros(TAU_M_SIZE) if tau_m is None else tau_m.value,
+        "sync.target_host_s": [t],
+        "sync.tcp_pose.timing_s": [state.received, 0.0],
+        "sync.tcp_wrench.timing_s": [state.received, 0.0],
+        "sync.actions.timing_s": [action.received, 0.0, 0.0],
+        "sync.gripper_position.timing_s": [gripper.received, gripper.stamp],
+        "sync.gripper_action.timing_s": [target_sample.received, target_sample.stamp],
+        "sync.control_flag.timing_s": [t if control is None else control.received, 0.0],
+        "sync.tau_m.timing_s": [0.0 if tau_m is None else tau_m.received, 0.0],
+    }
+    for name in ("front", "wrist"):
+        frame = samples[name]
+        values[f"sync.{name}.timing_s"] = [frame.received, frame.stamp, frame.received - t]
+        values[f"sync.{name}.frame_index"] = [frame.index]
+    return values, problems
+
+
+def human_chunks(flags: Sequence[int], horizon: int) -> int:
+    """Frames LIFT trains on (``intervention_only``): the next ``horizon`` flags (up to the episode end) are human."""
+    count = run = 0
+    for index in range(len(flags) - 1, -1, -1):
+        run = run + 1 if flags[index] == HUMAN_FLAG else 0
+        count += run >= min(horizon, len(flags) - index)
+    return count
+
+
+class RolloutRecorder:
+    """Records episodes with an ``ar3_lift_recorder.EpisodeRecorder`` (``writer``).
+
+    Frame ``k`` describes host time ``T = start + k / fps`` and is assembled ``SYNC_DELAY`` after ``T`` from the
+    robot's input history and a 20 Hz gripper poll (position + the policy's current target).
+    """
+
+    def __init__(
+        self, robot: Any, writer: Any, gripper: Any, *, fps: int = RECORD_FPS, horizon: int = 10, poll_hz: float = 20.0
+    ) -> None:
+        self.writer = writer
+        self._robot = robot
+        self._gripper = gripper
+        self._fps = fps
+        self._horizon = horizon
+        self._lock = threading.Lock()
+        self._gripper_samples = Stream(64)
+        self._closed = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._until = math.inf
+        self._error: Exception | None = None
+        self._flags: list[int] = []
+        self._stale: collections.Counter[str] = collections.Counter()
+        self._poller = threading.Thread(target=self._poll, args=(1.0 / poll_hz,), name="gripper-poll", daemon=True)
+        self._poller.start()
+
+    @property
+    def failed(self) -> bool:
+        return self._error is not None
+
+    def _poll(self, period: float) -> None:
+        failing = False
+        while True:
+            started = time.monotonic()
+            try:
+                position = self._gripper.read()
+            except GripperError as error:
+                if not failing:
+                    logger.warning("recording: %s", error)
+                failing = True
+            else:
+                failing = False
+                with self._lock:
+                    self._gripper_samples.add(Sample(time.monotonic(), (position, self._gripper.target), time.time()))
+            if self._closed.wait(max(period - (time.monotonic() - started), 0.0)):
+                return
+
+    def start(self) -> None:
+        """Starts an episode now."""
+        self.writer.start_episode()
+        self._flags, self._stale, self._error, self._until = [], collections.Counter(), None, math.inf
+        self._thread = threading.Thread(target=self._record, args=(time.monotonic(),), name="recorder", daemon=True)
+        self._thread.start()
+
+    def _record(self, start: float) -> None:
+        index = 0
+        try:
+            while True:
+                t = start + index / self._fps
+                if t > self._until:
+                    return
+                remaining = t + SYNC_DELAY - time.monotonic()
+                if remaining > 0:
+                    time.sleep(min(remaining, 0.02))
+                    continue
+                self._add(t)
+                index += 1
+        except Exception as error:
+            logger.error("recording failed: %s", error)
+            self._error = error
+
+    def _add(self, t: float) -> None:
+        samples = self._robot.recording_samples(t)
+        with self._lock:
+            samples["gripper"] = self._gripper_samples.at(t)
+        values, problems = frame_values(samples, t)
+        self.writer.add_frame(values, {name: rgb_image(samples[name].value) for name in ("front", "wrist")})
+        self._flags.append(int(values["control_flag"][0]))
+        self._stale.update(problems)
+
+    def stop(self, until: float) -> dict[str, Any]:
+        """Ends the episode with the last frame at or before host time ``until``; returns its summary."""
+        self._until = until
+        self._join()
+        if self._error is not None:
+            self.writer.discard_episode()
+            raise RobotError(f"recording failed: {self._error}") from self._error
+        return {
+            "frames": len(self._flags),
+            "human": self._flags.count(HUMAN_FLAG),
+            "chunks": human_chunks(self._flags, self._horizon),
+            "stale": dict(self._stale),
+        }
+
+    def abort(self) -> None:
+        """Ends and discards the current episode."""
+        self._until = -math.inf
+        self._join()
+        self.writer.discard_episode()
+
+    def save(self) -> int:
+        try:
+            return self.writer.save_episode()
+        except Exception as error:
+            raise RobotError(f"saving the episode failed: {error}") from error
+
+    def discard(self) -> None:
+        self.writer.discard_episode()
+
+    def close(self) -> None:
+        """Discards an unsaved episode and stops the gripper poll."""
+        self._closed.set()
+        self.abort()
+        self._poller.join(timeout=2.0)
+        self.writer.close()
+
+    def _join(self) -> None:
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
+
+
+class Console:
+    """Operator input: Enter presses (``poll``) and answers (``ask``). Without a terminal, answers are the defaults."""
+
+    def __init__(self, stream: Any = None) -> None:
+        stream = sys.stdin if stream is None else stream
+        self.interactive = bool(stream is not None and stream.isatty())
+        self._lines: queue.Queue[str | None] = queue.Queue()
+        if self.interactive:
+            threading.Thread(target=self._read, args=(stream,), name="console", daemon=True).start()
+
+    def _read(self, stream: Any) -> None:
+        for line in stream:
+            self._lines.put(line.strip().lower())
+        self._lines.put(None)  # end of input
+
+    def poll(self) -> bool:
+        """Whether Enter was pressed since the last call."""
+        pressed = False
+        while True:
+            try:
+                line = self._lines.get_nowait()
+            except queue.Empty:
+                return pressed
+            if line is None:
+                self.interactive = False
+            else:
+                pressed = True
+
+    def ask(self, prompt: str, default: str) -> str:
+        self.poll()  # earlier input is no answer
+        if not self.interactive:
+            logger.info("%s -> %r (no terminal)", prompt, default)
+            return default
+        print(f"\n>>> {prompt}: ", end="", flush=True)
+        while True:
+            try:
+                line = self._lines.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if line is None:
+                self.interactive = False
+                return default
+            return line
 
 
 CONTROLLER_PARAMETERS = (
@@ -1388,15 +1952,29 @@ class Session:
             target_timeout=args.target_timeout,
             workspace_margin=args.workspace_margin,
         )
-        self.robot = Ar3Robot(execute=args.execute, limits=self.limits, prefix=args.controller_prefix)
+        self.recording = args.record_dir is not None
+        self.robot = Ar3Robot(
+            execute=args.execute,
+            limits=self.limits,
+            prefix=args.controller_prefix,
+            dagger=args.dagger,
+            record=self.recording,
+        )
         self.gripper: DMGripper | None = None
         self.planner: ChunkPlanner | None = None
+        self.recorder: RolloutRecorder | None = None
+        self.console: Console | None = None
         self.trace = Trace(args.trace)
 
     def run(self) -> int:
         args, robot = self.args, self.robot
-        logger.info("%s run", "EXECUTE" if args.execute else "DRY")
-        robot.start(front_topic=args.front_topic, wrist_topic=args.wrist_topic, controller_node=args.controller_node)
+        logger.info("%s run%s", "EXECUTE" if args.execute else "DRY", " (DAgger)" if args.dagger else "")
+        robot.start(
+            front_topic=args.front_topic,
+            wrist_topic=args.wrist_topic,
+            controller_node=args.controller_node,
+            clutch_topic=args.clutch_topic,
+        )
         metadata: dict = {}
         policy = None
         if not args.check:
@@ -1408,8 +1986,10 @@ class Session:
         mode = ("reactive" if reactive_model else "infer") if args.mode == "auto" else args.mode
         if mode == "reactive" and not reactive_model and not args.check:
             raise PolicyError("the served model is not force-reactive; use --mode infer")
-        robot.wait_ready(args.ready_timeout, need_tau_m=args.check or wrench_dim == 6 + TAU_M_SIZE)
+        robot.wait_ready(args.ready_timeout, need_tau_m=args.check or self.recording or wrench_dim == 6 + TAU_M_SIZE)
         self._configure_limits()
+        if args.dagger:
+            robot.check_teleoperation(args.ready_timeout)
         if not args.no_gripper:
             try:
                 self.gripper = DMGripper.connect(
@@ -1462,6 +2042,8 @@ class Session:
             warm_up(robot, self.planner, self.gripper, config)
         if args.execute and self.gripper is not None:
             self.gripper.configure()
+        if args.record_dir is not None or args.dagger or args.episodes != 1:
+            return self._run_episodes(config, metadata)
         robot.activate(service_timeout=args.service_timeout)
         if args.move_to_start and args.execute:
             move_to_start(robot, self.gripper, args.start_pose, timeout=args.move_timeout)
@@ -1480,6 +2062,203 @@ class Session:
         chunks = run_chunks(robot, self.planner, self.gripper, config, self.trace)
         logger.info("finished %d chunks", chunks)
         return 0
+
+    # Episodes (--episodes, --record-dir, --dagger).
+    def _run_episodes(self, config: RunConfig, metadata: dict) -> int:
+        """Start pose -> policy (-> operator takeover) -> save / discard, until --episodes or the operator quits."""
+        args = self.args
+        self.console = Console()
+        if self.recording:
+            self._open_recorder(metadata)
+        logger.info("%s", DAGGER_HELP if args.dagger else "Enter ends an episode early, Ctrl+C aborts.")
+        if not args.execute:
+            logger.warning("dry run: the arm stays where it is (episodes only exercise the policy and the recording)")
+        done = 0
+        while args.episodes == 0 or done < args.episodes:
+            if done and self.console.ask("reset the scene; Enter = next episode, q = quit", "q") == "q":
+                break
+            if not self._start_episode():
+                break
+            summary = self._run_episode(config)
+            done += 1
+            if not self._keep_episode(summary):
+                break
+        logger.info("finished %d episode(s)", done)
+        return 0
+
+    def _open_recorder(self, metadata: dict) -> None:
+        args = self.args
+        try:
+            if __package__:
+                from . import ar3_lift_recorder
+            else:
+                import ar3_lift_recorder
+            import av  # noqa: F401
+            import pyarrow as pa  # noqa: F401
+        except ImportError as error:
+            raise RobotError(
+                f"recording needs pyarrow and PyAV ({error}): {sys.executable} -m pip install pyarrow av"
+            ) from error
+        observation = self.robot.observe(
+            wrench_dim=6, max_age=args.max_observation_age, max_image_age=args.max_image_age
+        )
+        if observation.front.shape != observation.wrist.shape:
+            raise RobotError(
+                f"recording needs equally sized cameras (front {observation.front.shape}, wrist "
+                f"{observation.wrist.shape})"
+            )
+        capture_info = {
+            "source": "scripts/ar3_lift_robot_client.py",
+            "dagger": args.dagger,
+            "control_flag": {"human": HUMAN_FLAG, "policy": POLICY_FLAG},
+            "policy_server": json.loads(json.dumps(metadata, default=str)),
+            "control_hz": args.control_hz,
+            "gripper_speed": args.gripper_speed,
+            "gripper_force": args.gripper_force,
+            "sync_delay_s": SYNC_DELAY,
+        }
+        try:
+            writer = ar3_lift_recorder.EpisodeRecorder(
+                args.record_dir,
+                task=args.prompt,
+                fps=RECORD_FPS,
+                image_size=observation.front.shape[:2],
+                capture_info=capture_info,
+            )
+        except (ar3_lift_recorder.RecorderError, OSError, ValueError) as error:
+            raise RobotError(f"cannot record to {args.record_dir}: {error}") from error
+        self.recorder = RolloutRecorder(self.robot, writer, self.gripper, horizon=self.planner.horizon)
+        logger.info("recording to %s (%d episodes so far)", writer.root, writer.num_episodes)
+
+    def _start_episode(self) -> bool:
+        """Activates the controller and moves to the start pose. False if the operator quits."""
+        args, robot = self.args, self.robot
+        while True:
+            if robot.takeover()[0] is not None:
+                self._await_release()
+                self._finish_takeover()
+            if args.dagger and not self._wait_for_controller():
+                return False
+            if self.gripper is not None:
+                self.gripper.forget_target()
+            try:
+                robot.activate(service_timeout=args.service_timeout)
+                if args.execute:
+                    move_to_start(robot, self.gripper, args.start_pose, timeout=args.move_timeout)
+                    if args.reanchor_at_start:
+                        self._reanchor()
+            except HumanTakeover:
+                logger.warning("clutch pressed before the episode started: release it to start again")
+                continue
+            return True
+
+    def _run_episode(self, config: RunConfig) -> dict | None:
+        """Runs the policy until --max-chunks or Enter; after a takeover until the clutch release.
+
+        Returns the recording summary (None without --record-dir).
+        """
+        robot, recorder = self.robot, self.recorder
+        self.console.poll()
+        if recorder is not None:
+            recorder.start()
+        taken_over = False
+        try:
+            try:
+                chunks = run_chunks(
+                    robot, self.planner, self.gripper, config, self.trace, should_stop=self._should_stop
+                )
+                until = time.monotonic()
+                logger.info("episode ended after %d policy chunks", chunks)
+                robot.stop()
+            except HumanTakeover:
+                taken_over = True
+                logger.warning("takeover: finish the task, then release the clutch to end the episode")
+                until = self._await_release()
+            summary = None if recorder is None else recorder.stop(until)
+        except BaseException:
+            if recorder is not None:
+                recorder.abort()
+            raise
+        if taken_over:
+            self._finish_takeover()
+        return summary
+
+    def _should_stop(self) -> bool:
+        if self.console.poll():
+            logger.info("Enter: ending the episode")
+            return True
+        return self.recorder is not None and self.recorder.failed
+
+    def _keep_episode(self, summary: dict | None) -> bool:
+        """Saves or discards the recorded episode as the operator decides. False to quit."""
+        if summary is None:
+            return True
+        logger.info(
+            "episode: %d frames (%.1f s), %d teleoperated, %d LIFT training samples (all-teleoperated chunks)%s",
+            summary["frames"],
+            summary["frames"] / RECORD_FPS,
+            summary["human"],
+            summary["chunks"],
+            f"; frames with stale inputs: {summary['stale']}" if summary["stale"] else "",
+        )
+        if not summary["frames"]:
+            self.recorder.discard()
+            logger.warning("empty episode discarded")
+            return True
+        while True:
+            answer = self.console.ask("Enter/s = save, d = discard, q = save and quit, x = discard and quit", "q")
+            if answer in ("", "s", "q"):
+                index = self.recorder.save()
+                logger.info("saved episode %d in %s", index, self.recorder.writer.root)
+                return answer != "q"
+            if answer in ("d", "x"):
+                self.recorder.discard()
+                logger.info("episode discarded")
+                return answer != "x"
+            print(f"unknown answer {answer!r}")
+
+    def _await_release(self) -> float:
+        """Waits for the clutch release; returns its host time."""
+        robot, warned = self.robot, False
+        while True:
+            pressed_at, released_at, commands = robot.takeover()
+            if released_at is not None:
+                return released_at
+            if pressed_at is None and not robot.clutch_pressed:
+                return time.monotonic()
+            if pressed_at is not None and not warned and not commands and time.monotonic() - pressed_at > 1.0:
+                warned = True
+                logger.warning("no teleoperation commands since the clutch press: is the teleoperation running?")
+            time.sleep(0.02)
+
+    def _finish_takeover(self) -> None:
+        """After the release the teleoperation stops the arm; then the policy may command again."""
+        deadline = time.monotonic() + 10.0
+        while not self.robot.status.startswith(IDLE_STATUS) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.robot.end_takeover()
+
+    def _wait_for_controller(self) -> bool:
+        """DAgger: clutch released and controller idle. A clutch press while no episode runs starts a teleoperation
+        session that it keeps after the release; the operator may stop it. False if the operator quits."""
+        robot = self.robot
+        if robot.clutch_pressed:
+            logger.warning("release the teleoperation clutch to start the episode")
+            self._await_release()
+        deadline = time.monotonic() + 3.0
+        while not robot.status.startswith(IDLE_STATUS):
+            if time.monotonic() > deadline:
+                answer = self.console.ask(
+                    f"the controller is busy ({robot.status}), e.g. the teleoperation holds the arm. "
+                    "Enter = stop the controller (the arm stays where it is), q = quit",
+                    "q",
+                )
+                if answer == "q":
+                    return False
+                robot.stop_controller()
+                return True
+            time.sleep(0.05)
+        return True
 
     def _reanchor(self) -> None:
         """Centres the controller's workspace sphere at the start pose, like in the recordings."""
@@ -1581,6 +2360,8 @@ class Session:
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         ok = True
+        if self.recorder is not None:
+            self.recorder.close()
         if self.planner is not None:
             self.planner.close()
         try:
@@ -1611,7 +2392,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     run.add_argument(
         "--max-chunks", type=int, default=30, help="1 s action chunks to run (recordings: 30 s); 0 = until Ctrl+C"
     )
-    run.add_argument("--move-to-start", action="store_true", help="first move to --start-pose and open the gripper")
+    run.add_argument(
+        "--move-to-start",
+        action="store_true",
+        help="first move to --start-pose and open the gripper (episodes of --record-dir / --dagger / --episodes always "
+        "do)",
+    )
     run.add_argument(
         "--start-pose",
         type=float,
@@ -1681,6 +2467,27 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--no-gripper", action="store_true", help="run without the gripper (state uses --assumed-gripper)"
     )
     gripper.add_argument("--assumed-gripper", type=float, default=GRIPPER_OPEN)
+
+    record = parser.add_argument_group("recording / DAgger")
+    record.add_argument(
+        "--record-dir",
+        default=None,
+        help="append the episodes the operator keeps to this LeRobot v3.0 dataset (created if missing)",
+    )
+    record.add_argument(
+        "--dagger",
+        action="store_true",
+        help="LIFT human-in-the-loop corrections: the AR3 teleoperation's clutch takes over from the policy "
+        "(needs --execute and --record-dir, and scripts/prepare_ar3_inference.sh --dagger)",
+    )
+    record.add_argument(
+        "--episodes",
+        type=int,
+        default=None,
+        help="episodes to run, each from --start-pose; 0 = until the operator quits "
+        "(default: 0 with --record-dir / --dagger, else 1)",
+    )
+    record.add_argument("--clutch-topic", default="/clutch/right", help="the teleoperation clutch (std_msgs/Bool)")
     args = parser.parse_args(argv)
     for name in (
         "control_hz",
@@ -1699,6 +2506,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--resize and --max-chunks must not be negative")
     if not (1 <= args.gripper_speed <= 100 and 20 <= args.gripper_force <= 100):
         parser.error("the DM gripper accepts --gripper-speed 1..100 and --gripper-force 20..100")
+    if args.episodes is None:
+        args.episodes = 0 if args.dagger or args.record_dir is not None else 1
+    if args.episodes < 0:
+        parser.error("--episodes must not be negative")
+    if args.dagger and not args.check and not (args.execute and args.record_dir is not None):
+        parser.error("--dagger needs --execute and --record-dir")
+    if args.record_dir is not None and args.no_gripper:
+        parser.error("--record-dir needs the gripper (its position and target are recorded)")
     return args
 
 

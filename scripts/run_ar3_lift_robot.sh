@@ -7,11 +7,14 @@
 #   scripts/run_ar3_lift_robot.sh --check                       # controller, cameras, gripper, policy; no motion
 #   scripts/run_ar3_lift_robot.sh --max-chunks 3                # dry run: targets only on preview_command
 #   scripts/run_ar3_lift_robot.sh --execute --move-to-start     # MOVES the arm and gripper
+#   scripts/run_ar3_lift_robot.sh --execute --record-dir DIR    # MOVES; records each episode (LeRobot v3.0)
+#   scripts/run_ar3_lift_robot.sh --execute --dagger --record-dir DIR   # DAgger (./infer_oneclick.sh --dagger)
 #   scripts/run_ar3_lift_robot.sh --help                        # all client options
 #
 # Environment:
 #   INFER_ROBOT_PYTHON    Python 3.12 with grpc, DM_V3Gripper, numpy, msgpack, websockets>=11,<18, typing_extensions
-#                         and pillow (default: <repo>/../V3_Gripper/.venv-ros/bin/python)
+#                         and pillow; pyarrow and av (PyAV) for --record-dir
+#                         (default: <repo>/../V3_Gripper/.venv-ros/bin/python)
 #   INFER_GRIPPER_DIR     default prefix of INFER_ROBOT_PYTHON (default: <repo>/../V3_Gripper)
 #   INFER_ROS_SETUP       ROS setup script (default: /opt/ros/jazzy/setup.bash)
 #   INFER_ROS_DOMAIN_ID   ROS domain of the prepared nodes (default: 111)
@@ -52,11 +55,12 @@ if [[ "${OPENPI_DRY_RUN:-0}" == "1" ]]; then
     exit 0
 fi
 
-help=0 gripper=1
+help=0 gripper=1 record=0
 for arg in "$@"; do
     case "$arg" in
         -h|--help) help=1 ;;
         --no-gripper) gripper=0 ;;
+        --record-dir|--record-dir=*) record=1 ;;
     esac
 done
 if ((help)); then
@@ -65,6 +69,7 @@ if ((help)); then
 else
     modules=(rclpy numpy msgpack websockets.sync.client typing_extensions)
     ((gripper)) && modules+=(grpc DM_V3Gripper.gripper_pb2)
+    ((record)) && modules+=(pyarrow.parquet av)
     "${ros[@]}" "$PYTHON" -c '
 import importlib
 import sys
@@ -77,7 +82,7 @@ for name in sys.argv[1:]:
         missing.append(f"{name} ({type(error).__name__}: {error})")
 if missing:
     sys.exit("missing modules: " + "; ".join(missing))
-' "${modules[@]}" || die "The robot Python lacks the modules above: rclpy comes from $ROS_SETUP (Python 3.12), grpc and DM_V3Gripper from the gripper's .venv-ros; install the others with: $PYTHON -m pip install 'websockets>=11,<18' msgpack typing_extensions pillow"
+' "${modules[@]}" || die "The robot Python lacks the modules above: rclpy comes from $ROS_SETUP (Python 3.12), grpc and DM_V3Gripper from the gripper's .venv-ros; install the others with: $PYTHON -m pip install 'websockets>=11,<18' msgpack typing_extensions pillow pyarrow av"
 fi
 
 exec "${command[@]}"

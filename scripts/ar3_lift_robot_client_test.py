@@ -1,5 +1,6 @@
 import array
 import dataclasses
+import io
 import json
 import math
 import threading
@@ -285,11 +286,14 @@ class FakeStopClient:
 
 class FakeNode:
     def __init__(self, publishers=1):
-        self.publishers, self.nodes = publishers, ["cartesian_impedance_node", "ar3_lift_robot_client"]
+        # Node names of the publishers on {prefix}/command; other topics: topic_nodes.
+        self.publishers = ["ar3_lift_robot_client"] * publishers
+        self.nodes = ["cartesian_impedance_node", "ar3_lift_robot_client"]
+        self.topic_nodes = {}
 
-    def count_publishers(self, topic):
-        assert topic == "/ar3/cartesian_impedance/command"
-        return self.publishers
+    def get_publishers_info_by_topic(self, topic):
+        names = self.publishers if topic == "/ar3/cartesian_impedance/command" else self.topic_nodes.get(topic, [])
+        return [types.SimpleNamespace(node_name=name) for name in names]
 
     def get_node_names_and_namespaces(self):
         return [(name, "/") for name in self.nodes]
@@ -315,8 +319,13 @@ class FakeServiceClient:
 CONTRACT = {**client.RT_CONTRACT, "pose": client.RPY_CONVENTION, "workspace_recenter": client.WORKSPACE_RECENTER}
 
 
-def _robot(*, execute=True, **limits):
-    robot = client.Ar3Robot(execute=execute, limits=client.Limits(**{"workspace_radius": 0.45, **limits}))
+def _robot(*, execute=True, dagger=False, record=False, **limits):
+    robot = client.Ar3Robot(
+        execute=execute,
+        limits=client.Limits(**{"workspace_radius": 0.45, **limits}),
+        dagger=dagger,
+        record=record,
+    )
     state = np.concatenate([client.DATASET_START_POSE, np.arange(6) + 1.0, np.arange(18) + 100.0])
     measured = client.pose_from_vector(state[:6])
     robot._state, robot._state_at = state, time.monotonic()
@@ -331,6 +340,9 @@ def _robot(*, execute=True, **limits):
         "Trigger": types.SimpleNamespace(Request=lambda: None),
         "node": FakeNode(publishers=int(execute)),
     }
+    if dagger:
+        robot._ros["Bool"] = lambda data: types.SimpleNamespace(data=data)
+        robot._ros["human_control"] = FakePublisher()
     return robot, measured
 
 
@@ -434,7 +446,7 @@ def test_other_command_sources_block_activation_and_halt_the_stream():
     assert robot._ros["stop"].calls == 1
 
     robot, _ = _robot()
-    robot._ros["node"].publishers = 2
+    robot._ros["node"].publishers.append("another_client")
     robot._status = "monitoring: RT 1ms state"
     with pytest.raises(client.RobotError, match="1 other publisher"):
         robot.activate(service_timeout=0.1)
@@ -442,6 +454,70 @@ def test_other_command_sources_block_activation_and_halt_the_stream():
     robot, _ = _robot(execute=False)
     robot._ros["node"].nodes.append("ar3_cartesian_impedance_teleop")
     robot.heartbeat()
+
+    # DAgger: the AR3 teleoperation (only) may run next to the client.
+    robot, _ = _robot(dagger=True)
+    robot._ros["node"].nodes.append(client.TELEOP_NODE)
+    robot._ros["node"].publishers.append(client.TELEOP_NODE)
+    assert robot.command_sources() == (0, [])
+    robot._ros["node"].nodes.append("rokae_driver7")
+    assert robot.command_sources() == (0, ["rokae_driver7"])
+
+
+def test_dagger_clutch_hands_the_session_to_the_teleoperation_without_stopping_it():
+    robot, _ = _robot(dagger=True, record=True)
+    robot._tick()
+    own = robot._ros["command"].messages[-1]
+    robot._on_clutch(types.SimpleNamespace(data=True))
+    assert (robot._streaming, robot._armed) == (False, False)
+    assert robot._ros["stop"].calls == 0
+    assert robot._ros["human_control"].messages[-1]
+    with pytest.raises(client.HumanTakeover):
+        robot.heartbeat()
+    robot._tick()
+    assert len(robot._ros["command"].messages) == 1
+    # Only the teleoperation's commands count, not echoes of this client's own.
+    robot._on_command(types.SimpleNamespace(data=own.tolist()))
+    robot._on_command(types.SimpleNamespace(data=[0.5] * client.STATE_SIZE))
+    pressed_at, released_at, commands = robot.takeover()
+    assert pressed_at is not None
+    assert (released_at, commands) == (None, 1)
+
+    # The release ends the takeover; the teleoperation's stop that follows is not a fault of this client.
+    robot._on_clutch(types.SimpleNamespace(data=False))
+    robot._on_status(types.SimpleNamespace(data="stopped: controller idle confirmed"))
+    assert (robot._fault, robot._ros["stop"].calls) == (None, 0)
+    assert robot.takeover()[1] is not None
+    assert not robot._ros["human_control"].messages[-1]
+    robot.end_takeover()
+    assert robot.takeover() == (None, None, 0)
+    assert [sample.value for sample in robot._streams["control"]._samples] == [client.HUMAN_FLAG, client.POLICY_FLAG]
+
+    # A clutch held before the episode starts keeps the policy from enabling the controller.
+    robot._clutch = True
+    with pytest.raises(client.HumanTakeover):
+        robot.activate(service_timeout=0.1)
+
+
+def test_dagger_needs_the_live_teleoperation_and_a_gated_gripper_teleoperation():
+    robot, _ = _robot(dagger=True)
+    with pytest.raises(client.RobotError, match="no AR3 teleoperation status"):
+        robot.check_teleoperation(0.0)
+    status = {"dry_run": True, "clutch_pressed": False}
+    robot._on_teleop_status(types.SimpleNamespace(data=json.dumps(status)))
+    with pytest.raises(client.RobotError, match="dry run"):
+        robot.check_teleoperation(0.0)
+    robot._on_teleop_status(types.SimpleNamespace(data=json.dumps({**status, "dry_run": False})))
+    node = robot._ros["node"]
+    node.nodes.append("v3_gripper_teleop")  # V3_Gripper's teleop_gripper.py, even without its telemetry
+    with pytest.raises(client.RobotError, match="ungated"):
+        robot.check_teleoperation(0.0)
+    node.nodes[-1] = client.GRIPPER_GATE_NODE
+    node.topic_nodes[client.GRIPPER_ACTION_TOPIC] = [client.GRIPPER_GATE_NODE, "v3_gripper_recording_telemetry"]
+    with pytest.raises(client.RobotError, match="v3_gripper_recording_telemetry"):
+        robot.check_teleoperation(0.0)
+    node.topic_nodes[client.GRIPPER_ACTION_TOPIC] = [client.GRIPPER_GATE_NODE]
+    robot.check_teleoperation(0.0)
 
 
 def test_workspace_recenter_waits_for_the_rt_hold_and_moves_the_origin():
@@ -541,3 +617,172 @@ def test_run_chunks_executes_exact_reactive_actions_at_control_rate():
         np.testing.assert_allclose(rotation, reference[1])
     assert clock.now == pytest.approx(2 * HORIZON * config.period)
     assert policy.observation["observation/state"][6] == 1000.0
+
+
+def test_run_chunks_asks_before_every_chunk_whether_to_stop():
+    robot, policy, clock = FakeRobot(_readings()), FakePolicy(), FakeClock()
+    planner = client.ChunkPlanner(policy, reactive=True, horizon=HORIZON, latency=3)
+    asked = []
+
+    def should_stop():
+        asked.append(clock.now)
+        return len(asked) > 1
+
+    config = client.RunConfig(max_chunks=0, resize=0)
+    trace = client.Trace(None)
+    assert client.run_chunks(
+        robot, planner, None, config, trace, clock=clock, sleep=clock.sleep, should_stop=should_stop
+    )
+    planner.close()
+    assert len(robot.targets) == HORIZON
+    assert asked == pytest.approx([0.0, HORIZON * config.period])
+
+
+def test_gripper_resends_targets_after_someone_else_moved_the_fingers():
+    gripper, _, log = _gripper()
+    gripper.command(600)
+    gripper.command(600)
+    assert log == [("SetTargetPosition", 600)]
+    assert gripper.target == 600.0
+    gripper.forget_target()
+    assert gripper.target is None
+    gripper.command(600)
+    assert log == [("SetTargetPosition", 600)] * 2
+
+
+# Recording.
+IMAGE = types.SimpleNamespace(encoding="rgb8", height=2, width=2, step=6, data=bytes(12))
+ACCEPTED = np.asarray(client.DATASET_START_POSE) + 0.01
+
+
+def _samples(t, **overrides):
+    """``Ar3Robot.recording_samples`` + the gripper poll of a policy-controlled moment with fresh inputs."""
+    state = np.concatenate([client.DATASET_START_POSE, np.arange(6) + 1.0, np.zeros(18)])
+    samples = {
+        "state": client.Sample(t - 0.002, state),
+        "tau_m": client.Sample(t - 0.001, np.arange(7.0)),
+        "accepted": client.Sample(t - 0.003, ACCEPTED),
+        "commanded": client.Sample(t - 0.004, ACCEPTED + 0.01),
+        "gripper": client.Sample(t - 0.02, (900.0, 0.0), 5.0),
+        "front": client.Sample(t + 0.01, IMAGE, 7.0, 3),
+        "wrist": client.Sample(t - 0.02, IMAGE, 8.0, 4),
+        "control": None,
+        "teleop": None,
+        "human_gripper": None,
+    }
+    return {**samples, **overrides}
+
+
+def test_frames_are_human_only_while_the_operator_commands_with_fresh_inputs():
+    t = 100.0
+    values, problems = client.frame_values(_samples(t), t)
+    assert problems == []
+    assert values["control_flag"] == [client.POLICY_FLAG]
+    np.testing.assert_allclose(values["actions"], [*client.pose_rotvec(ACCEPTED), 0.0])  # the policy's gripper target
+    np.testing.assert_allclose(values["observation.tcp_wrench"], np.arange(6) + 1.0)
+    assert values["sync.front.timing_s"] == pytest.approx([t + 0.01, 7.0, 0.01])
+    assert values["sync.wrist.frame_index"] == [4]
+
+    human = {
+        "control": client.Sample(t - 5.0, client.HUMAN_FLAG),
+        "teleop": client.Sample(t - 0.05, None),
+        "human_gripper": client.Sample(t - 0.05, 300.0, 9.0),
+    }
+    values, problems = client.frame_values(_samples(t, **human), t)
+    assert (values["control_flag"], values["actions"][6], problems) == ([client.HUMAN_FLAG], 300.0, [])
+    # No teleoperation command lately (e.g. the handover) or a stale input: not trained on.
+    values, _ = client.frame_values(_samples(t, **{**human, "teleop": client.Sample(t - 0.5, None)}), t)
+    assert values["control_flag"] == [client.POLICY_FLAG]
+    values, problems = client.frame_values(_samples(t, **human, accepted=client.Sample(t - 1.0, ACCEPTED)), t)
+    assert (values["control_flag"], problems) == ([client.POLICY_FLAG], ["action"])
+    np.testing.assert_allclose(values["actions"][:6], client.pose_rotvec(ACCEPTED + 0.01))
+    values, problems = client.frame_values(_samples(t, **human, front=client.Sample(t - 0.3, IMAGE)), t)
+    assert (values["control_flag"], problems) == ([client.POLICY_FLAG], ["front"])
+
+
+def test_human_chunks_count_the_training_samples_of_intervention_only():
+    # Rows whose next 3 frames (clamped to the episode end) are all teleoperated: 1, 5 and 6.
+    flags = [client.POLICY_FLAG] + [client.HUMAN_FLAG] * 3 + [client.POLICY_FLAG] + [client.HUMAN_FLAG] * 2
+    assert client.human_chunks(flags, 3) == 3
+    assert client.human_chunks([client.POLICY_FLAG] * 4, 3) == 0
+
+
+class FakeWriter:
+    def __init__(self):
+        self.frames, self.events = [], []
+
+    def start_episode(self):
+        self.events.append("start")
+
+    def add_frame(self, values, images):
+        assert images["front"].shape == (2, 2, 3)
+        self.frames.append(values)
+
+    def discard_episode(self):
+        self.events.append("discard")
+
+    def close(self):
+        self.events.append("close")
+
+
+def test_rollout_recorder_records_10_hz_frames_up_to_the_end_time():
+    writer = FakeWriter()
+    robot = types.SimpleNamespace(recording_samples=lambda t: {k: v for k, v in _samples(t).items() if k != "gripper"})
+    gripper = types.SimpleNamespace(read=lambda: 900.0, target=None)
+    recorder = client.RolloutRecorder(robot, writer, gripper, horizon=2)
+    recorder.start()
+    until = time.monotonic() + 0.25
+    summary = recorder.stop(until)
+    recorder.close()
+    assert summary == {"frames": 3, "human": 0, "chunks": 0, "stale": {}}
+    times = [values["sync.target_host_s"][0] for values in writer.frames]
+    np.testing.assert_allclose(np.diff(times), 0.1)
+    assert times[-1] <= until
+    assert [values["actions"][6] for values in writer.frames] == [900.0] * 3  # no policy target yet: hold
+    assert writer.events == ["start", "discard", "close"]
+
+
+def test_takeover_episodes_record_until_the_clutch_release_and_leave_the_stop_to_the_teleoperation(monkeypatch):
+    session = client.Session(client.parse_args(["--execute", "--dagger", "--record-dir", "unused"]))
+    calls = []
+    session.robot = types.SimpleNamespace(
+        takeover=lambda: (1.0, 2.5, 7),
+        status="stopped: RT motion ended",
+        end_takeover=lambda: calls.append("end takeover"),
+        stop=lambda: calls.append("stop arm"),
+    )
+    session.recorder = types.SimpleNamespace(
+        start=lambda: calls.append("record"),
+        stop=lambda until: calls.append(("end recording", until)) or {"frames": 3},
+        abort=lambda: calls.append("abort"),
+        failed=False,
+    )
+    session.console = client.Console(io.StringIO())
+
+    def taken_over(*args, should_stop, **kwargs):
+        assert not should_stop()
+        raise client.HumanTakeover
+
+    monkeypatch.setattr(client, "run_chunks", taken_over)
+    assert session._run_episode(client.RunConfig()) == {"frames": 3}
+    assert calls == ["record", ("end recording", 2.5), "end takeover"]
+
+    calls.clear()
+    monkeypatch.setattr(client, "run_chunks", lambda *args, should_stop, **kwargs: 4)
+    session._run_episode(client.RunConfig())
+    assert [call if isinstance(call, str) else call[0] for call in calls] == ["record", "stop arm", "end recording"]
+
+
+def test_recording_and_dagger_arguments():
+    assert client.parse_args([]).episodes == 1
+    assert client.parse_args(["--execute", "--dagger", "--record-dir", "d"]).episodes == 0
+    assert client.parse_args(["--record-dir", "d", "--episodes", "3"]).episodes == 3
+    assert client.parse_args(["--check", "--dagger"]).dagger
+    for argv in (
+        ["--dagger", "--record-dir", "d"],
+        ["--execute", "--dagger"],
+        ["--record-dir", "d", "--no-gripper"],
+        ["--episodes", "-1"],
+    ):
+        with pytest.raises(SystemExit):
+            client.parse_args(argv)
