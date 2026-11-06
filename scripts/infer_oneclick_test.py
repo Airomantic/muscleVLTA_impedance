@@ -35,6 +35,7 @@ def environment(tmp_path):
     gripper = base / "V3_Gripper"
     arm = base / "arm"
     tilt = base / "tilt"
+    lerobot = base / "lerobot"
     cameras = base / "camera launch"
     data_home = base / "openpi"
     checkpoint = base / "checkpoint"
@@ -47,6 +48,8 @@ def environment(tmp_path):
         base / "bridge/config/MessageBridge.yaml",
         tilt / "camera_tilt_ros2.py",
         tilt / "usb_servo.py",
+        lerobot / "scripts/ar3_tactile_bridge.py",
+        lerobot / "examples/rokae_ar3/tactile_bridge.json",
         cameras / "gemini_330_series.launch.py",
         cameras / "gemini305.launch.py",
         data_home / "big_vision/paligemma_tokenizer.model",
@@ -60,6 +63,12 @@ def environment(tmp_path):
     _executable(base / "bridge/MessageBridge")
     _executable(base / "puppetry/Puppetry")
     _executable(arm / "install/ar3_cartesian_impedance/lib/ar3_cartesian_impedance/cartesian_impedance_node")
+    _executable(lerobot / ".venv-ar3/bin/python")
+    _executable(
+        lerobot / "scripts/ar3_python.sh",
+        '#!/bin/bash\nprintf "tactile-bridge ROS_DOMAIN_ID=%s AR3_WS=%s %s\\n" "$ROS_DOMAIN_ID" "$AR3_WS" "$*" '
+        '>> "$INFER_TEST_CALLS"\n',
+    )
     # Import checks (-c) are local and not logged; helper runs are.
     _executable(
         gripper / ".venv-ros/bin/python",
@@ -113,6 +122,7 @@ if [[ "$*" == *"node list"* ]]; then
         [[ ! -v INFER_TEST_NODES_SECOND ]] || touch "$INFER_TEST_NODE_QUERY_MARKER"
     fi
 elif [[ "$*" == *"/dev/tcp/"* ]]; then
+    [[ " ${INFER_TEST_TCP_OPEN:-} " != *" ${@: -1} "* ]] || exit 0
     exit "${INFER_TEST_TCP_EXIT:-1}"
 elif [[ "$*" == *"${INFER_TEST_FAIL:-__none__}"* ]]; then
     exit 1
@@ -139,6 +149,7 @@ printf '\\n' >> "$INFER_TEST_CALLS"
             "INFER_AR3_WS": str(arm),
             "INFER_GRIPPER_DIR": str(gripper),
             "INFER_TILT_DIR": str(tilt),
+            "INFER_LEROBOT_DIR": str(lerobot),
             "INFER_SERVO_PYTHON": str(servo_python),
             "INFER_CAMERA_LAUNCH_DIR": str(cameras),
             "INFER_WRIST_DRIVER_OVERLAY": "",
@@ -698,6 +709,68 @@ def test_dagger_readiness_enables_the_teleoperation_after_every_input_and_waits_
     ]
     assert order == sorted(order)
     assert order[-1] > order[-2]
+
+
+def test_tactile_starts_the_recorded_tac_g2_pipeline_and_reuses_running_parts(environment):
+    result = run(environment, "--tactile")
+    assert result.returncode == 0, result.stderr
+    assert terminal_tasks(environment) == ["arm", "sensor", "gripper", "front", "wrist", "tilt", "tactile", "ready"]
+    assert "grpc_server.py" in result.stdout
+    assert "ar3_tactile_bridge.py --preview" in result.stdout
+    Path(environment["INFER_TEST_CALLS"]).unlink()
+    # Listening sensor/gripper ports and a running bridge node are reused, as in the recordings' oneClick.sh.
+    environment["INFER_TEST_NODES"] = "/v3_gripper_tactile_recording"
+    environment["INFER_TEST_TCP_EXIT"] = "0"
+    result = run(environment, "--tactile")
+    assert result.returncode == 0, result.stderr
+    assert terminal_tasks(environment) == ["arm", "front", "wrist", "tilt", "ready"]
+    # The bridge files are required only with --tactile.
+    (Path(environment["INFER_LEROBOT_DIR"]) / "scripts/ar3_tactile_bridge.py").unlink()
+    assert run(environment, "--check").returncode == 0
+    result = run(environment, "--check", "--tactile")
+    assert result.returncode != 0
+    assert "ar3_tactile_bridge.py" in result.stderr
+
+
+def test_tac_g2_tasks_start_in_the_recording_order(environment):
+    environment["INFER_TIMEOUT"] = "1"
+    result = run(environment, "--task", "gripper", "--tactile")
+    assert result.returncode != 0
+    assert "Nothing listens on 192.168.127.10:50051" in result.stderr
+    assert not any("/bin/ssh " in line for line in calls(environment))
+    environment["INFER_TEST_TCP_OPEN"] = "50051"
+    result = run(environment, "--task", "gripper", "--tactile")
+    assert result.returncode == 0, result.stderr
+    assert any("/bin/ssh " in line and "deploy.sh" in line for line in calls(environment))
+    # The bridge needs both fingers' servers and publishes in the robot's ROS domain.
+    result = run(environment, "--task", "tactile", "--tactile")
+    assert result.returncode != 0
+    assert "Nothing listens on 192.168.127.10:50052" in result.stderr
+    environment["INFER_TEST_TCP_OPEN"] = "50051 50052"
+    result = run(environment, "--task", "tactile", "--tactile")
+    assert result.returncode == 0, result.stderr
+    bridge = [line for line in calls(environment) if line.startswith("tactile-bridge ")]
+    assert bridge == [
+        f"tactile-bridge ROS_DOMAIN_ID=111 AR3_WS={environment['INFER_AR3_WS']} "
+        f"{environment['INFER_LEROBOT_DIR']}/scripts/ar3_tactile_bridge.py --preview"
+    ]
+
+
+def test_tactile_readiness_requires_samples_of_both_fingers(environment):
+    assert run(environment, "--task", "ready").returncode == 0
+    assert not any("/v3_gripper/tactile/" in line for line in calls(environment))
+    result = run(environment, "--task", "ready", "--tactile")
+    assert result.returncode == 0, result.stderr
+    assert "PREPARATION READY" in result.stdout
+    log = "\n".join(calls(environment))
+    for sensor in ("sensor_0", "sensor_2"):
+        assert f"/v3_gripper/tactile/{sensor}/wrench geometry_msgs/msg/WrenchStamped" in log
+        assert f"/v3_gripper/tactile/{sensor}/depth sensor_msgs/msg/Image" in log
+    environment["INFER_TEST_FAIL"] = "/v3_gripper/tactile/sensor_2/depth"
+    result = run(environment, "--task", "ready", "--tactile")
+    assert result.returncode != 0
+    assert "No qualifying sample on /v3_gripper/tactile/sensor_2/depth" in result.stderr
+    assert "PREPARATION READY" not in result.stdout
 
 
 def test_robot_runner_requires_client_dependencies_before_starting_the_client(environment, tmp_path):

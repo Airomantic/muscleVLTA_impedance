@@ -21,6 +21,12 @@ fi
 REMOTE_DIR="${INFER_REMOTE_DIR:-$UPPERLIMB/remote/pp_ubuntu24.04_V1.1.2.38_202606301404_release_ros2_x86_jazzy}"
 BRIDGE_DIR="${INFER_BRIDGE_DIR:-$REMOTE_DIR/x86/standalone/bin/ROS_2}"
 PUPPETRY_DIR="${INFER_PUPPETRY_DIR:-$REMOTE_DIR/x86/standalone/bin/Puppetry}"
+# --tactile (muscleVLTA policies): the recordings' Tac G2 pipeline (lerobot oneClick.sh): the remote sensor server on
+# the gripper host, then the lerobot bridge publishing both fingers' depth and wrench for the robot client.
+LEROBOT_DIR="${INFER_LEROBOT_DIR:-$UPPERLIMB/lerobot_89236e_muscleVLTA_eef}"
+TACTILE_PORTS=(50051 50052)
+TACTILE_NODE=v3_gripper_tactile_recording
+TACTILE_SENSORS=(sensor_0 sensor_2)
 TELEOP_NODE=/ar3_cartesian_impedance_teleop
 GATE_NODE=/ar3_dagger_gripper_gate
 TRIGGER_TOPIC=/trigger_positions
@@ -54,7 +60,7 @@ RT_PARAMS=install/ar3_cartesian_impedance/share/ar3_cartesian_impedance/config/r
 WRIST_COLOR=(enable_color_auto_exposure:=false color_exposure:=80 color_gain:=16
     enable_color_auto_white_balance:=false color_white_balance:=4600)
 
-WITH_ARM=1 WITH_SSH=1 WITH_FRONT_CAMERA=1 WITH_WRIST_CAMERA=1 WITH_TILT=1 WITH_POLICY=0 WITH_DAGGER=0
+WITH_ARM=1 WITH_SSH=1 WITH_FRONT_CAMERA=1 WITH_WRIST_CAMERA=1 WITH_TILT=1 WITH_POLICY=0 WITH_DAGGER=0 WITH_TACTILE=0
 WINDOWS=0 MODE=start TASK=""
 INITIALIZE_GRIPPER=0
 WITH_READY_TAB=1
@@ -85,6 +91,10 @@ Usage: ./infer_oneclick.sh [OPTIONS]
                      the AR3 Cartesian teleoperation (the ready task sets dry_run=false: it
                      MOVES the arm while the clutch is pressed) and the gated gripper
                      teleoperation (scripts/ar3_dagger_gripper_teleop.sh).
+  --tactile          Also start the Tac G2 fingers of muscleVLTA policies as recorded: the remote
+                     sensor server (grpc_server.py, ports 50051/50052; before the gripper service)
+                     and the lerobot bridge (scripts/ar3_tactile_bridge.py --preview); readiness
+                     waits for both fingers' depth and wrench.
   --windows          Separate GNOME windows instead of tabs in one new window.
   -h, --help         Show this help.
 
@@ -115,6 +125,7 @@ fix). INFER_WRIST_DRIVER_OVERLAY selects another overlay; an explicitly empty va
 uses the system driver. Only the wrist process receives this AMENT_PREFIX_PATH;
 the front camera and arm keep the system ROS environment.
 DAgger paths: INFER_REMOTE_DIR, INFER_BRIDGE_DIR (MessageBridge), INFER_PUPPETRY_DIR (Puppetry).
+Tac G2 path: INFER_LEROBOT_DIR (the recordings' LeRobot project with scripts/ar3_tactile_bridge.py).
 Devices: INFER_ARM_INTERFACE, INFER_ARM_CIDR, INFER_ARM_IP, INFER_WORKSPACE_RADIUS,
 INFER_GRIPPER_INTERFACE, INFER_GRIPPER_CIDR, INFER_GRIPPER_HOST, INFER_GRIPPER_USER,
 INFER_GRIPPER_CHANNEL, INFER_GRIPPER_MOTOR_ID, INFER_FRONT_SERIAL, INFER_WRIST_SERIAL,
@@ -163,6 +174,7 @@ while (($#)); do
         --with-policy) WITH_POLICY=1 ;;
         --no-policy) WITH_POLICY=0 ;;
         --dagger) WITH_DAGGER=1 ;;
+        --tactile) WITH_TACTILE=1 ;;
         --windows) WINDOWS=1 ;;
         --task)
             [[ $# -ge 2 ]] || die "--task requires a name."
@@ -201,10 +213,12 @@ ROS_CMD=(env -i "HOME=$HOME" "PATH=/usr/bin:/bin:/usr/local/bin"
     bash --noprofile --norc -c 'set -e; source "$1"; shift; exec "$@"' _ "$ROS_SETUP")
 TASKS=()
 ((WITH_ARM)) && TASKS+=(arm)
+((WITH_SSH && WITH_TACTILE)) && TASKS+=(sensor)
 ((WITH_SSH)) && TASKS+=(gripper)
 ((WITH_FRONT_CAMERA)) && TASKS+=(front)
 ((WITH_WRIST_CAMERA)) && TASKS+=(wrist)
 ((WITH_TILT)) && TASKS+=(tilt)
+((WITH_TACTILE)) && TASKS+=(tactile)
 ((WITH_DAGGER)) && TASKS+=(bridge puppetry teleop gate)
 ((WITH_POLICY)) && TASKS+=(policy)
 ((WITH_READY_TAB)) && TASKS+=(ready)
@@ -236,11 +250,17 @@ command_for() {
             COMMAND=(bash "$AR3_WS/jazzy.sh" ros2 run ar3_cartesian_impedance cartesian_impedance_node --ros-args
                 --params-file "$AR3_WS/$RT_PARAMS" -p "robot_ip:=$ARM_IP" -p "local_ip:=$ARM_LOCAL_IP"
                 -p enable_motion:=true -p auto_power_on:=true -p "workspace_radius_m:=$WORKSPACE_RADIUS") ;;
-        gripper)
+        gripper|sensor)
             local remote='cd "$HOME/gripper_sdk" && exec bash deploy.sh'
+            [[ "$1" == gripper ]] || remote='cd "$HOME/dmrobotics_Flux_pkg_V1.2.13.1/dmrobotics_Flux_pkg/sensor_server" && exec python -u grpc_server.py'
             COMMAND=(ssh -tt -o StrictHostKeyChecking=yes -o ConnectTimeout=10
                 -o ServerAliveInterval=15 -o ServerAliveCountMax=3
                 "$GRIPPER_USER@$GRIPPER_HOST" "$(quote_remote bash -lic "$remote")") ;;
+        tactile)
+            # The recordings' bridge in the LeRobot project (its own Python, ROS and this ROS domain).
+            TASK_CWD="$LEROBOT_DIR"
+            COMMAND=(env "AR3_WS=$AR3_WS" PYTHONFAULTHANDLER=1 bash "$LEROBOT_DIR/scripts/ar3_python.sh"
+                "$LEROBOT_DIR/scripts/ar3_tactile_bridge.py" --preview) ;;
         front|wrist)
             local launch=gemini_330_series.launch.py serial="$FRONT_SERIAL" format=MJPG
             local camera_ros=("${ROS_CMD[@]}")
@@ -352,6 +372,11 @@ preflight() {
         # jazzy.sh impedance-teleop keeps its per-domain lock there.
         [[ -d "$AR3_WS/.venv-teleop" ]] || die "Missing $AR3_WS/.venv-teleop (the AR3 teleoperation environment)."
     fi
+    if ((WITH_TACTILE)); then
+        files+=("$LEROBOT_DIR/scripts/ar3_python.sh" "$LEROBOT_DIR/scripts/ar3_tactile_bridge.py"
+            "$LEROBOT_DIR/examples/rokae_ar3/tactile_bridge.json" "$AR3_WS/install/local_setup.bash")
+        executables+=("${AR3_RECORD_PYTHON:-$LEROBOT_DIR/.venv-ar3/bin/python}")
+    fi
     if ((WITH_POLICY)); then
         command -v curl >/dev/null || die "Missing command: curl"
         files+=("${OPENPI_DATA_HOME:-$HOME/.cache/openpi}/big_vision/paligemma_tokenizer.model")
@@ -380,6 +405,7 @@ print_plan() {
         info "Wrist camera driver: ${WRIST_DRIVER_OVERLAY:-system ROS driver}; front camera uses the system driver."
     fi
     ((WITH_DAGGER)) && info "DAgger: MessageBridge, Puppetry, the AR3 teleoperation (enabled by the ready task: it MOVES the arm while the clutch is pressed) and the gated gripper teleoperation."
+    ((WITH_TACTILE)) && info "Tac G2: sensor server $GRIPPER_HOST (ports ${TACTILE_PORTS[*]}) and the bridge of $LEROBOT_DIR."
     if [[ "$TASK" == ready ]]; then
         info "Recheck existing services; require gripper $GRIPPER_HOST via $GRIPPER_INTERFACE src $GRIPPER_LOCAL_IP. No new tabs."
     else
@@ -402,6 +428,8 @@ print_plan() {
             ((WITH_WRIST_CAMERA)) && printf '  Wait for /wrist/color/image_raw samples.\n'
             ((WITH_WRIST_CAMERA)) && printf '  Check /wrist/color/metadata: exposure 80, gain 16, white balance 4600 K; AE/AWB off.\n'
             ((WITH_TILT)) && printf '  Wait for measured /camera_tilt/state_deg within %s +/- 2 degrees.\n' "$TILT_ANGLE"
+            ((WITH_TACTILE)) && printf '  Wait for /v3_gripper/tactile/{%s}/{wrench,depth} samples.\n' \
+                "$(IFS=,; printf '%s' "${TACTILE_SENSORS[*]}")"
             ((WITH_DAGGER)) && printf '  Wait for %s, set %s dry_run=false and verify it, wait for %s.\n' \
                 "$TRIGGER_TOPIC" "$TELEOP_NODE" "$GATE_NODE"
             ((WITH_POLICY)) && printf '  Wait for http://%s:%s/healthz.\n' "$OPENPI_HOST" "$OPENPI_PORT"
@@ -410,7 +438,12 @@ print_plan() {
         fi
         case "$task" in
             arm) printf '  Add %s to %s only if absent; verify route and ping; refuse old joint drivers.\n' "$ARM_CIDR" "$ARM_INTERFACE" ;;
-            gripper) printf '  Reuse the service if %s:%s already listens.\n' "$GRIPPER_HOST" "$GRIPPER_PORT" ;;
+            gripper)
+                printf '  Reuse the service if %s:%s already listens.\n' "$GRIPPER_HOST" "$GRIPPER_PORT"
+                ((WITH_TACTILE == 0)) || printf '  Otherwise first wait for the Tac G2 sensor server (as recorded).\n' ;;
+            sensor) printf '  Reuse the server if %s:%s already listens.\n' "$GRIPPER_HOST" "${TACTILE_PORTS[0]}" ;;
+            tactile) printf '  Wait for %s:%s; reuse the bridge if /%s runs.\n' "$GRIPPER_HOST" \
+                "$(IFS=,; printf '%s' "${TACTILE_PORTS[*]}")" "$TACTILE_NODE" ;;
             bridge|puppetry) printf '  Reuse it if it already runs.\n' ;;
             teleop) printf '  Start after the controller is ready, with dry_run=true; the ready task enables it.\n' ;;
             gate) printf '  Drives the gripper only during DAgger takeovers; never stops or disconnects it.\n' ;;
@@ -422,6 +455,15 @@ print_plan() {
 
 tcp_ready() {
     timeout 2 bash --noprofile --norc -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$1" "$2" >/dev/null 2>&1
+}
+
+wait_tcp() {
+    local deadline=$((SECONDS + WAIT_TIMEOUT))
+    info "Waiting for $GRIPPER_HOST:$1"
+    until tcp_ready "$GRIPPER_HOST" "$1"; do
+        ((SECONDS < deadline)) || die "Nothing listens on $GRIPPER_HOST:$1; inspect the Tac G2 sensor server tab."
+        sleep 2
+    done
 }
 
 wait_topic() {
@@ -520,6 +562,8 @@ select_missing_tasks() {
             wrist) [[ "$nodes" != *"/wrist/"* ]] || present=1 ;;
             tilt) [[ "$nodes" != *camera_tilt_servo* ]] || present=1 ;;
             gripper) if tcp_ready "$GRIPPER_HOST" "$GRIPPER_PORT"; then present=1; fi ;;
+            sensor) if tcp_ready "$GRIPPER_HOST" "${TACTILE_PORTS[0]}"; then present=1; fi ;;
+            tactile) [[ "$nodes" != *"/$TACTILE_NODE"* ]] || present=1 ;;
         esac
         if ((present)); then
             info "Reusing existing $task; readiness will still check it."
@@ -564,9 +608,9 @@ prepare_gripper_network() {
 }
 
 run_task() {
-    local addresses route nodes deadline binary
+    local addresses route nodes deadline binary port sensor
     case "$TASK" in
-        gripper|ready) check_gripper_route ;;
+        gripper|ready|sensor|tactile) check_gripper_route ;;
     esac
     case "$TASK" in
         arm)
@@ -587,7 +631,15 @@ run_task() {
             if tcp_ready "$GRIPPER_HOST" "$GRIPPER_PORT"; then
                 info "Reusing the gripper service listening on $GRIPPER_HOST:$GRIPPER_PORT; the ready tab checks it."
                 return
+            fi
+            # As in the recordings, the gripper service starts after the Tac G2 sensor server.
+            if ((WITH_TACTILE)); then wait_tcp "${TACTILE_PORTS[0]}"; fi ;;
+        sensor)
+            if tcp_ready "$GRIPPER_HOST" "${TACTILE_PORTS[0]}"; then
+                info "Reusing the Tac G2 sensor server listening on $GRIPPER_HOST:${TACTILE_PORTS[0]}."
+                return
             fi ;;
+        tactile) for port in "${TACTILE_PORTS[@]}"; do wait_tcp "$port"; done ;;
         bridge|puppetry)
             binary=MessageBridge
             [[ "$TASK" == bridge ]] || binary=Puppetry
@@ -616,6 +668,12 @@ run_task() {
                 wait_topic /camera_tilt/state_deg std_msgs/msg/Float64 --field data \
                     --qos-reliability reliable --qos-durability transient_local \
                     --filter "abs(m - $TILT_ANGLE) <= 2.0"
+            fi
+            if ((WITH_TACTILE)); then
+                for sensor in "${TACTILE_SENSORS[@]}"; do
+                    wait_topic "/v3_gripper/tactile/$sensor/wrench" geometry_msgs/msg/WrenchStamped --field header
+                    wait_topic "/v3_gripper/tactile/$sensor/depth" sensor_msgs/msg/Image --field header
+                done
             fi
             check_gripper
             if ((WITH_DAGGER)); then
