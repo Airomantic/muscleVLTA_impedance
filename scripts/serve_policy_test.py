@@ -22,3 +22,15 @@ def test_create_policy_uses_explicit_task_checkpoint(monkeypatch):
         "prompt": args.default_prompt,
     }
     assert args.host == "127.0.0.1"
+
+
+def test_server_metadata_announces_the_muscle_vlta_sensor_layout():
+    from openpi.training import config as _config
+
+    lift = serve_policy.server_metadata(_config.get_config("pi05_ar3_lift_reactive"))
+    assert lift["sensor_history"] == 0
+    assert lift["tactile_in_use"] is False
+    muscle = serve_policy.server_metadata(_config.get_config("pi05_ar3_muscle_vlta"))
+    assert muscle["sensor_history"] == 10
+    assert muscle["tactile_in_use"] is True
+    assert muscle["wrench_dim"] == 13

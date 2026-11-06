@@ -67,6 +67,9 @@ def server_metadata(config: _config.TrainConfig, policy_metadata: dict | None = 
     if metadata["reactive"]:
         metadata["cross_attention_latency"] = model.cross_attention_latency
         metadata["wrench_dim"] = model.wrench_dim
+        # muscleVLTA: per-step readings carry this many history rows (and the Tac G2 hand keys).
+        metadata["sensor_history"] = model.sensor_history
+        metadata["tactile_in_use"] = model.tactile_in_use
     return {**metadata, **(policy_metadata or {})}
 
 
