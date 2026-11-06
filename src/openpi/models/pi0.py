@@ -7,6 +7,7 @@ import flax.nnx as nnx
 import flax.nnx.bridge as nnx_bridge
 import jax
 import jax.numpy as jnp
+import optax
 from typing_extensions import override
 
 from openpi.models import hand_encoder as _hand_encoder
@@ -160,6 +161,11 @@ class ReactiveContext(NamedTuple):
     contact_logits: jax.Array | None = None
 
 
+def _masked_mean(values: jax.Array, mask: jax.Array) -> jax.Array:
+    mask = jnp.broadcast_to(mask, values.shape)
+    return jnp.sum(jnp.where(mask, values, 0.0)) / jnp.maximum(jnp.sum(mask), 1)
+
+
 @at.typecheck
 def posemb_sincos(
     pos: at.Real[at.Array, " b"], embedding_dim: int, min_period: float, max_period: float
@@ -193,6 +199,8 @@ class Pi0(_model.BaseModel):
         self.tactile_contact_depth = config.tactile_contact_depth
         self.hand_dropout = config.hand_dropout
         self.finger_dropout = config.finger_dropout
+        self.contact_loss_weight = config.contact_loss_weight
+        self.forward_loss_weight = config.forward_loss_weight
         self.cross_attention_latency = config.cross_attention_latency
         self.residual_image_keys = config.residual_image_keys
         self.residual_action_dim = len(config.residual_action_scale) if config.residual_policy_in_use else 0
@@ -261,6 +269,14 @@ class Pi0(_model.BaseModel):
             # Added to the arm (and hand) stream tokens, which share time positions in the force memory.
             num_streams = 2 if config.tactile_in_use else 1
             self.sensor_stream_embedding = nnx.Param(jnp.zeros((num_streams, action_expert_config.width)))
+            # Training-only forward model of the readings (``_sensor_forward``): arm wrench, then per finger the
+            # wrench with the contact-patch geometry, then the finger contact logits.
+            fingers = config.tactile_num_fingers if config.tactile_in_use else 0
+            finger_dim = _hand_encoder.FINGER_WRENCH_DIM + _hand_encoder.GEOMETRY_DIM + 1
+            self.sensor_forward_in = nnx.Linear(
+                num_streams * action_expert_config.width + 2 * config.action_dim, 512, rngs=rngs
+            )
+            self.sensor_forward_out = nnx.Linear(512, config.wrench_dim + fingers * finger_dim, rngs=rngs)
 
         if config.residual_policy_in_use:
             self.residual_policy = create_residual_policy_submodule(config, rngs)
@@ -466,6 +482,70 @@ class Pi0(_model.BaseModel):
         keep_hand = jax.random.bernoulli(hand_rng, 1.0 - self.hand_dropout, (batch_size, 1, 1))
         keep_finger = jax.random.bernoulli(finger_rng, 1.0 - self.finger_dropout, (batch_size, 1, fingers))
         return finger_valid & keep_hand & keep_finger
+
+    def _sensor_forward(self, memory: jax.Array, actions: _model.Actions) -> jax.Array:
+        """Readings of chunk step p + 1 from the force memory of step p and the commands a_{p-1}, a_p, p = 1..H-2.
+
+        Step 0 is left out: its previous command precedes the chunk.
+        """
+        batch_size, rows = memory.shape[0], self.sensor_history + self.action_horizon
+        memory = memory.reshape(batch_size, -1, rows, memory.shape[-1])[:, :, self.sensor_history + 1 : rows - 1]
+        state = einops.rearrange(memory, "b n p w -> b p (n w)")
+        commands = jnp.concatenate([actions[:, :-2], actions[:, 1:-1]], axis=-1)
+        inputs = jnp.concatenate([state.astype(jnp.float32), commands.astype(jnp.float32)], axis=-1)
+        return self.sensor_forward_out(jax.nn.gelu(self.sensor_forward_in(inputs)))
+
+    def _sensor_aux_losses(
+        self, observation: _model.Observation, actions: _model.Actions, context: ReactiveContext
+    ) -> dict[str, jax.Array]:
+        """Training-only supervision of the sensor encoders; nothing here runs at inference.
+
+        ``contact_loss``: the finger contact gates against the indentation-map labels. ``forward_*_loss``: the
+        action-conditioned forward model (``_sensor_forward``) against the next arm wrench, finger wrenches with
+        contact-patch geometry, and finger contact. It reads the training memory, after sensor dropout, so the next
+        reading of a dropped finger has to be inferred from the arm and the other finger.
+        """
+        batch_size, rows = observation.wrench.shape[:2]
+        valid = observation.sensor_valid
+        if valid is None:
+            valid = jnp.ones((batch_size, rows), dtype=jnp.bool_)
+        valid = valid & self._get_wrench_mask(observation)[:, None]
+        losses = {}
+        if self.tactile_in_use:
+            labels = _hand_encoder.contact_labels(observation.tactile_depth, self.tactile_contact_depth)
+            labels = labels.astype(jnp.float32)
+            finger_valid = observation.tactile_valid & valid[..., None]
+            if self.contact_loss_weight:
+                logits = context.contact_logits.astype(jnp.float32)
+                losses["contact_loss"] = _masked_mean(optax.sigmoid_binary_cross_entropy(logits, labels), finger_valid)
+        if not self.forward_loss_weight:
+            return losses
+
+        prediction = self._sensor_forward(context.memory, actions)
+        current, following = slice(self.sensor_history + 1, rows - 1), slice(self.sensor_history + 2, rows)
+        step_valid = valid[:, current] & valid[:, following]
+        arm_target = observation.wrench[:, following].astype(jnp.float32)
+        losses["forward_arm_loss"] = _masked_mean(
+            optax.huber_loss(prediction[..., : self.wrench_dim], arm_target), step_valid[..., None]
+        )
+        if self.tactile_in_use:
+            steps, fingers = prediction.shape[1], finger_valid.shape[-1]
+            finger_target = jnp.concatenate(
+                [
+                    observation.tactile_wrench[:, following].reshape(batch_size, steps, fingers, -1),
+                    _hand_encoder.contact_geometry(observation.tactile_depth[:, following], self.tactile_contact_depth),
+                ],
+                axis=-1,
+            ).astype(jnp.float32)
+            finger_prediction = prediction[..., self.wrench_dim : -fingers].reshape(finger_target.shape)
+            next_valid = finger_valid[:, following] & step_valid[..., None]
+            losses["forward_finger_loss"] = _masked_mean(
+                optax.huber_loss(finger_prediction, finger_target), next_valid[..., None]
+            )
+            losses["forward_contact_loss"] = _masked_mean(
+                optax.sigmoid_binary_cross_entropy(prediction[..., -fingers:], labels[:, following]), next_valid
+            )
+        return losses
 
     def _get_residual_wrench_memory(self, wrench, wrench_mask, batch_size: int):
         if wrench is None:
@@ -727,9 +807,15 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
+        return self.compute_loss_and_metrics(rng, observation, actions, train=train)[0]
+
+    @override
+    def compute_loss_and_metrics(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> tuple[at.Float[at.Array, "*b ah"], dict[str, at.Array]]:
         if self.residual_policy_in_use:
             residual_loss, _ = self.compute_residual_loss_with_prediction(rng, observation, actions, train=train)
-            return residual_loss
+            return residual_loss, {}
 
         if not self.reactive_in_use:
             preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
@@ -756,16 +842,14 @@ class Pi0(_model.BaseModel):
             )
             del prefix_out
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
-            return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+            return jnp.mean(jnp.square(v_t - u_t), axis=-1), {}
 
         sensor_rng = None
         if self.tactile_in_use:
             rng, sensor_rng = jax.random.split(rng)
         preprocess_rng, noise_rng, time_rng, reac_noise_rng = jax.random.split(rng, 4)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
-        wrench_memory, cross_attn_mask, cross_positions, _ = self._reactive_context(
-            observation, sensor_rng, train=train
-        )
+        context = self._reactive_context(observation, sensor_rng, train=train)
 
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
@@ -794,15 +878,23 @@ class Pi0(_model.BaseModel):
             mask=attn_mask,
             adarms_cond=[None, adarms_cond, reac_adarms_cond],
             positions=positions,
-            memory=wrench_memory,
-            cross_attn_mask=cross_attn_mask,
-            cross_positions=cross_positions,
+            memory=context.memory,
+            cross_attn_mask=context.cross_attn_mask,
+            cross_positions=context.cross_positions,
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
         reac_v_t = self.action_out_proj(reacfix_out[:, -self.action_horizon :])
-        if self.original_head:
-            return jnp.mean(jnp.square(v_t - u_t), axis=-1)
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1) + jnp.mean(jnp.square(reac_v_t - reac_u_t), axis=-1)
+        chunked_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        if not self.original_head:
+            chunked_loss = chunked_loss + jnp.mean(jnp.square(reac_v_t - reac_u_t), axis=-1)
+        if not (self.sensor_history or self.tactile_in_use):
+            return chunked_loss, {}
+        aux_losses = self._sensor_aux_losses(observation, actions, context)
+        aux_loss = sum(
+            (self.forward_loss_weight if name.startswith("forward_") else self.contact_loss_weight) * loss
+            for name, loss in aux_losses.items()
+        )
+        return chunked_loss + aux_loss, {"action_loss": jnp.mean(chunked_loss), **aux_losses}
 
     @override
     def sample_actions(

@@ -48,6 +48,11 @@ class Pi0Config(_model.BaseModelConfig):
     # Training-time sensor dropout, constant over a sample: the whole hand, or each finger independently.
     hand_dropout: float = 0.1
     finger_dropout: float = 0.1
+    # Training-only supervision of the sensor encoders (0 skips a term; its parameters stay): the finger contact gates
+    # against the indentation-map labels, and an action-conditioned forward model of the readings (force memory of
+    # chunk step p + commands a_{p-1}, a_p -> arm wrench, finger wrenches, contact patches and contact of step p + 1).
+    contact_loss_weight: float = 0.05
+    forward_loss_weight: float = 0.1
 
     # The residual branch reuses the frozen base-policy SigLIP. These settings
     # control only the trainable correction decoder and wrench encoder.
@@ -88,6 +93,10 @@ class Pi0Config(_model.BaseModelConfig):
                 raise ValueError("use_force_history=False keeps only the chunk-start reading; drop sensor_history.")
             if not (0.0 <= self.hand_dropout < 1.0 and 0.0 <= self.finger_dropout < 1.0):
                 raise ValueError("hand_dropout and finger_dropout must be in [0, 1).")
+            if self.contact_loss_weight < 0 or self.forward_loss_weight < 0:
+                raise ValueError("contact_loss_weight and forward_loss_weight must be non-negative.")
+            if self.forward_loss_weight and self.action_horizon < 3:
+                raise ValueError("forward_loss_weight > 0 needs action_horizon >= 3 (it predicts chunk steps 2..H-1).")
         if self.residual_policy_in_use:
             if not self.residual_image_keys:
                 raise ValueError("residual_image_keys must contain at least one image key.")

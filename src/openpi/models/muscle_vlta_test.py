@@ -156,6 +156,8 @@ def test_new_params_are_safe_from_reactive_expert_copy():
         ({"pi05": False, "use_state": True}, "require pi05"),
         ({"use_force_history": False}, "drop sensor_history"),
         ({"finger_dropout": 1.0}, "dropout"),
+        ({"forward_loss_weight": -0.1}, "non-negative"),
+        ({"action_horizon": 2}, "action_horizon >= 3"),
     ],
 )
 def test_config_rejects_unsupported_muscle_vlta_settings(kwargs, match):
@@ -240,11 +242,56 @@ def test_reactive_context_drops_fingers_only_in_training(reactive_model):
     assert context.contact_logits.shape == (1, HISTORY + HORIZON, 2)
 
 
-def test_muscle_vlta_training_loss(reactive_model):
-    config, model, _, _ = reactive_model
-    observation, actions = config.fake_obs(batch_size=2), config.fake_act(batch_size=2)
-    loss = nnx_utils.module_jit(model.compute_loss, static_argnames=("train",))(
-        jax.random.key(5), observation, actions, train=True
-    )
+def test_sensor_forward_model_predicts_the_next_step_causally(reactive_model):
+    _, model, observation, _ = reactive_model
+    actions = jax.random.normal(jax.random.key(6), (1, HORIZON, 8))
+
+    def predict(obs, act):
+        return np.asarray(model._sensor_forward(model._reactive_context(obs).memory, act))
+
+    base = predict(observation, actions)
+    assert base.shape == (1, HORIZON - 2, 13 + 2 * (6 + 8 + 1))
+    # Prediction j reads the memory up to chunk step j + 1 and the commands a_j, a_{j+1}.
+    for changed in (
+        predict(_perturb(observation, HISTORY + 2), actions),
+        predict(observation, actions.at[:, 2].add(1)),
+    ):
+        np.testing.assert_array_equal(changed[:, 0], base[:, 0])
+        assert not np.allclose(changed[:, 1], base[:, 1])
+
+
+def test_muscle_vlta_training_loss_adds_the_sensor_supervision(reactive_model):
+    config, model, observation, _ = reactive_model
+    observation = jax.tree.map(lambda x: jnp.concatenate([x, x]), observation)
+    actions = jax.random.normal(jax.random.key(7), (2, HORIZON, 8))
+    loss_fn = nnx_utils.module_jit(model.compute_loss_and_metrics, static_argnames=("train",))
+
+    def losses(obs):
+        return jax.device_get(loss_fn(jax.random.key(5), obs, actions, train=True))
+
+    loss, metrics = losses(observation)
     assert loss.shape == (2, HORIZON)
-    assert np.isfinite(np.asarray(loss)).all()
+    assert set(metrics) == {
+        "action_loss",
+        "contact_loss",
+        "forward_arm_loss",
+        "forward_finger_loss",
+        "forward_contact_loss",
+    }
+    assert all(np.isfinite(value) and value > 0 for value in metrics.values())
+    forward = sum(value for name, value in metrics.items() if name.startswith("forward_"))
+    expected = (
+        metrics["action_loss"]
+        + config.contact_loss_weight * metrics["contact_loss"]
+        + config.forward_loss_weight * forward
+    )
+    np.testing.assert_allclose(loss.mean(), expected, rtol=1e-5)
+
+    # No term reads an unavailable finger.
+    missing = dataclasses.replace(observation, tactile_valid=observation.tactile_valid.at[:, :, 1].set(False))
+    changed = dataclasses.replace(
+        missing,
+        tactile_depth=missing.tactile_depth.at[:, :, 1].add(3.0),
+        tactile_wrench=missing.tactile_wrench.at[:, :, 6:].add(3.0),
+    )
+    jax.tree.map(np.testing.assert_array_equal, losses(changed), losses(missing))
