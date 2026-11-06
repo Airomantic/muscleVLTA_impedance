@@ -637,6 +637,11 @@ pi05_ar3_lift_reactive = pi0_config.Pi0Config(
     wrench_dim=ar3_lift_policy.force_dim(ar3_lift_policy.FORCE_KEYS_WRENCH_TAU_M),
 )
 
+# muscleVLTA: the LIFT preset whose reactive expert also reads 1 s of force history and the Tac G2 hand stream
+# (finger indentation maps, finger wrenches, gripper opening), with the training-only contact and forward-model
+# supervision of the sensor encoders. Needs the tactile cache (scripts/build_ar3_tactile_cache.py).
+pi05_ar3_muscle_vlta = dataclasses.replace(pi05_ar3_lift_reactive, sensor_history=10, tactile_in_use=True)
+
 
 def _ar3_lift_train_config(
     name: str, model: pi0_config.Pi0Config, force_keys: tuple[str, ...] = ar3_lift_policy.FORCE_KEYS_WRENCH_TAU_M
@@ -943,6 +948,8 @@ _CONFIGS = [
     # Vision-only pi05 (LIFT's offline stage); its params can initialize the reactive presets via
     # OPENPI_AR3_WEIGHT_PATH, like the Book preset initializes from an offline checkpoint.
     _ar3_lift_train_config("pi05_ar3_lift", dataclasses.replace(pi05_ar3_lift_reactive, reactive_in_use=False)),
+    # scripts/train_ar3_muscle_vlta.sh (plug insertion dataset by default).
+    _ar3_lift_train_config("pi05_ar3_muscle_vlta", pi05_ar3_muscle_vlta),
     # DAgger post-training of the presets above (scripts/train_ar3_lift_dagger_gpu012.sh). Serve the resulting
     # checkpoints with the matching offline preset name (same model; normalization statistics in the checkpoint).
     _ar3_lift_dagger_train_config("pi05_ar3_lift_reactive_dagger", pi05_ar3_lift_reactive),

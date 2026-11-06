@@ -155,6 +155,32 @@ def test_ar3_dagger_launcher_continues_offline_checkpoint(launcher_env, tmp_path
     assert "not a LeRobot v3.0 recording" in result.stderr
 
 
+def test_muscle_vlta_launcher_builds_the_tactile_cache_before_training(launcher_env, tmp_path):
+    dataset = tmp_path / "plug_in"
+    (dataset / "meta").mkdir(parents=True)
+    (dataset / "meta" / "info.json").write_text("{}")
+    (tmp_path / "home" / "big_vision").mkdir(parents=True)
+    (tmp_path / "home" / "big_vision" / "paligemma_tokenizer.model").write_text("")
+    launcher_env.update(
+        {
+            "OPENPI_AR3_REPO_ID": str(dataset),
+            "OPENPI_AR3_WEIGHT_PATH": launcher_env["OPENPI_INIT_CHECKPOINT"],
+            "OPENPI_DATA_HOME": str(tmp_path / "home"),
+            "OPENPI_CHECKPOINT_BASE_DIR": str(tmp_path / "checkpoints"),
+            "OPENPI_CUDA_VISIBLE_DEVICES": "4,5,6,7",
+        }
+    )
+    result = run_launcher("train_ar3_muscle_vlta.sh", launcher_env)
+    assert result.returncode == 0, result.stderr
+    cache, norm_stats, train = (shlex.split(line[2:]) for line in result.stdout.splitlines() if line.startswith("+ "))
+    assert cache[1:] == ["scripts/build_ar3_tactile_cache.py", "--dataset", str(dataset), "--workers", "16"]
+    assert norm_stats[-2:] == ["--config-name", "pi05_ar3_muscle_vlta"]
+    assert train[2] == "pi05_ar3_muscle_vlta"
+    assert train[train.index("--exp-name") + 1].startswith("muscle_vlta_")
+    assert train[train.index("--fsdp-devices") + 1] == "4"
+    assert not (dataset / "tactile_cache").exists()
+
+
 def test_vscode_configurations_pass_arguments_the_launcher_and_scripts_accept(tmp_path, monkeypatch):
     root = SCRIPTS_DIR.parent
     text = (root / ".vscode" / "launch.json").read_text()
