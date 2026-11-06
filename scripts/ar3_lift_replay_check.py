@@ -10,6 +10,12 @@ readings of frames t..t+i with ``reactive_step`` (LIFT Algorithm 1). The predict
 absolute targets and compared with the recorded command targets. With ``--check-causality`` the step-wise actions are
 compared with one call that sees the whole recorded force sequence: reactive action r only attends to force rows
 <= r - cross_attention_latency, so both must agree (up to numerical noise) for k <= latency + 1.
+
+muscleVLTA servers (metadata ``sensor_history`` / ``tactile_in_use``) get every per-step reading key, built from the
+dataset exactly as for training (``AR3LiftRepack``): the history rows of the frames before the chunk start and the
+Tac G2 hand stream of the dataset's tactile cache (scripts/build_ar3_tactile_cache.py), e.g.
+
+    .venv/bin/python scripts/ar3_lift_replay_check.py --dataset /data/jiang/ar3_eef_forceVisuoTactaile_plugIn
 """
 
 import dataclasses
@@ -52,6 +58,11 @@ def _force_keys(wrench_dim: int) -> tuple[str, ...]:
     raise ValueError(f"No AR3 force layout with wrench_dim={wrench_dim}")
 
 
+def _rows(readings: dict[str, np.ndarray], count: int) -> dict[str, np.ndarray]:
+    """The first ``count`` rows of every per-step reading key (what the robot client has measured so far)."""
+    return {key: value[:count] for key, value in readings.items()}
+
+
 def _errors(predicted: np.ndarray, recorded: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Position [mm], rotation [deg] and gripper errors between absolute [H, 7] targets."""
     position = 1000 * np.linalg.norm(predicted[:, :3] - recorded[:, :3], axis=-1)
@@ -67,20 +78,31 @@ def main(args: Args) -> None:
     horizon = int(metadata.get("action_horizon", 10))
     reactive = bool(metadata.get("reactive", False))
     force_keys = _force_keys(int(metadata.get("wrench_dim", 13))) if reactive else ()
+    # muscleVLTA: readings of the steps before the chunk, and the Tac G2 hand stream.
+    history = int(metadata.get("sensor_history", 0)) if reactive else 0
+    tactile = reactive and bool(metadata.get("tactile_in_use", False))
     logging.info("Server metadata: %s", metadata)
     if args.mode == "reactive" and not reactive:
         raise ValueError("The served model is not force-reactive; use --mode infer.")
     if args.mode == "reactive" and args.k > int(metadata.get("cross_attention_latency", 0)) + 1:
         logging.warning("k=%d exceeds latency + 1: the last actions of each call use padded force rows.", args.k)
 
+    # The sensor keys, history window and tactile cache of the training data (config._ar3_lift_train_config).
+    sensor_keys = (*force_keys, *(ar3.HAND_KEYS if tactile else ()))
     dataset = lerobot_v3.LeRobotV3Dataset(
         pathlib.Path(args.dataset),
-        sequence_keys=(ar3.ACTIONS_KEY, *force_keys),
+        sequence_keys=(ar3.ACTIONS_KEY, *sensor_keys),
         sequence_length=horizon,
+        history_keys=sensor_keys if history else (),
+        history_length=history,
         options=lerobot_v3.LeRobotV3Options(
-            video_keys=(ar3.WRIST_IMAGE_KEY, ar3.FRONT_IMAGE_KEY), require_valid=False, episodes=(args.episode,)
+            video_keys=(ar3.WRIST_IMAGE_KEY, ar3.FRONT_IMAGE_KEY),
+            require_valid=False,
+            episodes=(args.episode,),
+            tactile_cache="auto" if tactile else None,
         ),
     )
+    repack = ar3.AR3LiftRepack(force_keys=force_keys, history_length=history, tactile=tactile)
 
     all_errors = []
     for chunk in range(args.num_chunks):
@@ -88,8 +110,10 @@ def main(args: Args) -> None:
         if frame >= len(dataset):
             break
         item = dataset[frame]
-        state = np.concatenate([np.asarray(item[key], np.float32).reshape(-1) for key in ar3.STATE_KEYS])
-        force = ar3.concat_force([item[key] for key in force_keys]) if force_keys else None
+        inputs = repack(item)
+        state = inputs["observation/state"]
+        # [history + horizon, ...] per key: history rows, then the readings of the chunk's steps.
+        readings = {key: inputs[key] for key in ar3.READING_KEYS if key in inputs}
         images = {key: np.asarray(item[key]) for key in (ar3.WRIST_IMAGE_KEY, ar3.FRONT_IMAGE_KEY)}
         if args.resize:
             images = {
@@ -101,15 +125,15 @@ def main(args: Args) -> None:
             "observation/base_image": images[ar3.FRONT_IMAGE_KEY],
             "prompt": args.prompt or item["task"],
         }
-        if force is not None:
-            obs["wrench"] = force[:1]
+        if readings:
+            obs.update(_rows(readings, history + 1))
 
         timings = []
         if args.mode == "reactive":
             out = client.reactive_replan(obs, k=args.k)
             parts, timings = [out["actions"]], [out["policy_timing"]["infer_ms"]]
             while out["next_step"] < horizon:
-                out = client.reactive_step({"wrench": force[: out["next_step"] + 1]}, k=args.k)
+                out = client.reactive_step(_rows(readings, history + out["next_step"] + 1), k=args.k)
                 parts.append(out["actions"])
                 timings.append(out["policy_timing"]["infer_ms"])
             relative = np.concatenate(parts)
@@ -117,10 +141,16 @@ def main(args: Args) -> None:
             out = client.infer(obs)
             relative, timings = out["actions"], [out["policy_timing"]["infer_ms"]]
 
-        causality = ""
+        details = ""
         if args.mode == "reactive" and args.check_causality:
-            full = client.reactive_step({"wrench": force}, k=horizon, current_step=0)["actions"]
-            causality = f" | step-wise vs full-force max |diff| {np.max(np.abs(full - relative)):.2e}"
+            full = client.reactive_step(readings, k=horizon, current_step=0)["actions"]
+            details = f" | step-wise vs full-force max |diff| {np.max(np.abs(full - relative)):.2e}"
+        if tactile:
+            details += (
+                f" | Tac G2 peak {readings['tactile_depth'][history:].max():.2f}, "
+                f"fingers valid {100 * readings['tactile_valid'][history:].mean():.0f}%, "
+                f"gripper {readings['gripper_aperture'][history]:.0f}"
+            )
 
         predicted = ar3.relative_to_absolute_actions(relative, state)
         position, rotation, gripper = _errors(predicted, np.asarray(item[ar3.ACTIONS_KEY], np.float64))
@@ -137,7 +167,7 @@ def main(args: Args) -> None:
             position.max(),
             rotation.mean(),
             gripper.mean(),
-            causality,
+            details,
         )
 
     if all_errors:
