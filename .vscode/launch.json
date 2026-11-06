@@ -158,6 +158,79 @@
                 "INFER_ROS_DOMAIN_ID": "111"
             },
             "args": ["--check"]
+        },
+        {
+            "name": "muscleVLTA：插充电头真机推理（Tac G2，回起点并执行）",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/scripts/ar3_lift_debug_python.sh",
+            "program": "${workspaceFolder}/scripts/debug_ar3_lift_robot.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "subProcess": false,
+            "env": {
+                "INFER_ROS_DOMAIN_ID": "111",
+                "INFER_AR3_WS": "${workspaceFolder}/../ar3_CartesianImpedanceControl",
+                "OPENPI_PYTHON": "${workspaceFolder}/.venv/bin/python",
+                "OPENPI_SERVE_GPU": "0",
+                "OPENPI_CONFIG_NAME": "pi05_ar3_muscle_vlta"
+            },
+            "args": [
+                "--checkpoint", "${workspaceFolder}/infer_checkpoint/muscle_vlta_29999",
+                "--hardware", "auto", "--tactile",
+                "--", "--execute", "--move-to-start",
+                "--home-file", "${workspaceFolder}/../ar3_CartesianImpedanceControl/config/cartesian_home.json",
+                "--task=plug the two-pronged white charger on the table into the white socket, don't bump your fingers into other objects"
+            ]
+        },
+        {
+            "name": "muscleVLTA：检查（Tac G2，复用已启动硬件）",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/scripts/ar3_lift_debug_python.sh",
+            "program": "${workspaceFolder}/scripts/debug_ar3_lift_robot.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "subProcess": false,
+            "env": {
+                "INFER_ROS_DOMAIN_ID": "111",
+                "INFER_AR3_WS": "${workspaceFolder}/../ar3_CartesianImpedanceControl",
+                "OPENPI_PYTHON": "${workspaceFolder}/.venv/bin/python",
+                "OPENPI_SERVE_GPU": "0",
+                "OPENPI_CONFIG_NAME": "pi05_ar3_muscle_vlta"
+            },
+            "args": [
+                "--checkpoint", "${workspaceFolder}/infer_checkpoint/muscle_vlta_29999",
+                "--hardware", "skip",
+                "--", "--check",
+                "--task=plug the two-pronged white charger on the table into the white socket, don't bump your fingers into other objects"
+            ]
+        },
+        {
+            "name": "muscleVLTA：预览 3 块（Tac G2，不执行机械臂和夹爪动作）",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/scripts/ar3_lift_debug_python.sh",
+            "program": "${workspaceFolder}/scripts/debug_ar3_lift_robot.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "subProcess": false,
+            "env": {
+                "INFER_ROS_DOMAIN_ID": "111",
+                "INFER_AR3_WS": "${workspaceFolder}/../ar3_CartesianImpedanceControl",
+                "OPENPI_PYTHON": "${workspaceFolder}/.venv/bin/python",
+                "OPENPI_SERVE_GPU": "0",
+                "OPENPI_CONFIG_NAME": "pi05_ar3_muscle_vlta"
+            },
+            "args": [
+                "--checkpoint", "${workspaceFolder}/infer_checkpoint/muscle_vlta_29999",
+                "--hardware", "auto", "--tactile",
+                "--", "--max-chunks", "3",
+                "--task=plug the two-pronged white charger on the table into the white socket, don't bump your fingers into other objects"
+            ]
         }
     ],
     "inputs": [

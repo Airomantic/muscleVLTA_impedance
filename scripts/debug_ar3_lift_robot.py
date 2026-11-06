@@ -22,6 +22,9 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 LOGGER = logging.getLogger("ar3_lift_debug")
+# Tac G2 of muscleVLTA policies (./infer_oneclick.sh --tactile): the gripper host's sensor server and the local bridge.
+TACTILE_PORT = 50051
+TACTILE_NODE = "v3_gripper_tactile_recording"
 
 
 def model_environment() -> dict[str, str]:
@@ -52,8 +55,10 @@ def policy_healthy(host: str, port: int) -> bool:
         return False
 
 
-def hardware_start_options(nodes: set[str], *, gripper_ready: bool, skip_tilt: bool) -> list[str] | None:
-    """Start only missing devices, retaining each existing camera's owner."""
+def hardware_start_options(
+    nodes: set[str], *, gripper_ready: bool, skip_tilt: bool, tactile: bool = False, sensor_ready: bool = False
+) -> list[str] | None:
+    """Start only missing devices, retaining each existing camera's owner (with ``tactile`` also the Tac G2 parts)."""
     forbidden = ("teleop", "cartesian_retargeting", "rokae_driver", "controller_manager", "ar3_lift_robot_client")
     conflicts = sorted(node for node in nodes if any(name in node for name in forbidden))
     if conflicts:
@@ -62,7 +67,10 @@ def hardware_start_options(nodes: set[str], *, gripper_ready: bool, skip_tilt: b
     front = any(node.startswith("/front/") for node in nodes)
     wrist = any(node.startswith("/wrist/") for node in nodes)
     tilt = skip_tilt or any(node.rsplit("/", 1)[-1] == "camera_tilt_servo" for node in nodes)
-    if arm and front and wrist and tilt and gripper_ready:
+    bridge = not tactile or any(node.rsplit("/", 1)[-1] == TACTILE_NODE for node in nodes)
+    # Both remote services run (the sensor server only matters with tactile).
+    remote = gripper_ready and (sensor_ready or not tactile)
+    if arm and front and wrist and tilt and remote and bridge:
         return None
     options = ["--no-policy", "--no-ready-tab"]
     for present, flag in ((arm, "--no-arm"), (front and wrist, "--no-cameras"), (tilt, "--no-tilt")):
@@ -70,8 +78,10 @@ def hardware_start_options(nodes: set[str], *, gripper_ready: bool, skip_tilt: b
             options.append(flag)
     if front != wrist:
         options.append("--no-front-camera" if front else "--no-wrist-camera")
-    if gripper_ready:
+    if remote:
         options.append("--no-ssh")
+    if tactile:
+        options.append("--tactile")
     return options
 
 
@@ -101,10 +111,13 @@ def prepare_hardware(args: argparse.Namespace) -> None:
     launcher = ["bash", str(ROOT / "infer_oneclick.sh")]
     if args.hardware == "auto":
         nodes = discover_hardware_nodes()
+        gripper_host = os.environ.get("INFER_GRIPPER_HOST", "192.168.127.10")
         options = hardware_start_options(
             nodes,
-            gripper_ready=port_open(os.environ.get("INFER_GRIPPER_HOST", "192.168.127.10"), 50008),
+            gripper_ready=port_open(gripper_host, 50008),
             skip_tilt=args.skip_tilt,
+            tactile=args.tactile,
+            sensor_ready=args.tactile and port_open(gripper_host, TACTILE_PORT),
         )
         if options is not None:
             LOGGER.info("Starting missing devices: %s", shlex.join(launcher + options))
@@ -112,6 +125,8 @@ def prepare_hardware(args: argparse.Namespace) -> None:
     ready = [*launcher, "--ready-only", "--no-policy"]
     if args.skip_tilt:
         ready.append("--no-tilt")
+    if args.tactile:
+        ready.append("--tactile")
     if args.initialize_gripper:
         ready.append("--initialize-gripper")
     # --no-ready-tab above ensures there is exactly one owner of the readiness lock.
@@ -143,6 +158,11 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
     parser.add_argument("--port", type=int, default=int(os.environ.get("OPENPI_PORT", "8000")))
     parser.add_argument("--hardware", choices=("auto", "ready", "skip"), default="auto")
     parser.add_argument("--skip-tilt", action="store_true", help="do not start or verify the camera tilt servo")
+    parser.add_argument(
+        "--tactile",
+        action="store_true",
+        help="also start and check the Tac G2 fingers of muscleVLTA policies (./infer_oneclick.sh --tactile)",
+    )
     parser.add_argument("--initialize-gripper", action="store_true", help="explicitly allow finger calibration motion")
     parser.add_argument(
         "--reuse-policy", action="store_true", help="use an existing server; verify its checkpoint yourself"
@@ -156,6 +176,8 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
         parser.error("local policy startup requires localhost; use --reuse-policy for a remote service")
     if args.hardware == "skip" and args.initialize_gripper:
         parser.error("--initialize-gripper requires --hardware auto or ready")
+    if args.hardware == "skip" and args.tactile:
+        parser.error("--tactile requires --hardware auto or ready (with skip, run ./infer_oneclick.sh --tactile)")
     args.checkpoint = args.checkpoint.expanduser().resolve()
     client_args = ["--host", args.host, "--port", str(args.port)]
     if "INFER_GRIPPER_HOST" in os.environ:
@@ -177,8 +199,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.print_plan:
         print("Policy:", "reuse existing" if args.reuse_policy else shlex.join(serve))
         print(
-            f"Hardware: {args.hardware}; initialize gripper: {args.initialize_gripper}; ROS domain: "
-            f"{os.environ.get('ROS_DOMAIN_ID', '111')}"
+            f"Hardware: {args.hardware}; initialize gripper: {args.initialize_gripper}; Tac G2: {args.tactile}; "
+            f"ROS domain: {os.environ.get('ROS_DOMAIN_ID', '111')}"
         )
         print(
             "Client (same debugger process):",

@@ -113,7 +113,10 @@ GRIPPER_PREPARATION = (
 TACTILE_PREFIX = "/v3_gripper/tactile"
 # Freshness limit of the recordings (meta/ar3_capture.json max_tactile_age_s) and of the training tactile cache.
 MAX_TACTILE_AGE = 0.2
-TACTILE_PREPARATION = "start the Tac G2 bridge (lerobot: bash scripts/ar3_python.sh scripts/ar3_tactile_bridge.py)"
+TACTILE_PREPARATION = (
+    "run ./infer_oneclick.sh --tactile (Tac G2 sensor server and lerobot scripts/ar3_tactile_bridge.py; "
+    "VS Code: the muscleVLTA configurations pass --tactile)"
+)
 # Recording / DAgger.
 RECORD_FPS = 10  # frame rate of the training data
 HUMAN_FLAG, POLICY_FLAG = -1, 1  # control_flag of the recordings: teleoperated / policy-controlled frame

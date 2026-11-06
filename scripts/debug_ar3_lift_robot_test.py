@@ -72,6 +72,42 @@ def test_preparation_keeps_existing_devices_and_checks_every_required_sensor(mon
     assert not any("--initialize-gripper" in command for command in calls)
 
 
+def test_tactile_starts_only_missing_tac_g2_parts_and_checks_both_fingers(monkeypatch):
+    bridge = READY_NODES | {"/v3_gripper_tactile_recording"}
+    ready = {"gripper_ready": True, "skip_tilt": False, "tactile": True, "sensor_ready": True}
+    assert debug.hardware_start_options(bridge, **ready) is None
+    assert debug.hardware_start_options(READY_NODES, **ready) == [
+        "--no-policy",
+        "--no-ready-tab",
+        "--no-arm",
+        "--no-cameras",
+        "--no-tilt",
+        "--no-ssh",
+        "--tactile",
+    ]
+    # A running gripper service alone keeps the remote startup for the sensor server.
+    options = debug.hardware_start_options(bridge, **{**ready, "sensor_ready": False})
+    assert "--no-ssh" not in options
+    assert "--tactile" in options
+
+    calls = []
+
+    def run(command, **_kwargs):
+        calls.append(command)
+        return SimpleNamespace(stdout="\n".join(bridge))
+
+    ports = []
+    monkeypatch.setattr(debug.subprocess, "run", run)
+    monkeypatch.setattr(debug, "port_open", lambda host, port: ports.append(port) or True)
+    args, _ = debug.parse_args(["--tactile"])
+    debug.prepare_hardware(args)
+    assert ports == [50008, 50051]
+    assert len(calls) == 2
+    assert calls[1][2:] == ["--ready-only", "--no-policy", "--tactile"]
+    with pytest.raises(SystemExit):
+        debug.parse_args(["--hardware", "skip", "--tactile"])
+
+
 def test_check_configuration_does_not_prepare_hardware(monkeypatch):
     run = mock.Mock()
     monkeypatch.setattr(debug.subprocess, "run", run)
