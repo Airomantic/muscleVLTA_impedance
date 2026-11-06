@@ -340,6 +340,66 @@ scripts/ar3_lift_debug_python.sh scripts/debug_ar3_lift_robot.py --hardware skip
   --record-dir outputs/ar3_lift_dagger/round1 --home-file ../ar3_CartesianImpedanceControl/config/cartesian_home.json
 ```
 
+## ✋ muscleVLTA: AR3 + Tac G2 Visuotactile Insertion
+
+muscleVLTA (`pi05_ar3_muscle_vlta`) is the AR3 LIFT policy for plug insertion, where the plug's prongs and the socket
+holes leave both camera views once the plug is above the socket. Its reactive expert also reads 1 s of force history
+(`sensor_history=10` steps before each chunk) and the Tac G2 hand stream of both fingers
+([src/openpi/models/hand_encoder.py](src/openpi/models/hand_encoder.py)):
+
+| muscleVLTA input | AR3 dataset source (`/data/jiang/ar3_eef_forceVisuoTactaile_plugIn`) |
+| --- | --- |
+| finger indentation maps (2 × 48 × 64) and their change since the previous step | `tactile/episode-*/tactile_depth.sensor_{0,2}.parquet`, frame-aligned by `scripts/build_ar3_tactile_cache.py` |
+| finger wrenches (2 × 6D) | `observation.gripper_wrench.sensor_{0,2}` |
+| gripper opening (0 = closed … 1000 = open) | `observation.gripper_position` |
+| arm force (13D), images, state, actions | as in AR3 LIFT above |
+
+Finger contact is sparse: it appears only while an object is held. Each finger reading therefore passes a learned
+contact gate (without contact it collapses to a no-contact embedding; a missing finger uses a separate missing-sensor
+embedding), and a GRU fuses both fingers and the gripper opening over time. The arm and hand streams form the reactive
+expert's memory under LIFT's causal cross-attention mask, so an action only attends to readings at least
+`cross_attention_latency` steps older. Training drops the hand or single fingers (10% each) and adds training-only
+losses for the contact gates and for an action-conditioned forward model of the next arm and finger readings.
+
+**Train, serve and validate** (GPU server). The launcher builds the dataset's Tac G2 cache once, then runs
+`scripts/train_ar3_lift_gpu012.sh` with its options (GPUs 0–2 by default; the batch of 96 must divide by the GPU count):
+
+```bash
+OPENPI_EXP_NAME=muscle_vlta_30k OPENPI_NUM_TRAIN_STEPS=30000 bash scripts/train_ar3_muscle_vlta.sh
+# other GPUs: OPENPI_CUDA_VISIBLE_DEVICES=4,5,6,7; continue a run: OPENPI_RESUME=1 with the same OPENPI_EXP_NAME
+PLUG_IN="plug the two-pronged white charger on the table into the white socket, don't bump your fingers into other objects"
+OPENPI_CONFIG_NAME=pi05_ar3_muscle_vlta OPENPI_PROMPT="$PLUG_IN" \
+  bash scripts/serve_ar3_lift.sh /data/jiang/train_checkpoints/pi05_ar3_muscle_vlta/muscle_vlta_30k/29999
+.venv/bin/python scripts/ar3_lift_replay_check.py --port 8000 --dataset /data/jiang/ar3_eef_forceVisuoTactaile_plugIn \
+  --episode 0 --num-chunks 5 --start-frame 180   # frames with the plug held; prints the Tac G2 peaks per chunk
+```
+
+**Run on the robot PC.** The client reads the sensor layout from the server metadata and needs no extra flag; the
+policy prompt must be the insertion task (the defaults are the unplugging task). `--tactile` starts the Tac G2 pipeline
+of the recordings (the lerobot `oneClick.sh`): the sensor server on the gripper host
+(`~/dmrobotics_Flux_pkg_V1.2.13.1/dmrobotics_Flux_pkg/sensor_server/grpc_server.py`, ports 50051/50052) before the
+gripper service, then the local `scripts/ar3_tactile_bridge.py --preview` of the lerobot project
+(`INFER_LEROBOT_DIR`, default `../lerobot_89236e_muscleVLTA_eef`, with its `.venv-ar3`), and waits for the depth and
+wrench of both fingers:
+
+```bash
+./infer_oneclick.sh --tactile
+PLUG_IN="plug the two-pronged white charger on the table into the white socket, don't bump your fingers into other objects"
+scripts/run_ar3_lift_robot.sh --check --prompt "$PLUG_IN"
+scripts/run_ar3_lift_robot.sh --max-chunks 3 --prompt "$PLUG_IN"                 # dry run
+scripts/run_ar3_lift_robot.sh --execute --move-to-start --prompt "$PLUG_IN"      # MOVES the arm and gripper
+```
+
+A missing finger reading at start-up stops the client; later dropouts are logged and the policy continues with the
+missing-sensor embedding it was trained with. `--record-dir` and `--dagger` do not record the Tac G2 streams yet: their
+episodes would train muscleVLTA with the fingers missing.
+
+**VS Code**：先把检查点步目录复制到 `infer_checkpoint/muscle_vlta_29999`（含 `params/` 与 `assets/`），
+再选择 `muscleVLTA：插充电头真机推理（Tac G2，回起点并执行）`、`muscleVLTA：预览 3 块（Tac G2，不执行机械臂和夹爪动作）`
+或 `muscleVLTA：检查（Tac G2，复用已启动硬件）`。前两项在 `--` 之前带 `--tactile`，启动器只补启缺少的
+传感服务和触觉桥，并检查两指的深度图与六维力；检查项使用 `--hardware skip`，需先运行 `./infer_oneclick.sh --tactile`。
+三项均设置 `OPENPI_CONFIG_NAME=pi05_ar3_muscle_vlta`，并在 `--` 之后用 `--task=` 指定插入任务提示词。
+
 ## 🙏 Acknowledgements
 
 LIFT is built on [OpenPI (π₀/π₀.₅)](https://github.com/Physical-Intelligence/openpi).
