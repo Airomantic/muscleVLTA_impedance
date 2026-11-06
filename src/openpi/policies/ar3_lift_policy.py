@@ -14,6 +14,19 @@ inference the robot client sends the same keys:
   they are padded to the horizon by repeating the newest reading (see ``pad_force_sequence``).
 * ``prompt``: task string.
 
+muscleVLTA policies (``Pi0Config.sensor_history`` L > 0 and/or ``tactile_in_use``) read every per-step sensor key
+(``READING_KEYS``) with L extra leading rows: the readings of the L control steps before the chunk start, then the
+readings measured since the chunk start (L + 1 <= T <= L + horizon rows, all keys with the same T):
+
+* ``wrench``: as above.
+* ``sensor_valid``: [T] bool, False for history rows without a reading (before the episode start or after a gap);
+  default all True.
+* ``tactile_depth``: [T, 2, 48, 64] Tac G2 indentation maps of sensor_0 / sensor_2, area-pooled with
+  ``openpi_client.tactile.pool_depth`` (float16 is fine).
+* ``tactile_valid``: [T, 2] bool, False where a finger has no fresh map (zero map).
+* ``tactile_wrench``: [T, 12] Tac G2 finger wrenches (Fx Fy Fz Mx My Mz of sensor_0, then sensor_2).
+* ``gripper_aperture``: [T] gripper opening in SDK units (0 = closed ... 1000 = open).
+
 As in LIFT (``IPhoneZeroStateAndRealRelativeActions``), the policy outputs [action_horizon, 7] actions relative to
 the observed TCP pose: xyz [m] + xyz Euler angles [rad] of ``inv(T_state) @ T_target``, followed by the absolute
 gripper target (0..1000). ``relative_to_absolute_actions`` recovers absolute targets for the controller.
@@ -34,6 +47,9 @@ TCP_POSE_KEY = "observation.tcp_pose"
 GRIPPER_POSITION_KEY = "observation.gripper_position"
 TCP_WRENCH_KEY = "observation.tcp_wrench"
 TAU_M_KEY = "observation.tau_m"
+GRIPPER_WRENCH_KEYS = ("observation.gripper_wrench.sensor_0", "observation.gripper_wrench.sensor_2")
+TACTILE_DEPTH_KEY = "observation.tactile_depth"
+TACTILE_VALID_KEY = "observation.tactile_valid"
 WRIST_IMAGE_KEY = "observation.images.wrist"
 FRONT_IMAGE_KEY = "observation.images.front"
 ACTIONS_KEY = "actions"
@@ -43,6 +59,14 @@ STATE_KEYS = (TCP_POSE_KEY, GRIPPER_POSITION_KEY)
 FORCE_KEYS_WRENCH = (TCP_WRENCH_KEY,)
 FORCE_KEYS_WRENCH_TAU_M = (TCP_WRENCH_KEY, TAU_M_KEY)
 FORCE_KEY_DIMS = {TCP_WRENCH_KEY: 6, TAU_M_KEY: 7}
+# Hand stream of the muscleVLTA tactile policies: the two finger wrenches and the gripper opening.
+HAND_KEYS = (*GRIPPER_WRENCH_KEYS, GRIPPER_POSITION_KEY)
+TACTILE_WRENCH_DIM = 6 * len(GRIPPER_WRENCH_KEYS)
+# Model input = indentation map / scale (Tac G2 map peaks reach ~0.55 on the plug-insertion data).
+TACTILE_DEPTH_SCALE = 0.25
+# Per-step sensor keys of the client protocol (module docstring), padded together at inference.
+READING_KEYS = ("wrench", "sensor_valid", "tactile_depth", "tactile_valid", "tactile_wrench", "gripper_aperture")
+TACTILE_READING_KEYS = ("tactile_depth", "tactile_valid", "tactile_wrench", "gripper_aperture")
 
 ACTION_NAMES = ("x", "y", "z", "rx", "ry", "rz", "gripper")
 GRIPPER_CLOSED = 0.0
@@ -61,17 +85,28 @@ def concat_force(parts: Sequence[np.ndarray]) -> np.ndarray:
     return np.concatenate(arrays, axis=-1)
 
 
-def make_ar3_lift_example(*, action_horizon: int = 10, wrench_dim: int = 13) -> dict:
-    """Random robot-client observation in the format expected by the AR3 LIFT policies."""
-    return {
+def make_ar3_lift_example(
+    *, action_horizon: int = 10, wrench_dim: int = 13, history_length: int = 0, tactile: bool = False
+) -> dict:
+    """Random robot-client observation in the format expected by the AR3 LIFT (and muscleVLTA) policies."""
+    rows = history_length + action_horizon
+    example = {
         "observation/state": np.concatenate(
             [np.random.uniform(-0.5, 0.5, size=6), np.random.uniform(GRIPPER_CLOSED, GRIPPER_OPEN, size=1)]
         ).astype(np.float32),
         "observation/left_wrist_image": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8),
         "observation/base_image": np.random.randint(256, size=(480, 640, 3), dtype=np.uint8),
-        "wrench": np.random.randn(action_horizon, wrench_dim).astype(np.float32),
+        "wrench": np.random.randn(rows, wrench_dim).astype(np.float32),
         "prompt": "do something",
     }
+    if history_length:
+        example["sensor_valid"] = np.arange(rows) >= history_length // 2
+    if tactile:
+        example["tactile_depth"] = np.random.uniform(0.0, 0.3, size=(rows, 2, 48, 64)).astype(np.float16)
+        example["tactile_valid"] = np.ones((rows, 2), dtype=bool)
+        example["tactile_wrench"] = np.random.randn(rows, TACTILE_WRENCH_DIM).astype(np.float32)
+        example["gripper_aperture"] = np.random.uniform(GRIPPER_CLOSED, GRIPPER_OPEN, size=rows).astype(np.float32)
+    return example
 
 
 def _parse_image(image) -> np.ndarray:
@@ -85,13 +120,19 @@ def _parse_image(image) -> np.ndarray:
 
 @dataclasses.dataclass(frozen=True)
 class AR3LiftRepack(transforms.DataTransformFn):
-    """Training only: maps raw LeRobot v3.0 AR3 items to the LIFT client keys listed in the module docstring."""
+    """Training only: maps raw LeRobot v3.0 AR3 items to the LIFT client keys listed in the module docstring.
+
+    With ``history_length`` L, the force (and hand) keys are dataset history keys holding the L frames before the
+    current one first (``LeRobotV3Dataset``); ``tactile`` reads the tactile cache and the hand keys.
+    """
 
     force_keys: tuple[str, ...] = FORCE_KEYS_WRENCH_TAU_M
     use_front_camera: bool = True
+    history_length: int = 0
+    tactile: bool = False
 
     def __call__(self, data: dict) -> dict:
-        state = np.concatenate([np.asarray(data[key], dtype=np.float32).reshape(-1) for key in STATE_KEYS])
+        state = np.concatenate([self._current_frame(data, key) for key in STATE_KEYS])
         inputs = {
             "observation/state": state,
             "observation/left_wrist_image": data[WRIST_IMAGE_KEY],
@@ -101,40 +142,96 @@ class AR3LiftRepack(transforms.DataTransformFn):
             inputs["observation/base_image"] = data[FRONT_IMAGE_KEY]
         if self.force_keys:
             inputs["wrench"] = concat_force([data[key] for key in self.force_keys])
+            if self.history_length:
+                # History rows before the episode start have no reading; rows clamped at the episode end repeat
+                # the last reading and stay valid (LIFT).
+                valid = np.ones(len(inputs["wrench"]), dtype=bool)
+                pad = np.asarray(data[f"{self.force_keys[0]}_is_pad"], dtype=bool)
+                valid[: self.history_length] = ~pad[: self.history_length]
+                inputs["sensor_valid"] = valid
+        if self.tactile:
+            inputs.update(self._hand(data))
         prompt = data.get("prompt", data.get("task"))
         if prompt is not None:
             inputs["prompt"] = prompt
         return inputs
 
+    def _current_frame(self, data: dict, key: str) -> np.ndarray:
+        value = np.asarray(data[key], dtype=np.float32)
+        if f"{key}_is_pad" in data:  # A sequence key: [history frames..., current frame, next frames...].
+            value = value[len(value) - len(data[ACTIONS_KEY])]
+        return value.reshape(-1)
 
-def pad_force_sequence(wrench: np.ndarray, action_horizon: int) -> np.ndarray:
-    """Pads the force readings measured so far ([T, d] or [d], T <= action_horizon) to [action_horizon, d].
+    def _hand(self, data: dict) -> dict:
+        depth = np.asarray(data[TACTILE_DEPTH_KEY])
+        valid = np.asarray(data[TACTILE_VALID_KEY], dtype=bool)
+        if all(key in data for key in GRIPPER_WRENCH_KEYS):
+            finger_wrench = concat_force([data[key] for key in GRIPPER_WRENCH_KEYS])
+        else:
+            # Recordings without the Tac G2 wrenches (e.g. LIFT DAgger rounds): the fingers are unknown.
+            finger_wrench = np.zeros((len(depth), TACTILE_WRENCH_DIM), dtype=np.float32)
+            valid = np.zeros_like(valid)
+        aperture = np.asarray(data[GRIPPER_POSITION_KEY], dtype=np.float32).reshape(-1)
+        if not len(depth) == len(valid) == len(finger_wrench) == len(aperture):
+            raise ValueError(
+                f"Tactile rows {len(depth)}, finger wrench rows {len(finger_wrench)} and gripper rows "
+                f"{len(aperture)} differ: {GRIPPER_POSITION_KEY} and {GRIPPER_WRENCH_KEYS} must be history keys."
+            )
+        return {
+            "tactile_depth": depth,
+            "tactile_valid": valid,
+            "tactile_wrench": finger_wrench,
+            "gripper_aperture": aperture,
+        }
 
-    Missing future rows repeat the newest reading. Reactive action r only attends to force rows
-    <= r - cross_attention_latency (through a causal GRU), so the padding never changes actions whose inputs were
-    measured; it only fills the shape the model was trained with.
+
+def pad_readings(values: np.ndarray, action_horizon: int, *, history_length: int = 0) -> np.ndarray:
+    """Pads per-step readings [T, ...] (``history_length`` history rows, then the readings measured since the chunk
+    start) to [history_length + action_horizon, ...] by repeating the newest reading.
+
+    Reactive action r only attends to readings of steps <= r - cross_attention_latency (through causal GRUs), so the
+    padding never changes actions whose inputs were measured; it only fills the shape the model was trained with.
+    """
+    values = np.asarray(values)
+    length = history_length + action_horizon
+    if values.ndim < 1 or not history_length < values.shape[0] <= length:
+        raise ValueError(
+            f"Expected {history_length} history readings followed by 1..{action_horizon} readings of the chunk "
+            f"([T, ...] with {history_length + 1} <= T <= {length}), got {values.shape}."
+        )
+    if values.shape[0] < length:
+        values = np.concatenate([values, np.repeat(values[-1:], length - values.shape[0], axis=0)])
+    return values
+
+
+def pad_force_sequence(wrench: np.ndarray, action_horizon: int, *, history_length: int = 0) -> np.ndarray:
+    """Pads the force readings ([T, d], or [d] without history) to [history_length + action_horizon, d].
+
+    See ``pad_readings``.
     """
     wrench = np.asarray(wrench, dtype=np.float32)
-    if wrench.ndim == 1:
+    if wrench.ndim == 1 and not history_length:
         wrench = wrench[None]
-    if wrench.ndim != 2 or not 1 <= wrench.shape[0] <= action_horizon:
-        raise ValueError(f"Expected 1..{action_horizon} force readings of shape [T, d], got {wrench.shape}.")
-    if wrench.shape[0] < action_horizon:
-        wrench = np.concatenate([wrench, np.repeat(wrench[-1:], action_horizon - wrench.shape[0], axis=0)])
-    return wrench
+    if wrench.ndim != 2:
+        raise ValueError(f"Expected force readings of shape [T, d], got {wrench.shape}.")
+    return pad_readings(wrench, action_horizon, history_length=history_length)
 
 
 @dataclasses.dataclass(frozen=True)
 class AR3LiftInputs(transforms.DataTransformFn):
     """Converts LIFT client keys to model inputs (training and inference): wrist -> left wrist, front -> base.
 
-    With ``action_horizon`` set, a ``wrench`` holding only the readings measured so far in the chunk is padded to the
-    action horizon (``pad_force_sequence``); training samples already carry the full sequence.
+    With ``action_horizon`` set, per-step readings holding only the readings measured so far in the chunk are padded
+    to the action horizon (``pad_readings``); training samples already carry the full sequences. ``history_length``
+    and ``tactile`` select the muscleVLTA sensor keys (module docstring); the tactile maps are scaled by
+    ``TACTILE_DEPTH_SCALE`` and the gripper opening to [0, 1].
     """
 
     model_type: _model.ModelType
     use_front_camera: bool = True
     action_horizon: int | None = None
+    history_length: int = 0
+    tactile: bool = False
 
     def __call__(self, data: dict) -> dict:
         wrist_image = _parse_image(data["observation/left_wrist_image"])
@@ -162,8 +259,33 @@ class AR3LiftInputs(transforms.DataTransformFn):
             if key in data:
                 inputs[key] = data[key]
         if "wrench" in inputs and self.action_horizon is not None:
-            inputs["wrench"] = pad_force_sequence(inputs["wrench"], self.action_horizon)
+            inputs["wrench"] = pad_force_sequence(
+                inputs["wrench"], self.action_horizon, history_length=self.history_length
+            )
+        if "wrench" in inputs and (self.history_length or self.tactile):
+            wrench = np.asarray(data["wrench"])
+            inputs.update(self._readings(data, 1 if wrench.ndim == 1 else len(wrench)))
         return inputs
+
+    def _readings(self, data: dict, rows: int) -> dict:
+        keys = ("sensor_valid", *TACTILE_READING_KEYS) if self.tactile else ("sensor_valid",)
+        if self.tactile and (missing := [key for key in TACTILE_READING_KEYS if key not in data]):
+            raise KeyError(f"This AR3 policy was trained with the Tac G2 gripper: send {missing}.")
+        readings = {key: np.asarray(data[key]) for key in keys if key in data}
+        readings.setdefault("sensor_valid", np.ones(rows, dtype=bool))
+        for key, value in readings.items():
+            if len(value) != rows:
+                raise ValueError(f"'{key}' has {len(value)} rows but 'wrench' has {rows}.")
+            if self.action_horizon is not None:
+                readings[key] = pad_readings(value, self.action_horizon, history_length=self.history_length)
+        readings["sensor_valid"] = readings["sensor_valid"].astype(bool).reshape(-1)
+        if self.tactile:
+            readings["tactile_depth"] = readings["tactile_depth"].astype(np.float32) / TACTILE_DEPTH_SCALE
+            readings["tactile_valid"] = readings["tactile_valid"].astype(bool)
+            readings["tactile_wrench"] = readings["tactile_wrench"].astype(np.float32)
+            aperture = readings["gripper_aperture"].astype(np.float32).reshape(-1, 1) / GRIPPER_OPEN
+            readings["gripper_aperture"] = aperture
+        return readings
 
 
 @dataclasses.dataclass(frozen=True)

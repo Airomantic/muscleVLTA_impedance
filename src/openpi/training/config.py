@@ -152,6 +152,9 @@ class DataConfig:
     history_keys: Sequence[str] = ()
     history_length: int = 0
     tactile_cache: str | None = None
+    # Keys that need normalization stats: training fails if the loaded stats lack one (stats computed before the key
+    # was added to scripts/compute_norm_stats.py would leave it unnormalized).
+    required_norm_stats: Sequence[str] = ()
 
 
 class GroupFactory(Protocol):
@@ -330,6 +333,9 @@ class LeRobotAR3LiftDataConfig(DataConfigFactory):
     # Force signals concatenated per step; their total width must equal Pi0Config.wrench_dim.
     force_keys: tuple[str, ...] = ar3_lift_policy.FORCE_KEYS_WRENCH_TAU_M
     use_wrench: bool = False
+    # Tac G2 indentation map cache of the datasets of tactile models (Pi0Config.tactile_in_use): a directory, or
+    # "auto" for <dataset>/tactile_cache/depth_48x64 (built by scripts/build_ar3_tactile_cache.py).
+    tactile_cache: str = "auto"
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig, *args, **kwargs) -> DataConfig:
@@ -346,9 +352,23 @@ class LeRobotAR3LiftDataConfig(DataConfigFactory):
                     f"force_keys {force_keys} give {ar3_lift_policy.force_dim(force_keys)}D force, "
                     f"but the model expects wrench_dim={wrench_dim}."
                 )
+        # muscleVLTA: the force (and hand) readings of the sensor_history steps before the chunk start, and the Tac G2
+        # hand stream (finger wrenches, indentation maps, gripper opening).
+        history_length = getattr(model_config, "sensor_history", 0)
+        tactile = getattr(model_config, "tactile_in_use", False)
+        if (history_length or tactile) and not force_keys:
+            raise ValueError("sensor_history and tactile_in_use need the force sequence (reactive_in_use).")
+        sensor_keys = (*force_keys, *(ar3_lift_policy.HAND_KEYS if tactile else ()))
 
         repack_transform = _transforms.Group(
-            inputs=[ar3_lift_policy.AR3LiftRepack(force_keys=force_keys, use_front_camera=self.use_front_camera)]
+            inputs=[
+                ar3_lift_policy.AR3LiftRepack(
+                    force_keys=force_keys,
+                    use_front_camera=self.use_front_camera,
+                    history_length=history_length,
+                    tactile=tactile,
+                )
+            ]
         )
         data_transforms = _transforms.Group(
             inputs=[
@@ -356,6 +376,8 @@ class LeRobotAR3LiftDataConfig(DataConfigFactory):
                     model_type=model_config.model_type,
                     use_front_camera=self.use_front_camera,
                     action_horizon=model_config.action_horizon,
+                    history_length=history_length,
+                    tactile=tactile,
                 )
             ],
             outputs=[ar3_lift_policy.AR3LiftOutputs()],
@@ -368,7 +390,11 @@ class LeRobotAR3LiftDataConfig(DataConfigFactory):
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             action_names=ar3_lift_policy.ACTION_NAMES,
-            action_sequence_keys=("actions", *force_keys),
+            action_sequence_keys=("actions", *sensor_keys),
+            history_keys=sensor_keys if history_length else (),
+            history_length=history_length,
+            tactile_cache=self.tactile_cache if tactile else None,
+            required_norm_stats=("tactile_wrench",) if tactile else (),
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=ModelTransformFactory()(model_config),

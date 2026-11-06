@@ -9,6 +9,7 @@ import pytest
 
 from openpi.data import lerobot_v3
 from openpi.data import tactile_cache
+from openpi.policies import ar3_lift_policy as ar3
 from openpi.training import config as _config
 from openpi.training import data_loader
 from scripts import ar3_lift_recorder as recorder_lib
@@ -126,6 +127,29 @@ def test_dataset_items_hold_sensor_history_and_tactile_maps(tmp_path):
         np.testing.assert_array_equal(item[lerobot_v3.TACTILE_PAD_KEY], np.asarray(pad, bool))
     assert dataset[1][lerobot_v3.TACTILE_VALID_KEY][:, 0].tolist() == [True] * 3 + [True, True, False, True]
     assert pickle.loads(pickle.dumps(dataset))[1].keys() == dataset[1].keys()
+
+
+def test_ar3_repack_reads_dataset_history_items(tmp_path):
+    root = tmp_path / "plug_in"
+    _write_dataset(root)
+    sensor_keys = (*ar3.FORCE_KEYS_WRENCH_TAU_M, *ar3.HAND_KEYS)
+    data_config = _config.DataConfig(
+        repo_id=str(root),
+        action_sequence_keys=("actions", *sensor_keys),
+        history_keys=sensor_keys,
+        history_length=3,
+        tactile_cache=str(tactile_cache.build_cache(root, shape=SHAPE, max_age_s=MAX_AGE, workers=1)),
+    )
+    dataset = data_loader.create_torch_dataset(data_config, 4, None, decode_videos=False)
+    inputs = ar3.AR3LiftRepack(history_length=3, tactile=True)(dataset[1])
+    # Frame 1 of episode 0: the state is the current frame, the history is clamped to the episode start.
+    np.testing.assert_array_equal(inputs["observation/state"], np.ones(7))
+    np.testing.assert_array_equal(inputs["wrench"][:, 0], [0, 0, 0, 1, 2, 3, 4])
+    np.testing.assert_array_equal(inputs["sensor_valid"], [False, False] + [True] * 5)
+    np.testing.assert_array_equal(inputs["gripper_aperture"], [0, 0, 0, 1, 2, 3, 4])
+    # The recorder stores no Tac G2 wrenches, so both fingers count as unknown.
+    assert inputs["tactile_depth"].shape == (7, 2, *SHAPE)
+    assert not inputs["tactile_valid"].any()
 
 
 def test_align_causal_matches_samples_at_or_before_each_target():
