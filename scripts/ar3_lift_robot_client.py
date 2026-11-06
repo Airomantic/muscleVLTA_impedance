@@ -24,6 +24,13 @@ Each action chunk follows the recording / training layout (10 Hz, action horizon
    60 mm / 0.05 rad, 40 mm/s, 0.15 rad/s, tracking stop 80 mm / 0.15 rad, session stiffness, zero desired wrench).
    The gripper target goes through gRPC (speed 80, force level 20 of 20..100: the recording teleoperation's).
 
+muscleVLTA policies (server metadata ``sensor_history`` > 0 and / or ``tactile_in_use``; trained with
+``scripts/train_ar3_muscle_vlta.sh``) read more per step, as recorded: the Tac G2 hand stream (both fingers' indentation
+maps, area-pooled with ``openpi_client.tactile``, and 6D wrenches from ``/v3_gripper/tactile/sensor_{0,2}/{depth,wrench}``
+of the lerobot ``scripts/ar3_tactile_bridge.py``; a finger without samples of the last 0.2 s is sent as missing) and the
+gripper opening. Every request starts with the readings of the ``sensor_history`` control steps before the chunk
+(``SensorHistory``; marked missing before the episode start).
+
 Safety: without ``--execute`` it is a dry run (targets only on ``preview_command``; no enable, no gripper writes). It
 never takes over a controller session it does not own, refuses to run next to another arm command source (the
 teleoperation, except with ``--dagger``), and stops on stale sensors, tracking-limit violations, controller faults,
@@ -102,6 +109,11 @@ GRIPPER_PREPARATION = (
     "Prepare the gripper first: ./infer_oneclick.sh --ready-only "
     "(add --initialize-gripper once after power-up; it moves the fingers)."
 )
+# Tac G2 fingers of muscleVLTA policies (lerobot scripts/ar3_tactile_bridge.py): <prefix>/<sensor>/{depth,wrench}.
+TACTILE_PREFIX = "/v3_gripper/tactile"
+# Freshness limit of the recordings (meta/ar3_capture.json max_tactile_age_s) and of the training tactile cache.
+MAX_TACTILE_AGE = 0.2
+TACTILE_PREPARATION = "start the Tac G2 bridge (lerobot: bash scripts/ar3_python.sh scripts/ar3_tactile_bridge.py)"
 # Recording / DAgger.
 RECORD_FPS = 10  # frame rate of the training data
 HUMAN_FLAG, POLICY_FLAG = -1, 1  # control_flag of the recordings: teleoperated / policy-controlled frame
@@ -285,6 +297,45 @@ def rgb_image(message: Any) -> np.ndarray:
     if message.encoding == "bgr8":
         image = image[..., ::-1]
     return image.copy(order="C")
+
+
+@functools.cache
+def tactile_io() -> Any:
+    """``openpi_client.tactile``: the map pooling shared with the training data (imported for tactile policies)."""
+    try:
+        from openpi_client import tactile
+    except ImportError as error:
+        raise RobotError(f"openpi_client.tactile is not importable ({error}): use {_CLIENT_SRC}") from error
+    return tactile
+
+
+def depth_map(message: Any) -> np.ndarray:
+    """Decodes a 32FC1 Tac G2 indentation map (``sensor_msgs/Image``) to float32 [H, W], as the AR3 recorder does."""
+    if message.encoding != "32FC1" or message.height <= 0 or message.width <= 0:
+        raise RobotError(f"Tac G2 depth must be a nonempty 32FC1 image, got {message.encoding!r}")
+    raw = message.data
+    data = memoryview(bytes(raw) if isinstance(raw, list) else raw).cast("B")
+    if message.step < message.width * 4 or message.step % 4 or data.nbytes != message.height * message.step:
+        raise RobotError("Tac G2 depth has an invalid row step or payload length")
+    dtype = np.dtype(">f4" if message.is_bigendian else "<f4")
+    values = np.frombuffer(data, dtype=dtype).reshape(message.height, message.step // 4)[:, : message.width]
+    values = values.astype(np.float32)
+    if not np.isfinite(values).all():
+        raise RobotError("Tac G2 depth contains non-finite values")
+    return values
+
+
+def finger_wrench(message: Any) -> np.ndarray:
+    """``geometry_msgs/WrenchStamped`` -> float32 [6] Fx Fy Fz Mx My Mz (SDK units, sensor frame), as recorded."""
+    force, torque = message.wrench.force, message.wrench.torque
+    values = np.asarray([force.x, force.y, force.z, torque.x, torque.y, torque.z], dtype=np.float32)
+    if not np.isfinite(values).all():
+        raise RobotError("Tac G2 wrench contains non-finite values")
+    return values
+
+
+def _describe(problems: dict[str, str]) -> str:
+    return ", ".join(f"{name}: {problem}" for name, problem in problems.items())
 
 
 # DM V3 gripper (gRPC). Field number/type pairs of G3_client/DM_V3Gripper/gripper.proto StateResponse.
@@ -563,6 +614,10 @@ class Ar3Robot:
         self._tau_m_at = -math.inf
         self._images: dict[str, tuple[Any, float]] = {}
         self._camera_topics = {"front": "/front/color/image_raw", "wrist": "/wrist/color/image_raw"}
+        # Tac G2 (muscleVLTA policies): newest message and its receipt time per (kind, sensor).
+        self._tactile: dict[tuple[str, str], tuple[Any, float]] = {}
+        self._tactile_topics: dict[tuple[str, str], str] = {}
+        self._finger_problems: dict[str, str] = {}
         self._size_warned: set[str] = set()
         self._status = ""
         self._metadata: dict | None = None
@@ -593,9 +648,17 @@ class Ar3Robot:
 
     # ROS wiring (rclpy is imported lazily so the logic is testable without ROS).
     def start(
-        self, *, front_topic: str, wrist_topic: str, controller_node: str, clutch_topic: str = "/clutch/right"
+        self,
+        *,
+        front_topic: str,
+        wrist_topic: str,
+        controller_node: str,
+        clutch_topic: str = "/clutch/right",
+        tactile: bool = False,
     ) -> None:
+        """Subscribes to the controller, the cameras and, with ``tactile``, the Tac G2 fingers."""
         try:
+            from geometry_msgs.msg import WrenchStamped
             from rcl_interfaces.srv import GetParameters
             import rclpy
             from rclpy.executors import SingleThreadedExecutor
@@ -617,6 +680,7 @@ class Ar3Robot:
                 f"ROS 2 is not importable ({error}): source /opt/ros/jazzy/setup.bash first "
                 "(scripts/run_ar3_lift_robot.sh does this)"
             ) from error
+        sensors = tactile_io().SENSORS if tactile else ()
 
         # Ctrl+C must reach the main thread (which stops the arm), not shut ROS down underneath it.
         rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
@@ -641,6 +705,13 @@ class Ar3Robot:
         self._camera_topics = {"front": front_topic, "wrist": wrist_topic}
         for name, topic in self._camera_topics.items():
             node.create_subscription(Image, topic, functools.partial(self._on_image, name), image_qos)
+        # The bridge publishes with the sensor-data QoS (as the recorder subscribed); maps are decoded on use.
+        for sensor in sensors:
+            for kind, message_type in (("depth", Image), ("wrench", WrenchStamped)):
+                topic = self._tactile_topics[kind, sensor] = f"{TACTILE_PREFIX}/{sensor}/{kind}"
+                node.create_subscription(
+                    message_type, topic, functools.partial(self._on_tactile, (kind, sensor)), qos_profile_sensor_data
+                )
         if self._streams:
             node.create_subscription(
                 Float64MultiArray, self.prefix + "/accepted_command", self._on_accepted, qos_profile_sensor_data
@@ -757,6 +828,11 @@ class Ar3Robot:
             if self._streams:
                 index = self._camera_counts[name] = self._camera_counts.get(name, -1) + 1
                 self._add_locked(name, Sample(now, message, _stamp(message), index))
+
+    def _on_tactile(self, key: tuple[str, str], message: Any) -> None:
+        now = time.monotonic()
+        with self._lock:
+            self._tactile[key] = (message, now)
 
     def _on_accepted(self, message: Any) -> None:
         values = np.asarray(message.data, dtype=float)
@@ -930,10 +1006,14 @@ class Ar3Robot:
         timeout: float,
         *,
         need_tau_m: bool,
+        need_tactile: bool = False,
         max_observation_age: float = 1.0,
         max_image_age: float = 1.0,
+        max_tactile_age: float = 1.0,
     ) -> None:
-        """Waits for the controller, force and cameras to satisfy the requested freshness before activation."""
+        """Waits for the controller, force, cameras (and Tac G2 fingers) to satisfy the requested freshness."""
+        if need_tactile and not self._tactile_topics:
+            raise RobotError("the policy reads the Tac G2 fingers: start the robot with tactile=True")
         deadline = time.monotonic() + timeout
         while True:
             now = time.monotonic()
@@ -943,6 +1023,9 @@ class Ar3Robot:
                     ages[self.prefix + "/tau_m"] = (now - self._tau_m_at, max_observation_age)
                 for name, topic in self._camera_topics.items():
                     ages[topic] = (now - self._images.get(name, (None, -math.inf))[1], max_image_age)
+                if need_tactile:
+                    for key, topic in self._tactile_topics.items():
+                        ages[topic] = (now - self._tactile.get(key, (None, -math.inf))[1], max_tactile_age)
                 status, metadata = self._status, self._metadata
             missing = [topic for topic, (age, limit) in ages.items() if age > limit]
             if not status:
@@ -951,13 +1034,22 @@ class Ar3Robot:
                 missing.append(self.prefix + "/metadata")
             if not missing:
                 self._check_contract(metadata)
+                if need_tactile:
+                    self._check_fingers(max_tactile_age)
                 return
             if now > deadline:
+                hint = f"; {TACTILE_PREPARATION}" if any(topic.startswith(TACTILE_PREFIX) for topic in missing) else ""
                 raise RobotError(
                     f"no fresh data on {', '.join(missing)} after {timeout:.0f} s: start the impedance controller and "
-                    "the cameras (scripts/prepare_ar3_inference.sh) with the same ROS_DOMAIN_ID"
+                    f"the cameras (scripts/prepare_ar3_inference.sh) with the same ROS_DOMAIN_ID{hint}"
                 )
             time.sleep(0.05)
+
+    def _check_fingers(self, max_age: float) -> None:
+        """Both fingers' newest samples must decode as recorded (32FC1 maps that pool to the training shape)."""
+        _, valid, _ = self.hand_reading(max_age=max_age)
+        if not valid.all():
+            raise RobotError(f"Tac G2 fingers unusable ({_describe(self._finger_problems)}): {TACTILE_PREPARATION}")
 
     def _check_contract(self, metadata: dict) -> None:
         """The node must stream the RT Cartesian impedance command layout (and pose convention) this client uses."""
@@ -1030,6 +1122,48 @@ class Ar3Robot:
         with self._lock:
             self._raise_if_fault_locked()
             return self._sample_locked(now, wrench_dim, max_age)[1]
+
+    def hand_reading(self, *, max_age: float = MAX_TACTILE_AGE) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Tac G2 reading of this control step, as in the training data: area-pooled indentation maps float16
+        [2, 48, 64], finger validity bool [2] and finger wrenches float32 [12] (Fx Fy Fz Mx My Mz of sensor_0, then
+        sensor_2).
+
+        A finger counts when its newest map and wrench are at most ``max_age`` old (newest sample at or before this
+        step, like the tactile cache) and decode; otherwise it is sent as missing with zeros, which the policy was
+        trained with (finger dropout, recording gaps). Changes of the missing fingers are logged.
+        """
+        tactile = tactile_io()
+        now = time.monotonic()
+        with self._lock:
+            self._raise_if_fault_locked()
+            samples = dict(self._tactile)
+        depth = np.zeros((len(tactile.SENSORS), *tactile.DEPTH_SHAPE), dtype=np.float16)
+        wrench = np.zeros((len(tactile.SENSORS), tactile.WRENCH_DIM), dtype=np.float32)
+        valid = np.zeros(len(tactile.SENSORS), dtype=bool)
+        problems: dict[str, str] = {}
+        for index, sensor in enumerate(tactile.SENSORS):
+            (depth_message, depth_at), (wrench_message, wrench_at) = (
+                samples.get((kind, sensor), (None, -math.inf)) for kind in ("depth", "wrench")
+            )
+            age = now - min(depth_at, wrench_at)
+            if age > max_age:
+                problems[sensor] = "no samples" if math.isinf(age) else f"samples {age:.2f} s old"
+                continue
+            try:
+                depth[index] = tactile.pool_depth(depth_map(depth_message))
+                wrench[index] = finger_wrench(wrench_message)
+            except (RobotError, ValueError) as error:
+                depth[index], wrench[index] = 0.0, 0.0
+                problems[sensor] = str(error)
+                continue
+            valid[index] = True
+        if problems.keys() != self._finger_problems.keys():
+            if problems:
+                logger.warning("Tac G2 fingers missing (%s); the policy continues without them", _describe(problems))
+            else:
+                logger.info("Tac G2 fingers available again")
+        self._finger_problems = problems
+        return depth, valid, wrench.reshape(-1)
 
     def poses(self) -> tuple[tuple[np.ndarray, np.ndarray], Any, Any]:
         """(measured, last streamed command, current target) poses; the last two are None when not streaming."""
@@ -1372,6 +1506,79 @@ def parameter_value(value: Any) -> Any:
     return list(result) if value.type >= 6 else result
 
 
+def _reading(reading: Any) -> Any:
+    return dict(reading) if isinstance(reading, dict) else np.asarray(reading, dtype=np.float32)
+
+
+def stack_readings(rows: Sequence[Any]) -> dict[str, np.ndarray]:
+    """Per-step readings -> request keys [T, ...]: force readings -> ``wrench`` (LIFT); dicts -> one array per key."""
+    if isinstance(rows[0], dict):
+        return {key: np.stack([np.asarray(row[key]) for row in rows]) for key in rows[0]}
+    return {"wrench": np.stack(rows)}
+
+
+def sensor_reading(robot: Any, force: np.ndarray, gripper_position: float, config: "RunConfig") -> Any:
+    """One per-step reading of the client protocol (``ar3_lift_policy``): the force reading for LIFT policies; for
+    muscleVLTA policies the dict of its reading keys, with the Tac G2 fingers and the gripper opening if used."""
+    if not (config.sensor_history or config.tactile):
+        return force
+    reading = {"wrench": np.asarray(force, dtype=np.float32), "sensor_valid": np.True_}
+    if config.tactile:
+        depth, valid, wrench = robot.hand_reading(max_age=config.max_tactile_age)
+        reading.update(
+            tactile_depth=depth,
+            tactile_valid=valid,
+            tactile_wrench=wrench,
+            gripper_aperture=np.float32(gripper_position),
+        )
+    return reading
+
+
+def trace_reading(reading: Any) -> dict:
+    """Trace fields of a reading: the force reading, and the Tac G2 values with only the peak of each map."""
+    if not isinstance(reading, dict):
+        return {"reading": reading}
+    fields = {"reading": reading["wrench"]}
+    if "tactile_depth" in reading:
+        fields["tactile_peak"] = reading["tactile_depth"].max(axis=(-2, -1))
+    fields.update(
+        (key, reading[key]) for key in ("tactile_valid", "tactile_wrench", "gripper_aperture") if key in reading
+    )
+    return fields
+
+
+def tactile_summary(reading: Any) -> str:
+    """Chunk log suffix with the last Tac G2 reading: indentation peak per finger (- = missing) and gripper opening."""
+    if not isinstance(reading, dict) or "tactile_depth" not in reading:
+        return ""
+    peaks = reading["tactile_depth"].max(axis=(-2, -1))
+    fingers = " ".join(
+        f"{peak:.2f}" if valid else "-" for peak, valid in zip(peaks, reading["tactile_valid"], strict=True)
+    )
+    return f" | Tac G2 peak [{fingers}] at gripper {float(reading['gripper_aperture']):.0f}"
+
+
+class SensorHistory:
+    """Readings of the last ``length`` control steps of the episode: the history rows of muscleVLTA requests."""
+
+    def __init__(self, length: int) -> None:
+        self.length = length
+        self._rows: collections.deque[dict] = collections.deque(maxlen=length)
+
+    def add(self, reading: Any) -> None:
+        if self.length:
+            self._rows.append(reading)
+
+    def rows(self, current: Any) -> list[dict]:
+        """The ``length`` readings before ``current``. Steps before the episode start repeat the oldest reading marked
+        missing (``sensor_valid`` False), as training clamps history frames to the episode start."""
+        if not self.length:
+            return []
+        rows = list(self._rows)
+        padding = {**(rows[0] if rows else current), "sensor_valid": np.False_}
+        return [padding] * (self.length - len(rows)) + rows
+
+
 class ChunkPlanner:
     """Fetches the actions of the current chunk from the policy server; a worker thread owns the websocket.
 
@@ -1395,7 +1602,8 @@ class ChunkPlanner:
         self._cond = threading.Condition()
         self._chunk = 0
         self._observation: dict | None = None
-        self._readings: list[np.ndarray] = []
+        self._history: list[dict] = []
+        self._readings: list[Any] = []
         self._actions: list[np.ndarray] = []
         self._sent_first = False
         self._error: BaseException | None = None
@@ -1403,23 +1611,26 @@ class ChunkPlanner:
         self._thread = threading.Thread(target=self._run, name="policy", daemon=True)
         self._thread.start()
 
-    def begin_chunk(self, observation: dict, reading: np.ndarray | None) -> None:
-        """Starts a new chunk. ``reading``: chunk-start force reading (None for models without force input)."""
+    def begin_chunk(self, observation: dict, reading: Any, history: Sequence[dict] = ()) -> None:
+        """Starts a new chunk. ``reading``: chunk-start reading (None for models without force input): a force reading,
+        or a dict of the muscleVLTA reading keys. ``history``: the readings of the steps before the chunk
+        (``SensorHistory.rows``), sent first in every request."""
         with self._cond:
             self._raise_locked()
             self._chunk += 1
             self._observation = observation
-            self._readings = [] if reading is None else [np.asarray(reading, dtype=np.float32)]
+            self._history = list(history)
+            self._readings = [] if reading is None else [_reading(reading)]
             self._actions = []
             self._sent_first = False
             self._cond.notify_all()
 
-    def add_reading(self, reading: np.ndarray) -> None:
-        """Adds the force reading measured at the next step of the chunk."""
+    def add_reading(self, reading: Any) -> None:
+        """Adds the reading measured at the next step of the chunk."""
         with self._cond:
             self._raise_locked()
             if self._readings and len(self._readings) < self.horizon:
-                self._readings.append(np.asarray(reading, dtype=np.float32))
+                self._readings.append(_reading(reading))
                 self._cond.notify_all()
 
     def wait_action(self, index: int, timeout: float, idle: Any = None) -> np.ndarray:
@@ -1455,7 +1666,7 @@ class ChunkPlanner:
             self._sent_first = True
             observation = dict(self._observation)
             if self._readings:
-                observation["wrench"] = np.stack(self._readings[:1])
+                observation.update(stack_readings(self._history + self._readings[:1]))
             if self.reactive:
                 return functools.partial(self._policy.reactive_replan, observation, k=self.latency + 1), 0
             return functools.partial(self._policy.infer, observation), 0
@@ -1465,7 +1676,7 @@ class ChunkPlanner:
         computable = min(self.horizon - 1, len(self._readings) - 1 + self.latency)
         if known > computable:
             return None
-        readings = {"wrench": np.stack(self._readings)}
+        readings = stack_readings(self._history + self._readings)
         return functools.partial(
             self._policy.reactive_step, readings, k=computable - known + 1, current_step=known
         ), known
@@ -1571,6 +1782,9 @@ class RunConfig:
     max_image_age: float = 0.2
     command_gripper: bool = False
     assumed_gripper: float = GRIPPER_OPEN
+    sensor_history: int = 0  # muscleVLTA: readings of the steps before each chunk sent with it (0: LIFT requests)
+    tactile: bool = False  # muscleVLTA: every reading carries the Tac G2 fingers and the gripper opening
+    max_tactile_age: float = MAX_TACTILE_AGE
 
 
 def run_chunks(
@@ -1586,9 +1800,13 @@ def run_chunks(
 ) -> int:
     """Closed loop at ``1 / period`` Hz, one action chunk at a time (as recorded). Returns the completed chunks.
 
-    ``should_stop()`` is asked before every chunk (e.g. whether the operator ended the episode).
+    ``should_stop()`` is asked before every chunk (e.g. whether the operator ended the episode). Every call is one
+    episode: the sensor history of muscleVLTA policies starts empty.
     """
     chunks = 0
+    history = SensorHistory(config.sensor_history)
+    # Readings are measured every step when the policy reacts to them or keeps them as the next chunks' history.
+    measure = bool(config.wrench_dim) and (planner.reactive or config.sensor_history > 0)
     while config.max_chunks <= 0 or chunks < config.max_chunks:
         if should_stop is not None and should_stop():
             break
@@ -1598,17 +1816,27 @@ def run_chunks(
         gripper_now = gripper.read() if gripper is not None else config.assumed_gripper
         request = policy_observation(observation, gripper_now, config.prompt, config.resize)
         state = request["observation/state"]
-        planner.begin_chunk(request, observation.reading if config.wrench_dim else None)
+        reading = observation.reading
+        if config.wrench_dim:
+            reading = sensor_reading(robot, reading, gripper_now, config)
+            planner.begin_chunk(request, reading, history.rows(reading))
+            history.add(reading)
+        else:
+            planner.begin_chunk(request, None)
         relative = planner.wait_action(0, config.first_action_timeout, robot.heartbeat)
         t0 = clock()
-        reading, clamped_steps = observation.reading, 0
+        clamped_steps = 0
         for step in range(planner.horizon):
             if step:
                 sleep_until(t0 + step * config.period, robot.heartbeat, clock=clock, sleep=sleep)
                 reading = None
-                if planner.reactive and config.wrench_dim:
-                    reading = robot.force_reading(wrench_dim=config.wrench_dim, max_age=config.max_observation_age)
-                    planner.add_reading(reading)
+                if measure:
+                    force = robot.force_reading(wrench_dim=config.wrench_dim, max_age=config.max_observation_age)
+                    aperture = gripper.read() if config.tactile and gripper is not None else config.assumed_gripper
+                    reading = sensor_reading(robot, force, aperture, config)
+                    history.add(reading)
+                    if planner.reactive:
+                        planner.add_reading(reading)
                 relative = planner.wait_action(step, config.policy_timeout, robot.heartbeat)
             position, rotation = absolute_target(relative, state)
             clamped = robot.set_target(position, rotation)
@@ -1623,13 +1851,13 @@ def run_chunks(
                 action=relative[:7],
                 target=np.concatenate([position, matrix_rpy(rotation), relative[6:7]]),
                 clamped=clamped,
-                reading=reading,
+                **trace_reading(reading),
                 infer_ms=planner.last_infer_ms,
             )
         sleep_until(t0 + planner.horizon * config.period, robot.heartbeat, clock=clock, sleep=sleep)
         chunks += 1
         logger.info(
-            "chunk %d: state xyz [%.3f %.3f %.3f] gripper %.0f -> %.0f | %d policy requests, last %.0f ms%s",
+            "chunk %d: state xyz [%.3f %.3f %.3f] gripper %.0f -> %.0f | %d policy requests, last %.0f ms%s%s",
             chunks,
             *state[:3],
             state[6],
@@ -1637,6 +1865,7 @@ def run_chunks(
             planner.requests,
             planner.last_infer_ms,
             f" | {clamped_steps} targets clamped to the workspace" if clamped_steps else "",
+            tactile_summary(reading),
         )
     return chunks
 
@@ -2036,10 +2265,15 @@ def warm_up(robot: Any, planner: ChunkPlanner, gripper: Any, config: RunConfig) 
     )
     gripper_now = gripper.read() if gripper is not None else config.assumed_gripper
     request = policy_observation(observation, gripper_now, config.prompt, config.resize)
-    planner.begin_chunk(request, observation.reading if config.wrench_dim else None)
+    reading = None
+    if config.wrench_dim:
+        reading = sensor_reading(robot, observation.reading, gripper_now, config)
+        planner.begin_chunk(request, reading, SensorHistory(config.sensor_history).rows(reading))
+    else:
+        planner.begin_chunk(request, None)
     planner.wait_action(0, WARMUP_TIMEOUT)
     if planner.reactive and config.wrench_dim and planner.latency + 1 < planner.horizon:
-        planner.add_reading(observation.reading)
+        planner.add_reading(reading)
         planner.wait_action(planner.latency + 1, WARMUP_TIMEOUT)
     logger.info(
         "policy warm-up done in %.1f s (last request %.0f ms)", time.monotonic() - started, planner.last_infer_ms
@@ -2089,12 +2323,6 @@ class Session:
             args.home_file or "explicit --start-pose",
             np.round(args.start_pose, 6),
         )
-        robot.start(
-            front_topic=args.front_topic,
-            wrist_topic=args.wrist_topic,
-            controller_node=args.controller_node,
-            clutch_topic=args.clutch_topic,
-        )
         metadata: dict = {}
         policy = None
         if not args.check:
@@ -2103,10 +2331,25 @@ class Session:
             logger.info("policy server metadata: %s", metadata)
         reactive_model = bool(metadata.get("reactive", False))
         wrench_dim = int(metadata.get("wrench_dim", 0)) if reactive_model else 0
+        # muscleVLTA policies also take the readings of the steps before each chunk and, with tactile_in_use, the
+        # Tac G2 fingers and the gripper opening at every step (sensor layout announced by scripts/serve_policy.py).
+        sensor_history = int(metadata.get("sensor_history", 0)) if reactive_model else 0
+        tactile = reactive_model and bool(metadata.get("tactile_in_use", False))
         mode = ("reactive" if reactive_model else "infer") if args.mode == "auto" else args.mode
         if mode == "reactive" and not reactive_model and not args.check:
             raise PolicyError("the served model is not force-reactive; use --mode infer")
-        robot.wait_ready(args.ready_timeout, need_tau_m=args.check or self.recording or wrench_dim == 6 + TAU_M_SIZE)
+        robot.start(
+            front_topic=args.front_topic,
+            wrist_topic=args.wrist_topic,
+            controller_node=args.controller_node,
+            clutch_topic=args.clutch_topic,
+            tactile=tactile or args.check,
+        )
+        robot.wait_ready(
+            args.ready_timeout,
+            need_tau_m=args.check or self.recording or wrench_dim == 6 + TAU_M_SIZE,
+            need_tactile=tactile,
+        )
         self._configure_limits()
         if args.dagger:
             robot.check_teleoperation(args.ready_timeout)
@@ -2138,14 +2381,18 @@ class Session:
             max_image_age=args.max_image_age,
             command_gripper=args.execute and self.gripper is not None,
             assumed_gripper=args.assumed_gripper,
+            sensor_history=sensor_history,
+            tactile=tactile,
         )
         # Parameter/gripper setup can outlast the first camera samples. Wait for fresh observations while the
         # controller is still inactive; execution keeps the normal fail-fast sensor checks and age limits.
         robot.wait_ready(
             args.ready_timeout,
             need_tau_m=args.check or self.recording or wrench_dim == 6 + TAU_M_SIZE,
+            need_tactile=tactile,
             max_observation_age=args.max_observation_age,
             max_image_age=args.max_image_age,
+            max_tactile_age=config.max_tactile_age,
         )
         if args.check:
             self._report()
@@ -2158,14 +2405,20 @@ class Session:
             latency=int(metadata.get("cross_attention_latency", 0)) if mode == "reactive" else 0,
         )
         logger.info(
-            "mode %s: horizon %d, latency %d, force reading width %d, %.0f Hz, prompt %r",
+            "mode %s: horizon %d, latency %d, force reading width %d%s%s, %.0f Hz, prompt %r",
             mode,
             self.planner.horizon,
             self.planner.latency,
             wrench_dim,
+            f", {sensor_history} history steps" if sensor_history else "",
+            ", Tac G2 fingers + gripper opening" if tactile else "",
             args.control_hz,
             args.prompt,
         )
+        if tactile and self.recording:
+            logger.warning(
+                "--record-dir does not save the Tac G2 fingers yet: these episodes train with the fingers missing"
+            )
         if args.warmup:
             warm_up(robot, self.planner, self.gripper, config)
         episodes = args.record_dir is not None or args.dagger or args.episodes != 1
@@ -2474,6 +2727,19 @@ class Session:
             "TCP wrench %s, tau_m %s", np.round(observation.reading[:6], 2), np.round(observation.reading[6:], 2)
         )
         logger.info("front %s, wrist %s", observation.front.shape, observation.wrist.shape)
+        depth, valid, wrench = self.robot.hand_reading()
+        if valid.all():
+            logger.info(
+                "Tac G2 %s",
+                "; ".join(
+                    f"{sensor}: indentation peak {depth[index].max():.2f}, force {np.round(wrench[6 * index : 6 * index + 3], 2)}"
+                    for index, sensor in enumerate(tactile_io().SENSORS)
+                ),
+            )
+        else:
+            logger.warning(
+                "Tac G2 fingers unavailable: tactile muscleVLTA policies will not start; %s", TACTILE_PREPARATION
+            )
         recenter = self.robot.metadata.get("workspace_recenter") == WORKSPACE_RECENTER
         logger.info(
             "controller contract ok; workspace recenter %s",

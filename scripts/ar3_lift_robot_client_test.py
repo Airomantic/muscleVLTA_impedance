@@ -2,6 +2,7 @@ import array
 import dataclasses
 import io
 import json
+import logging
 import math
 import threading
 import time
@@ -11,6 +12,7 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
 
+from openpi.models import model as _model
 from openpi.policies import ar3_lift_policy as ar3
 from scripts import ar3_lift_robot_client as client
 
@@ -60,6 +62,61 @@ def test_rgb_image_drops_row_padding_and_converts_bgr():
     message.encoding = "mono8"
     with pytest.raises(client.RobotError):
         client.rgb_image(message)
+
+
+def _tactile_messages(value: float):
+    """Tac G2 bridge messages of one finger: a native 32FC1 map filled with ``value`` and a wrench with Fz = value."""
+    raw = np.full(client.tactile_io().RAW_DEPTH_SHAPE, value, dtype="<f4")
+    depth = types.SimpleNamespace(
+        encoding="32FC1", height=raw.shape[0], width=raw.shape[1], step=4 * raw.shape[1], is_bigendian=False
+    )
+    depth.data = raw.tobytes()
+    force, torque = types.SimpleNamespace(x=1.0, y=2.0, z=value), types.SimpleNamespace(x=4.0, y=5.0, z=6.0)
+    return depth, types.SimpleNamespace(wrench=types.SimpleNamespace(force=force, torque=torque))
+
+
+def test_tactile_messages_decode_like_the_recorder():
+    pixels = np.arange(6, dtype=np.float32).reshape(2, 3)
+    padded = np.zeros((2, 4), dtype=">f4")
+    padded[:, :3] = pixels
+    message = types.SimpleNamespace(
+        encoding="32FC1", height=2, width=3, step=16, is_bigendian=True, data=list(padded.tobytes())
+    )
+    np.testing.assert_array_equal(client.depth_map(message), pixels)
+    for change in ({"encoding": "16UC1"}, {"step": 8}, {"data": padded.tobytes()[:-4]}):
+        with pytest.raises(client.RobotError):
+            client.depth_map(types.SimpleNamespace(**{**vars(message), **change}))
+    message.data = np.full((2, 4), np.nan, dtype=">f4").tobytes()
+    with pytest.raises(client.RobotError, match="non-finite"):
+        client.depth_map(message)
+    np.testing.assert_array_equal(client.finger_wrench(_tactile_messages(3.0)[1]), [1, 2, 3, 4, 5, 6])
+
+
+def test_hand_reading_sends_stale_or_malformed_fingers_as_missing(monkeypatch, caplog):
+    tactile = client.tactile_io()
+    robot = client.Ar3Robot(execute=False, limits=client.Limits())
+    clock = FakeClock()
+    clock.now = 10.0
+    monkeypatch.setattr(client.time, "monotonic", clock)
+    for index, sensor in enumerate(tactile.SENSORS):
+        depth, wrench = _tactile_messages(0.1 * (index + 1))
+        robot._tactile.update({("depth", sensor): (depth, 9.95), ("wrench", sensor): (wrench, 9.9)})
+    depth, valid, wrench = robot.hand_reading()
+    assert depth.dtype == np.float16
+    assert depth.shape == (len(tactile.SENSORS), *tactile.DEPTH_SHAPE)
+    np.testing.assert_allclose(depth.max(axis=(1, 2)), [0.1, 0.2], rtol=1e-3)
+    assert valid.tolist() == [True, True]
+    np.testing.assert_allclose(wrench, [1, 2, 0.1, 4, 5, 6, 1, 2, 0.2, 4, 5, 6], rtol=1e-6)
+
+    robot._tactile["wrench", "sensor_2"] = (robot._tactile["wrench", "sensor_2"][0], 9.7)  # older than 0.2 s
+    robot._tactile["depth", "sensor_0"][0].encoding = "16UC1"
+    with caplog.at_level(logging.WARNING, logger=client.logger.name):
+        depth, valid, wrench = robot.hand_reading()
+    assert valid.tolist() == [False, False]
+    assert not depth.any()
+    assert not wrench.any()
+    assert "sensor_0: Tac G2 depth must be" in caplog.text
+    assert "sensor_2: samples 0.30 s old" in caplog.text
 
 
 # Policy server fake with the reactive semantics of ReactiveSession: action r only sees force rows <= r - latency,
@@ -394,32 +451,71 @@ def test_wait_ready_times_out_when_fresh_camera_frames_never_arrive(monkeypatch)
     assert not robot._streaming
 
 
-@pytest.mark.parametrize("check", [False, True])
-def test_session_refreshes_observations_after_setup_before_report_or_warmup(monkeypatch, check):
+def test_wait_ready_requires_fresh_decodable_fingers_for_tactile_policies(monkeypatch):
+    robot = client.Ar3Robot(execute=False, limits=client.Limits())
+    robot._status, robot._metadata = "monitoring:", CONTRACT
+    robot._state_at = robot._tau_m_at = 10.0
+    robot._images = {"front": (None, 10.0), "wrist": (None, 10.0)}
+    clock = FakeClock()
+    clock.now = 10.0
+    monkeypatch.setattr(client.time, "monotonic", clock)
+    monkeypatch.setattr(client.time, "sleep", clock.sleep)
+    with pytest.raises(client.RobotError, match="tactile=True"):
+        robot.wait_ready(0.1, need_tau_m=True, need_tactile=True)
+    sensors = client.tactile_io().SENSORS
+    robot._tactile_topics = {
+        (kind, sensor): f"{client.TACTILE_PREFIX}/{sensor}/{kind}" for sensor in sensors for kind in ("depth", "wrench")
+    }
+    with pytest.raises(client.RobotError, match="sensor_0/depth.*ar3_tactile_bridge"):
+        robot.wait_ready(0.1, need_tau_m=True, need_tactile=True)
+    for sensor in sensors:
+        depth, wrench = _tactile_messages(0.1)
+        robot._tactile.update({("depth", sensor): (depth, clock.now), ("wrench", sensor): (wrench, clock.now)})
+    robot.wait_ready(0.1, need_tau_m=True, need_tactile=True, max_tactile_age=0.2)
+    robot._tactile["depth", "sensor_2"][0].height = 5  # the payload no longer matches the image size
+    with pytest.raises(client.RobotError, match=r"unusable \(sensor_2: Tac G2 depth has an invalid row step"):
+        robot.wait_ready(0.1, need_tau_m=True, need_tactile=True, max_tactile_age=0.2)
+    robot.wait_ready(0.1, need_tau_m=True)  # LIFT policies do not read the fingers
+
+
+@pytest.mark.parametrize(("check", "tactile"), [(False, False), (True, False), (False, True)])
+def test_session_refreshes_observations_after_setup_before_report_or_warmup(monkeypatch, check, tactile):
     session = client.Session(client.parse_args([*(["--check"] if check else []), "--start-pose", *["0"] * 6]))
     events = []
     waits = []
+    starts = []
 
     def wait_ready(timeout, **kwargs):
         waits.append(kwargs)
         events.append("wait")
 
-    session.robot = types.SimpleNamespace(start=lambda **kwargs: None, wait_ready=wait_ready)
+    session.robot = types.SimpleNamespace(start=lambda **kwargs: starts.append(kwargs), wait_ready=wait_ready)
     monkeypatch.setattr(session, "_configure_limits", lambda: events.append("parameters"))
     gripper = types.SimpleNamespace(read=lambda: events.append("gripper") or 1000.0)
     monkeypatch.setattr(client.DMGripper, "connect", lambda *args, **kwargs: gripper)
-    policy = types.SimpleNamespace(
-        get_server_metadata=lambda: {"reactive": True, "wrench_dim": 13, "action_horizon": 10}
-    )
+    metadata = {"reactive": True, "wrench_dim": 13, "action_horizon": 10}
+    if tactile:
+        metadata.update(sensor_history=10, tactile_in_use=True)
+    policy = types.SimpleNamespace(get_server_metadata=lambda: metadata)
     monkeypatch.setattr(client, "connect_policy", lambda *args: policy)
     monkeypatch.setattr(client, "ChunkPlanner", lambda *args, **kwargs: types.SimpleNamespace(horizon=10, latency=0))
 
     def observe_after_setup(*args):
         assert events == ["wait", "parameters", "gripper", "wait"]
+        # --check subscribes to the fingers to report them; only tactile policies require them.
+        assert [start["tactile"] for start in starts] == [tactile or check]
         assert waits == [
-            {"need_tau_m": True},
-            {"need_tau_m": True, "max_observation_age": 0.25, "max_image_age": 0.2},
+            {"need_tau_m": True, "need_tactile": tactile},
+            {
+                "need_tau_m": True,
+                "need_tactile": tactile,
+                "max_observation_age": 0.25,
+                "max_image_age": 0.2,
+                "max_tactile_age": client.MAX_TACTILE_AGE,
+            },
         ]
+        if args:  # warm_up(robot, planner, gripper, config)
+            assert (args[3].sensor_history, args[3].tactile) == ((10, True) if tactile else (0, False))
         if not check:
             raise RuntimeError("stop before activation")
 
@@ -786,6 +882,93 @@ def test_run_chunks_asks_before_every_chunk_whether_to_stop():
     planner.close()
     assert len(robot.targets) == HORIZON
     assert asked == pytest.approx([0.0, HORIZON * config.period])
+
+
+@dataclasses.dataclass
+class TactileRobot(FakeRobot):
+    """Every measurement (chunk start or step) is tagged with its count m: wrench, finger maps / wrenches = m; the
+    second finger is missing at odd m."""
+
+    measured: int = 0
+
+    def observe(self, *, wrench_dim, max_age, max_image_age):
+        observation = super().observe(wrench_dim=wrench_dim, max_age=max_age, max_image_age=max_image_age)
+        return dataclasses.replace(observation, reading=self.force_reading(wrench_dim=wrench_dim, max_age=max_age))
+
+    def force_reading(self, *, wrench_dim, max_age):
+        self.measured += 1
+        return np.full(wrench_dim, self.measured, dtype=np.float32)
+
+    def hand_reading(self, *, max_age):
+        depth = np.full((2, 48, 64), self.measured / 100, dtype=np.float16)
+        return depth, np.asarray([True, self.measured % 2 == 0]), np.full(12, self.measured, dtype=np.float32)
+
+
+class SensorPolicy:
+    """Reactive server fake that feeds every request, merged over the chunk-start observation like
+    ``ReactiveSession``, through the server's input transform of a muscleVLTA policy."""
+
+    def __init__(self, history_length: int):
+        self.history_length = history_length
+        self.inputs = ar3.AR3LiftInputs(
+            model_type=_model.ModelType.PI05, action_horizon=HORIZON, history_length=history_length, tactile=True
+        )
+        self.requests = []
+        self.observation = None
+
+    def _respond(self, data, start, end):
+        self.requests.append((start, data))
+        inputs = self.inputs(data)
+        assert inputs["tactile_depth"].shape == (self.history_length + HORIZON, 2, 48, 64)
+        actions = np.zeros((end - start, 7))
+        actions[:, 6] = 500.0
+        return {"actions": actions, "start_step": start, "next_step": end}
+
+    def reactive_replan(self, observation, *, k):
+        self.observation = observation
+        return self._respond(observation, 0, k)
+
+    def reactive_step(self, readings, *, k, current_step):
+        return self._respond({**self.observation, **readings}, current_step, min(current_step + k, HORIZON))
+
+
+def test_run_chunks_sends_muscle_vlta_readings_with_the_episode_history():
+    history = 10
+    robot, policy, clock = TactileRobot([np.zeros(13, dtype=np.float32)]), SensorPolicy(history), FakeClock()
+    planner = client.ChunkPlanner(policy, reactive=True, horizon=HORIZON, latency=3)
+    apertures = iter(range(1000, 0, -1))  # measurement m reads the opening 1001 - m
+    gripper = types.SimpleNamespace(read=lambda: float(next(apertures)))
+    config = client.RunConfig(max_chunks=2, resize=0, sensor_history=history, tactile=True)
+    for _ in range(2):  # every call is an episode
+        assert client.run_chunks(robot, planner, gripper, config, client.Trace(None), clock=clock, sleep=clock.sleep)
+    planner.close()
+
+    chunks = []
+    for start, data in policy.requests:
+        if start == 0:
+            chunks.append([])
+        chunks[-1].append(data)
+    assert len(chunks) == 4
+    for index, requests in enumerate(chunks):
+        base, episode_start = HORIZON * index, index % 2 == 0
+        # The steps before the episode start repeat its first reading as missing; later chunks carry the readings of
+        # the previous chunk.
+        before = [base + 1] * history if episode_start else list(range(base - history + 1, base + 1))
+        for data in requests:
+            rows = len(data["wrench"])
+            assert history < rows <= history + HORIZON
+            assert all(len(data[key]) == rows for key in ar3.READING_KEYS)
+            measured = np.asarray(before + list(range(base + 1, base + 1 + rows - history)), dtype=np.float32)
+            np.testing.assert_array_equal(data["wrench"][:, 0], measured)
+            np.testing.assert_array_equal(data["tactile_wrench"][:, 0], measured)
+            np.testing.assert_allclose(data["tactile_depth"][:, 0, 0, 0], measured / 100, rtol=1e-3)
+            np.testing.assert_array_equal(data["tactile_valid"][:, 1], measured % 2 == 0)
+            np.testing.assert_array_equal(data["gripper_aperture"], 1001 - measured)
+            np.testing.assert_array_equal(
+                data["sensor_valid"], np.logical_or(not episode_start, np.arange(rows) >= history)
+            )
+        assert requests[0]["observation/state"][6] == 1000 - base
+        assert len(requests[-1]["wrench"]) >= history + HORIZON - planner.latency  # last action saw its readings
 
 
 def test_gripper_resends_targets_after_someone_else_moved_the_fingers():
