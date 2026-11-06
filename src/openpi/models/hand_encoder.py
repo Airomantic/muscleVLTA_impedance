@@ -3,8 +3,10 @@
 Finger contact is sparse: the indentation maps and finger wrenches carry signal only while an object is held, and the
 noise of a free finger is not a weak version of that signal. Each finger reading therefore becomes a token through a
 contact gate (supervised with ``contact_labels``): without contact the token collapses to a learned no-contact
-embedding, and an unavailable (or dropped) finger uses a separate missing-sensor embedding. A GRU fuses the finger
-tokens, their contact probabilities and the gripper opening over time, skipping the rows before the episode start.
+embedding, and an unavailable (or dropped) finger uses a separate missing-sensor embedding. As in T-WLA's tactile
+history encoder, each map is read together with its change since the previous row, where contact onsets, slip and
+in-hand rotation of the held object show up. A GRU fuses the finger tokens, their contact probabilities and the
+gripper opening over time, skipping the rows before the episode start.
 
 Layer names avoid ``*_1``/``*_2`` pairs: ``maybe_copy_reactive_expert_params`` copies every ``*_1`` entry to ``*_2``.
 """
@@ -54,15 +56,18 @@ def contact_labels(depth: jnp.ndarray, contact_depth: float) -> jnp.ndarray:
 
 
 class _FingerEncoder(nn.Module):
-    """One finger reading (indentation map [N, h, w], wrench [N, 6]) -> (features [N, F], contact logit [N])."""
+    """One finger reading -> (features [N, F], contact logit [N]).
+
+    Inputs: the indentation map and its change since the previous row [N, h, w], and the finger wrench [N, 6].
+    """
 
     features: int
     contact_depth: float
 
     @nn.compact
-    def __call__(self, depth, wrench):
+    def __call__(self, depth, depth_change, wrench):
         geometry = contact_geometry(depth, self.contact_depth)
-        x = depth.astype(jnp.float32)[..., None]
+        x = jnp.stack([depth, depth_change], axis=-1).astype(jnp.float32)
         for channels in (16, 32, 64):
             x = nn.gelu(nn.Conv(channels, (3, 3), strides=(2, 2), name=f"conv{channels}")(x))
         x = x.reshape(*x.shape[:-3], -1)
@@ -97,8 +102,14 @@ class HandEncoder(nn.Module):
     def __call__(self, depth, finger_valid, finger_wrench, aperture, valid):
         batch, rows, fingers = depth.shape[:3]
         wrench = finger_wrench.reshape(batch, rows, fingers, FINGER_WRENCH_DIM)
+        # Zero at the first row and wherever either reading of the pair is missing.
+        pair_valid = finger_valid[:, 1:] & finger_valid[:, :-1] & (valid[:, 1:] & valid[:, :-1])[..., None]
+        change = jnp.where(pair_valid[..., None, None], depth[:, 1:] - depth[:, :-1], 0.0)
+        change = jnp.concatenate([jnp.zeros_like(depth[:, :1]), change], axis=1)
         features, logits = _FingerEncoder(self.features, self.contact_depth, name="finger")(
-            depth.reshape(-1, *depth.shape[-2:]), wrench.reshape(-1, FINGER_WRENCH_DIM).astype(jnp.float32)
+            depth.reshape(-1, *depth.shape[-2:]),
+            change.reshape(-1, *depth.shape[-2:]),
+            wrench.reshape(-1, FINGER_WRENCH_DIM).astype(jnp.float32),
         )
         features = features.reshape(batch, rows, fingers, self.features)
         logits = logits.reshape(batch, rows, fingers)
