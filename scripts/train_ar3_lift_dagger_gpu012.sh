@@ -18,7 +18,8 @@
 #                            must match the offline checkpoint's model
 #   OPENPI_EXP_NAME          experiment name (default: ar3_lift_dagger_<date>)
 #   OPENPI_AR3_DAGGER_RATIO  share of DAgger samples in every batch (default 0.5 = LIFT 1:1 offline:online)
-#   OPENPI_AR3_REPO_ID       offline LeRobot v3.0 dataset (default /data/jiang/ar3_eef_forceVisuoTactaile_front_wrist)
+#   OPENPI_AR3_REPO_ID       offline LeRobot v3.0 dataset (default /data/jiang/ar3_eef_forceVisuoTactaile_front_wrist);
+#                            several ':'-separated ones as in scripts/train_ar3_lift_gpu012.sh
 #   OPENPI_AR3_ASSET_ID      norm-stats id under <step>/assets (default: the only one there)
 #   OPENPI_CUDA_VISIBLE_DEVICES (default 0,1,2), OPENPI_BATCH_SIZE (default 96), OPENPI_NUM_WORKERS (default 16)
 #   OPENPI_NUM_TRAIN_STEPS (default 10000), OPENPI_SAVE_INTERVAL (default 1000), OPENPI_KEEP_PERIOD (default 2000)
@@ -106,7 +107,14 @@ run() {
     fi
 }
 
-for path in "${OPENPI_AR3_REPO_ID}/meta/info.json" "${OPENPI_DATA_HOME}/big_vision/paligemma_tokenizer.model" "${PYTHON}"; do
+IFS=: read -r -a OFFLINE_DIRS <<<"${OPENPI_AR3_REPO_ID}"
+for directory in "${OFFLINE_DIRS[@]}"; do
+    if [[ -n "${directory}" && ! -e "${directory}/meta/info.json" ]]; then
+        echo "Missing ${directory}/meta/info.json" >&2
+        exit 1
+    fi
+done
+for path in "${OPENPI_DATA_HOME}/big_vision/paligemma_tokenizer.model" "${PYTHON}"; do
     if [[ ! -e "${path}" ]]; then
         echo "Missing ${path}" >&2
         exit 1

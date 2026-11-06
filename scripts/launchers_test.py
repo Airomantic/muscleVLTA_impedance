@@ -154,6 +154,14 @@ def test_ar3_dagger_launcher_continues_offline_checkpoint(launcher_env, tmp_path
     assert result.returncode == 1
     assert "not a LeRobot v3.0 recording" in result.stderr
 
+    # Several offline datasets (':'-separated) stay in the 1:1 mixture as one.
+    (tmp_path / "offline_35" / "meta").mkdir(parents=True)
+    (tmp_path / "offline_35" / "meta" / "info.json").write_text("{}")
+    launcher_env["OPENPI_AR3_REPO_ID"] += f":{tmp_path / 'offline_35'}"
+    result = run_launcher("train_ar3_lift_dagger_gpu012.sh", launcher_env, str(step), str(rounds[0]))
+    assert result.returncode == 0, result.stderr
+    assert f"Offline data:   {tmp_path / 'offline'}:{tmp_path / 'offline_35'}" in result.stdout
+
 
 def test_muscle_vlta_launcher_builds_the_tactile_cache_before_training(launcher_env, tmp_path):
     dataset = tmp_path / "plug_in"
@@ -179,6 +187,32 @@ def test_muscle_vlta_launcher_builds_the_tactile_cache_before_training(launcher_
     assert train[train.index("--exp-name") + 1].startswith("muscle_vlta_")
     assert train[train.index("--fsdp-devices") + 1] == "4"
     assert not (dataset / "tactile_cache").exists()
+
+
+def test_muscle_vlta_launcher_trains_several_sessions_as_one(launcher_env, tmp_path):
+    sessions = [tmp_path / "plug_in", tmp_path / "plug in_35"]
+    for session in sessions:
+        (session / "meta").mkdir(parents=True)
+        (session / "meta" / "info.json").write_text("{}")
+    (tmp_path / "home" / "big_vision").mkdir(parents=True)
+    (tmp_path / "home" / "big_vision" / "paligemma_tokenizer.model").write_text("")
+    launcher_env.update(
+        {
+            "OPENPI_AR3_REPO_ID": f"{sessions[0]}::{sessions[1]}:",
+            "OPENPI_AR3_WEIGHT_PATH": launcher_env["OPENPI_INIT_CHECKPOINT"],
+            "OPENPI_DATA_HOME": str(tmp_path / "home"),
+            "OPENPI_CHECKPOINT_BASE_DIR": str(tmp_path / "checkpoints"),
+        }
+    )
+    result = run_launcher("train_ar3_muscle_vlta.sh", launcher_env)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[0].endswith(f"--dataset {sessions[0]} {sessions[1]} --workers 16")
+    assert "assets/pi05_ar3_muscle_vlta/plug_in+plug in_35/norm_stats.json" in result.stdout
+
+    (sessions[1] / "meta" / "info.json").unlink()
+    result = run_launcher("train_ar3_muscle_vlta.sh", launcher_env)
+    assert result.returncode == 1
+    assert f"Missing {sessions[1]}/meta/info.json" in result.stderr
 
 
 def test_ar3_configs_train_every_listed_dataset_as_one(launcher_env):

@@ -224,6 +224,11 @@ and runs the trained policy on that robot. LeRobot v3.0 recordings are read nati
 bash scripts/train_ar3_lift_gpu012.sh
 ```
 
+Several sessions recorded alike (same fps and sensors, any episode length) train as one dataset when listed
+`:`-separated in `OPENPI_AR3_REPO_ID`. Every frame is sampled equally, each session keeps its own task prompts and
+Tac G2 cache, and the normalization statistics cover all of them under
+`assets/<config>/<dir1>+<dir2>/`. A new combination therefore needs a new run (new `OPENPI_EXP_NAME`), not a resume.
+
 **Serve and validate** a checkpoint step directory on the GPU server, replaying recorded frames exactly as the robot
 queries the policy (LIFT Algorithm 1: `reactive_replan`, then one `reactive_step` per force reading):
 
@@ -367,6 +372,8 @@ losses for the contact gates and for an action-conditioned forward model of the 
 ```bash
 OPENPI_EXP_NAME=muscle_vlta_30k OPENPI_NUM_TRAIN_STEPS=30000 bash scripts/train_ar3_muscle_vlta.sh
 # other GPUs: OPENPI_CUDA_VISIBLE_DEVICES=4,5,6,7; continue a run: OPENPI_RESUME=1 with the same OPENPI_EXP_NAME
+# 30 s and 35 s sessions together (one Tac G2 cache each):
+#   OPENPI_AR3_REPO_ID=/data/jiang/ar3_eef_forceVisuoTactaile_plugIn:/data/jiang/ar3_eef_forceVisuoTactaile_plugIn_35
 PLUG_IN="plug the two-pronged white charger on the table into the white socket, don't bump your fingers into other objects"
 OPENPI_CONFIG_NAME=pi05_ar3_muscle_vlta OPENPI_PROMPT="$PLUG_IN" \
   bash scripts/serve_ar3_lift.sh /data/jiang/train_checkpoints/pi05_ar3_muscle_vlta/muscle_vlta_30k/29999

@@ -6,6 +6,9 @@
 # scripts/train_ar3_lift_gpu012.sh, which computes the normalization statistics (with the finger wrenches) and trains.
 # All overrides of that launcher apply, e.g. on GPUs 4-7:
 #   OPENPI_CUDA_VISIBLE_DEVICES=4,5,6,7 bash scripts/train_ar3_muscle_vlta.sh
+# or on several sessions recorded alike (':'-separated; every dataset gets its own cache):
+#   OPENPI_AR3_REPO_ID=/data/jiang/ar3_eef_forceVisuoTactaile_plugIn:/data/jiang/ar3_eef_forceVisuoTactaile_plugIn_35 \
+#       bash scripts/train_ar3_muscle_vlta.sh
 #
 # Defaults set here: OPENPI_CONFIG_NAME=pi05_ar3_muscle_vlta, OPENPI_EXP_NAME=muscle_vlta_<date>,
 # OPENPI_AR3_REPO_ID=/data/jiang/ar3_eef_forceVisuoTactaile_plugIn. OPENPI_TACTILE_CACHE_WORKERS (default 16).
@@ -18,10 +21,17 @@ export OPENPI_CONFIG_NAME="${OPENPI_CONFIG_NAME:-pi05_ar3_muscle_vlta}"
 export OPENPI_EXP_NAME="${OPENPI_EXP_NAME:-muscle_vlta_$(date +%Y%m%d_%H%M)}"
 export OPENPI_AR3_REPO_ID="${OPENPI_AR3_REPO_ID:-/data/jiang/ar3_eef_forceVisuoTactaile_plugIn}"
 PYTHON="${OPENPI_PYTHON:-${REPO_ROOT}/.venv/bin/python}"
+IFS=: read -r -a DATASET_ENTRIES <<<"${OPENPI_AR3_REPO_ID}"
+DATASETS=()
+for dataset in "${DATASET_ENTRIES[@]}"; do
+    if [[ -n "${dataset}" ]]; then
+        DATASETS+=("${dataset}")
+    fi
+done
 
 CACHE_COMMAND=(
     "${PYTHON}" scripts/build_ar3_tactile_cache.py
-    --dataset "${OPENPI_AR3_REPO_ID}"
+    --dataset "${DATASETS[@]}"
     --workers "${OPENPI_TACTILE_CACHE_WORKERS:-16}"
 )
 echo "+ ${CACHE_COMMAND[*]}"

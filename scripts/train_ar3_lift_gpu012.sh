@@ -13,7 +13,10 @@
 #   OPENPI_CONFIG_NAME     pi05_ar3_lift_reactive (default: 13D force = tcp_wrench + tau_m) |
 #                          pi05_ar3_lift_reactive_wrench6 (tcp_wrench only) | pi05_ar3_lift (vision only, no force)
 #   OPENPI_EXP_NAME        experiment name (default: ar3_lift_<date>), <checkpoint root>/<config>/<exp>/
-#   OPENPI_AR3_REPO_ID     LeRobot v3.0 dataset dir (default: /data/jiang/ar3_eef_forceVisuoTactaile_front_wrist)
+#   OPENPI_AR3_REPO_ID     LeRobot v3.0 dataset dir (default: /data/jiang/ar3_eef_forceVisuoTactaile_front_wrist), or
+#                          several ':'-separated dirs recorded alike (same fps and sensors) to train as one, e.g.
+#                          /data/jiang/ar3_eef_forceVisuoTactaile_plugIn:/data/jiang/ar3_eef_forceVisuoTactaile_plugIn_35
+#   OPENPI_AR3_ASSET_ID    norm stats id, assets/<config>/<asset_id>/ (default: the dataset dir names joined by '+')
 #   OPENPI_AR3_WEIGHT_PATH initialization params (default: /data/jiang/checkpoints/openpi-assets/checkpoints/pi05_base/params)
 #   OPENPI_CUDA_VISIBLE_DEVICES  GPUs (default 0,1,2); fsdp devices = number of GPUs
 #   OPENPI_BATCH_SIZE      global batch, divisible by the GPU count (default 96 = 32 per H100)
@@ -52,7 +55,21 @@ if ((BATCH_SIZE % NUM_GPUS != 0)); then
 fi
 
 export OPENPI_AR3_REPO_ID="${OPENPI_AR3_REPO_ID:-/data/jiang/ar3_eef_forceVisuoTactaile_front_wrist}"
-export OPENPI_AR3_ASSET_ID="${OPENPI_AR3_ASSET_ID:-$(basename "${OPENPI_AR3_REPO_ID}")}"
+# ':'-separated datasets are read as one (src/openpi/training/config.py) with statistics named after all of them.
+IFS=: read -r -a DATASET_ENTRIES <<<"${OPENPI_AR3_REPO_ID}"
+DATASET_NAMES=()
+DATASET_INFOS=()
+for dataset in "${DATASET_ENTRIES[@]}"; do
+    if [[ -n "${dataset}" ]]; then
+        DATASET_NAMES+=("$(basename "${dataset}")")
+        DATASET_INFOS+=("${dataset}/meta/info.json")
+    fi
+done
+if ((${#DATASET_NAMES[@]} == 0)); then
+    echo "OPENPI_AR3_REPO_ID=${OPENPI_AR3_REPO_ID} names no dataset" >&2
+    exit 1
+fi
+export OPENPI_AR3_ASSET_ID="${OPENPI_AR3_ASSET_ID:-$(IFS=+; echo "${DATASET_NAMES[*]}")}"
 export OPENPI_AR3_WEIGHT_PATH="${OPENPI_AR3_WEIGHT_PATH:-/data/jiang/checkpoints/openpi-assets/checkpoints/pi05_base/params}"
 # paligemma_tokenizer.model is read from ${OPENPI_DATA_HOME}/big_vision/.
 export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-${HOME}/.cache/openpi}"
@@ -75,7 +92,7 @@ run() {
     fi
 }
 
-for path in "${OPENPI_AR3_REPO_ID}/meta/info.json" "${OPENPI_AR3_WEIGHT_PATH}" "${OPENPI_DATA_HOME}/big_vision/paligemma_tokenizer.model" "${PYTHON}"; do
+for path in "${DATASET_INFOS[@]}" "${OPENPI_AR3_WEIGHT_PATH}" "${OPENPI_DATA_HOME}/big_vision/paligemma_tokenizer.model" "${PYTHON}"; do
     if [[ ! -e "${path}" ]]; then
         echo "Missing ${path}" >&2
         exit 1
@@ -95,9 +112,10 @@ if ((FREE_GB < 100)); then
     echo "WARNING: less than 100 GB free; checkpoint saving may fail. Set OPENPI_CHECKPOINT_BASE_DIR to a larger disk." >&2
 fi
 
-# 1) Normalization statistics (state / actions / measured force), computed once per dataset on the CPU.
+# 1) Normalization statistics (state / actions / measured force), computed once per dataset (combination) on the CPU.
 NORM_STATS="${REPO_ROOT}/assets/${CONFIG_NAME}/${OPENPI_AR3_ASSET_ID}/norm_stats.json"
 if [[ ! -f "${NORM_STATS}" || "${OPENPI_RECOMPUTE_NORM_STATS:-0}" == "1" ]]; then
+    echo "Computing ${NORM_STATS}"
     run env JAX_PLATFORMS=cpu "${PYTHON}" scripts/compute_norm_stats.py --config-name "${CONFIG_NAME}"
 else
     echo "Using existing ${NORM_STATS}"
