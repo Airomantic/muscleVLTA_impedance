@@ -1,6 +1,6 @@
 from collections.abc import Callable
 import logging
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import einops
 import flax.nnx as nnx
@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 from typing_extensions import override
 
+from openpi.models import hand_encoder as _hand_encoder
 from openpi.models import model as _model
 from openpi.models import pi0_config
 from openpi.models import residual_policy as _residual_policy
@@ -127,6 +128,38 @@ def make_cross_attn_mask(spec_modules, *, use_force_history: bool = True):
     return attn_mask
 
 
+def make_sensor_cross_attn_mask(
+    sensor_valid: at.Bool[at.Array, "b r"],
+    *,
+    history_length: int,
+    latency: int,
+    use_force_history: bool = True,
+    num_streams: int = 1,
+) -> at.Bool[at.Array, "b 1 h m"]:
+    """Reactive cross-attention mask over time-aligned sensor streams (``r = history_length + h`` rows each).
+
+    Row j holds the reading at chunk step p = j - history_length. Action token i attends to it iff p <= i - latency
+    and the row is valid; without force history only the chunk-start reading (p = 0) is visible, as in
+    ``make_cross_attn_mask`` (which this reproduces for one stream without history). The streams share the row layout
+    and are concatenated along the memory axis (m = num_streams * r).
+    """
+    rows = sensor_valid.shape[-1]
+    steps = jnp.arange(rows) - history_length
+    visible = steps[None, :] <= jnp.arange(rows - history_length)[:, None] - latency
+    if not use_force_history:
+        visible = visible & (steps[None, :] == 0)
+    mask = visible[None] & sensor_valid.astype(bool)[:, None, :]
+    return jnp.tile(mask, (1, 1, num_streams))[:, None]
+
+
+class ReactiveContext(NamedTuple):
+    memory: jax.Array
+    cross_attn_mask: jax.Array
+    cross_positions: list[jax.Array]
+    # Finger contact logits [b, r, fingers] of the Tac G2 hand stream (None without it).
+    contact_logits: jax.Array | None = None
+
+
 @at.typecheck
 def posemb_sincos(
     pos: at.Real[at.Array, " b"], embedding_dim: int, min_period: float, max_period: float
@@ -155,6 +188,11 @@ class Pi0(_model.BaseModel):
         self.original_head = config.original_head
         self.use_force_history = config.use_force_history
         self.wrench_dim = config.wrench_dim
+        self.sensor_history = config.sensor_history
+        self.tactile_in_use = config.tactile_in_use
+        self.tactile_contact_depth = config.tactile_contact_depth
+        self.hand_dropout = config.hand_dropout
+        self.finger_dropout = config.finger_dropout
         self.cross_attention_latency = config.cross_attention_latency
         self.residual_image_keys = config.residual_image_keys
         self.residual_action_dim = len(config.residual_action_scale) if config.residual_policy_in_use else 0
@@ -207,7 +245,22 @@ class Pi0(_model.BaseModel):
             )
             wrench_gru.lazy_init(rngs=rngs, method="init")
             model_parts["wrench_gru"] = wrench_gru
+            if config.tactile_in_use:
+                hand_encoder = _hand_encoder.create_hand_encoder(
+                    width=action_expert_config.width,
+                    hidden_size=action_expert_config.width // 2,
+                    features=config.tactile_feature_dim,
+                    contact_depth=config.tactile_contact_depth,
+                    depth_shape=tuple(config.tactile_depth_shape),
+                    num_fingers=config.tactile_num_fingers,
+                )
+                hand_encoder.lazy_init(rngs=rngs, method="init")
+                model_parts["hand_encoder"] = hand_encoder
         self.PaliGemma = nnx.Dict(**model_parts)
+        if config.sensor_history or config.tactile_in_use:
+            # Added to the arm (and hand) stream tokens, which share time positions in the force memory.
+            num_streams = 2 if config.tactile_in_use else 1
+            self.sensor_stream_embedding = nnx.Param(jnp.zeros((num_streams, action_expert_config.width)))
 
         if config.residual_policy_in_use:
             self.residual_policy = create_residual_policy_submodule(config, rngs)
@@ -345,6 +398,74 @@ class Pi0(_model.BaseModel):
         if observation.wrench_mask is None:
             return jnp.ones((observation.wrench.shape[0],), dtype=jnp.bool_)
         return observation.wrench_mask
+
+    def _reactive_context(
+        self, observation: _model.Observation, rng: at.KeyArrayLike | None = None, *, train: bool = False
+    ) -> ReactiveContext:
+        """Force memory of the reactive expert with its cross-attention mask and positions.
+
+        LIFT (no sensor history, no hand stream): the wrench GRU tokens of the action horizon. muscleVLTA: the arm
+        (wrench GRU) and hand (``HandEncoder``) streams over the sensor history and the action horizon, each tagged by
+        a stream embedding; rows before the episode start are skipped by the GRUs and masked out.
+        """
+        if not (self.sensor_history or self.tactile_in_use):
+            memory = self._get_wrench_memory(observation)
+            cross_attn_mask, cross_positions = self._cross_context(observation)
+            return ReactiveContext(memory, cross_attn_mask, cross_positions)
+        if not self.cross_attention_latency:
+            raise ValueError("cross_attention_latency must be set")
+        if observation.wrench is None:
+            raise ValueError("muscleVLTA policies need the force readings ('wrench').")
+        batch_size, rows = observation.wrench.shape[:2]
+        if rows != self.sensor_history + self.action_horizon:
+            raise ValueError(f"Expected {self.sensor_history + self.action_horizon} sensor rows, got {rows}.")
+        valid = observation.sensor_valid
+        if valid is None:
+            valid = jnp.ones((batch_size, rows), dtype=jnp.bool_)
+
+        streams = [self.PaliGemma.wrench_gru(observation.wrench, valid=valid)]
+        contact_logits = None
+        if self.tactile_in_use:
+            if observation.tactile_depth is None:
+                raise ValueError("This policy uses the Tac G2 hand stream: the tactile readings are missing.")
+            finger_valid = observation.tactile_valid
+            if train and rng is not None:
+                finger_valid = self._drop_fingers(rng, finger_valid)
+            hand, contact_logits = self.PaliGemma.hand_encoder(
+                observation.tactile_depth,
+                finger_valid,
+                observation.tactile_wrench,
+                observation.gripper_aperture,
+                valid,
+            )
+            streams.append(hand)
+        stream_embedding = self.sensor_stream_embedding.value
+        memory = jnp.concatenate(
+            [stream + stream_embedding[i].astype(stream.dtype) for i, stream in enumerate(streams)], axis=1
+        )
+        memory = memory * self._get_wrench_mask(observation)[:, None, None].astype(memory.dtype)
+        cross_attn_mask = make_sensor_cross_attn_mask(
+            valid,
+            history_length=self.sensor_history,
+            latency=self.cross_attention_latency,
+            use_force_history=self.use_force_history,
+            num_streams=len(streams),
+        )
+        query_positions = self.sensor_history + jnp.arange(self.action_horizon, dtype=jnp.int32)
+        key_positions = jnp.tile(jnp.arange(rows, dtype=jnp.int32), len(streams))
+        cross_positions = [
+            jnp.broadcast_to(query_positions, (batch_size, self.action_horizon)),
+            jnp.broadcast_to(key_positions, (batch_size, key_positions.shape[0])),
+        ]
+        return ReactiveContext(memory, cross_attn_mask, cross_positions, contact_logits)
+
+    def _drop_fingers(self, rng: at.KeyArrayLike, finger_valid: jax.Array) -> jax.Array:
+        """Training-time sensor dropout, constant over a sample: the whole hand, or single fingers, become missing."""
+        hand_rng, finger_rng = jax.random.split(rng)
+        batch_size, _, fingers = finger_valid.shape
+        keep_hand = jax.random.bernoulli(hand_rng, 1.0 - self.hand_dropout, (batch_size, 1, 1))
+        keep_finger = jax.random.bernoulli(finger_rng, 1.0 - self.finger_dropout, (batch_size, 1, fingers))
+        return finger_valid & keep_hand & keep_finger
 
     def _get_residual_wrench_memory(self, wrench, wrench_mask, batch_size: int):
         if wrench is None:
@@ -637,10 +758,14 @@ class Pi0(_model.BaseModel):
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
             return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
+        sensor_rng = None
+        if self.tactile_in_use:
+            rng, sensor_rng = jax.random.split(rng)
         preprocess_rng, noise_rng, time_rng, reac_noise_rng = jax.random.split(rng, 4)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
-        wrench_memory = self._get_wrench_memory(observation)
-        cross_attn_mask, cross_positions = self._cross_context(observation)
+        wrench_memory, cross_attn_mask, cross_positions, _ = self._reactive_context(
+            observation, sensor_rng, train=train
+        )
 
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
@@ -788,8 +913,7 @@ class Pi0(_model.BaseModel):
             raise ValueError("reactive_get_k_actions requires reactive_in_use=True")
         observation = _model.preprocess_observation(None, observation, train=False)
         batch_size = observation.state.shape[0]
-        wrench_memory = self._get_wrench_memory(observation)
-        cross_attn_mask, cross_positions = self._cross_context(observation)
+        wrench_memory, cross_attn_mask, cross_positions, _ = self._reactive_context(observation)
 
         if prefix_tokens is None:
             prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
@@ -960,8 +1084,7 @@ class Pi0(_model.BaseModel):
         noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
         reac_noise = jax.random.normal(reac_rng, (batch_size, self.action_horizon, self.action_dim))
 
-        wrench_memory = self._get_wrench_memory(observation)
-        cross_attn_mask, cross_positions = self._cross_context(observation)
+        wrench_memory, cross_attn_mask, cross_positions, _ = self._reactive_context(observation)
         special_modules = [1, self.action_horizon] if ((not self.pi05) and self.use_state) else [0, self.action_horizon]
 
         _, kv_cache = self.PaliGemma.llm(

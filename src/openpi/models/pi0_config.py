@@ -34,6 +34,21 @@ class Pi0Config(_model.BaseModelConfig):
     # Per-step width of the force sequence fed to the wrench GRU (6 = TCP wrench only, as in LIFT).
     wrench_dim: int = 6
 
+    # muscleVLTA (reactive policies only; 0 / False keeps LIFT unchanged). The sensor readings are time-aligned rows:
+    # ``sensor_history`` steps before the chunk start followed by the action horizon.
+    sensor_history: int = 0
+    # Adds the Tac G2 hand stream (finger indentation maps + finger wrenches + gripper opening) to the force memory.
+    tactile_in_use: bool = False
+    tactile_depth_shape: tuple[int, int] = (48, 64)
+    tactile_num_fingers: int = 2
+    # Model-scale indentation above which a pixel counts as contact (0.2 = 0.05 raw Tac G2 depth; open-gripper
+    # noise peaks stay below 0.04 raw on the plug-insertion data).
+    tactile_contact_depth: float = 0.2
+    tactile_feature_dim: int = 256
+    # Training-time sensor dropout, constant over a sample: the whole hand, or each finger independently.
+    hand_dropout: float = 0.1
+    finger_dropout: float = 0.1
+
     # The residual branch reuses the frozen base-policy SigLIP. These settings
     # control only the trainable correction decoder and wrench encoder.
     residual_image_keys: tuple[str, ...] = ("left_wrist_0_rgb",)
@@ -62,6 +77,17 @@ class Pi0Config(_model.BaseModelConfig):
     def __post_init__(self):
         if self.reactive_in_use and self.residual_policy_in_use:
             raise ValueError("reactive_in_use and residual_policy_in_use cannot both be enabled.")
+        if self.sensor_history < 0:
+            raise ValueError("sensor_history must be non-negative.")
+        if self.sensor_history or self.tactile_in_use:
+            if not self.reactive_in_use:
+                raise ValueError("sensor_history and tactile_in_use require reactive_in_use=True.")
+            if not self.pi05 and self.use_state:
+                raise ValueError("sensor_history and tactile_in_use require pi05=True or use_state=False.")
+            if self.sensor_history and not self.use_force_history:
+                raise ValueError("use_force_history=False keeps only the chunk-start reading; drop sensor_history.")
+            if not (0.0 <= self.hand_dropout < 1.0 and 0.0 <= self.finger_dropout < 1.0):
+                raise ValueError("hand_dropout and finger_dropout must be in [0, 1).")
         if self.residual_policy_in_use:
             if not self.residual_image_keys:
                 raise ValueError("residual_image_keys must contain at least one image key.")
@@ -100,11 +126,25 @@ class Pi0Config(_model.BaseModelConfig):
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
         with at.disable_typechecking():
+            sensor_rows = self.sensor_history + self.action_horizon
             wrench_spec = (
-                jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.wrench_dim], jnp.float32)
+                jax.ShapeDtypeStruct([batch_size, sensor_rows, self.wrench_dim], jnp.float32)
                 if self.reactive_in_use or self.residual_policy_in_use
                 else None
             )
+            sensor_specs = {}
+            if self.sensor_history or self.tactile_in_use:
+                sensor_specs["sensor_valid"] = jax.ShapeDtypeStruct([batch_size, sensor_rows], jnp.bool_)
+            if self.tactile_in_use:
+                fingers = self.tactile_num_fingers
+                sensor_specs.update(
+                    tactile_depth=jax.ShapeDtypeStruct(
+                        [batch_size, sensor_rows, fingers, *self.tactile_depth_shape], jnp.float32
+                    ),
+                    tactile_valid=jax.ShapeDtypeStruct([batch_size, sensor_rows, fingers], jnp.bool_),
+                    tactile_wrench=jax.ShapeDtypeStruct([batch_size, sensor_rows, 6 * fingers], jnp.float32),
+                    gripper_aperture=jax.ShapeDtypeStruct([batch_size, sensor_rows, 1], jnp.float32),
+                )
             observation_spec = _model.Observation(
                 images={
                     "base_0_rgb": image_spec,
@@ -118,6 +158,7 @@ class Pi0Config(_model.BaseModelConfig):
                 },
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 wrench=wrench_spec,
+                **sensor_specs,
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
             )

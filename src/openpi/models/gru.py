@@ -7,12 +7,16 @@ class _LinenGRUCell(nn.Module):
     hidden_size: int
 
     @nn.compact
-    def __call__(self, carry, x):
+    def __call__(self, carry, inputs):
+        # ``inputs`` is ``x`` or ``(x, valid)``; invalid steps keep the previous hidden state.
+        x, valid = inputs if isinstance(inputs, tuple) else (inputs, None)
         h_prev = carry
         r = nn.sigmoid(nn.Dense(self.hidden_size, name="r_dense")(jnp.concatenate([x, h_prev], axis=-1)))
         z = nn.sigmoid(nn.Dense(self.hidden_size, name="z_dense")(jnp.concatenate([x, h_prev], axis=-1)))
         h_candidate = nn.tanh(nn.Dense(self.hidden_size, name="h_dense")(jnp.concatenate([x, r * h_prev], axis=-1)))
         h = (1 - z) * h_prev + z * h_candidate
+        if valid is not None:
+            h = jnp.where(valid[:, None], h, h_prev)
         return h, h
 
 
@@ -23,7 +27,8 @@ class _LinenGRUNetwork(nn.Module):
     input_size: int = 6
 
     @nn.compact
-    def __call__(self, inputs, initial_state=None):
+    def __call__(self, inputs, initial_state=None, valid=None):
+        """[B, T, input_size] -> [B, T, output_size]; ``valid`` ([B, T] bool) skips the invalid steps."""
         batch_size, sequence_length, _ = inputs.shape
         if initial_state is None:
             initial_state = jnp.zeros((batch_size, self.hidden_size))
@@ -39,7 +44,7 @@ class _LinenGRUNetwork(nn.Module):
             length=sequence_length,
         )(hidden_size=self.hidden_size)
 
-        _, hidden_states = scanned_gru(initial_state, inputs)
+        _, hidden_states = scanned_gru(initial_state, inputs if valid is None else (inputs, valid.astype(bool)))
         outputs = nn.Dense(self.output_size)(hidden_states)
         return jnp.array(outputs, dtype=jnp.bfloat16)
 

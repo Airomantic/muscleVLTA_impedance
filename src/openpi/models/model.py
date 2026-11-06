@@ -89,6 +89,16 @@ class Observation(Generic[ArrayT]):
     state: at.Float[ArrayT, "*b s"]
     wrench: at.Float[ArrayT, "*b t q"] | None = None
     wrench_mask: at.Bool[ArrayT, "*b"] | None = None
+    # muscleVLTA sensor readings, time-aligned with ``wrench`` (rows = sensor history + action horizon).
+    # False for the history rows before the episode start.
+    sensor_valid: at.Bool[ArrayT, "*b t"] | None = None
+    # Tac G2 indentation maps and per-finger validity (f = fingers).
+    tactile_depth: at.Float[ArrayT, "*b t f th tw"] | None = None
+    tactile_valid: at.Bool[ArrayT, "*b t f"] | None = None
+    # Concatenated finger wrenches, normalized.
+    tactile_wrench: at.Float[ArrayT, "*b t tq"] | None = None
+    # Gripper opening in [0, 1] (1 = fully open).
+    gripper_aperture: at.Float[ArrayT, "*b t 1"] | None = None
 
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
@@ -111,6 +121,11 @@ class Observation(Generic[ArrayT]):
             state=data["state"],
             wrench=data.get("wrench"),
             wrench_mask=data.get("wrench_mask"),
+            sensor_valid=data.get("sensor_valid"),
+            tactile_depth=data.get("tactile_depth"),
+            tactile_valid=data.get("tactile_valid"),
+            tactile_wrench=data.get("tactile_wrench"),
+            gripper_aperture=data.get("gripper_aperture"),
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
         )
@@ -193,6 +208,11 @@ def preprocess_observation(
         state=observation.state,
         wrench=observation.wrench,
         wrench_mask=observation.wrench_mask,
+        sensor_valid=observation.sensor_valid,
+        tactile_depth=observation.tactile_depth,
+        tactile_valid=observation.tactile_valid,
+        tactile_wrench=observation.tactile_wrench,
+        gripper_aperture=observation.gripper_aperture,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
     )
