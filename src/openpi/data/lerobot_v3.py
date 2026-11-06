@@ -11,7 +11,9 @@ This module reads v3.0 datasets directly with pyarrow and PyAV:
 Items follow the LeRobot v2.1 conventions used by openpi: the current frame of every numeric feature,
 ``sequence_length`` consecutive frames for the sequence keys (clamped at the episode end, with a ``<key>_is_pad``
 flag, like ``delta_timestamps`` in LeRobot v2.1), decoded uint8 HWC images for the video keys and the task string
-under ``"task"``.
+under ``"task"``. Sequence keys listed as history keys also hold the ``history_length`` frames before the current one
+(clamped at the episode start, also flagged in ``<key>_is_pad``), and ``LeRobotV3Options.tactile_cache`` adds the
+frame-aligned Tac G2 indentation maps (``openpi.data.tactile_cache``) over the same frames.
 """
 
 from __future__ import annotations
@@ -40,6 +42,12 @@ _NON_NUMERIC_DTYPES = frozenset({"video", "image", "string"})
 _BOOKKEEPING_KEYS = ("episode_index", "frame_index", "timestamp", "task_index", "index")
 _PLACEHOLDER_IMAGE_SHAPE = (16, 16, 3)
 
+# Item keys of the tactile cache: float16 [frames, sensors, h, w] maps, bool [frames, sensors] validity and the
+# bool [frames] episode padding flags.
+TACTILE_DEPTH_KEY = "observation.tactile_depth"
+TACTILE_VALID_KEY = "observation.tactile_valid"
+TACTILE_PAD_KEY = f"{TACTILE_DEPTH_KEY}_is_pad"
+
 
 @dataclasses.dataclass(frozen=True)
 class LeRobotV3Options:
@@ -64,6 +72,10 @@ class LeRobotV3Options:
     intervention_only: bool = False
     intervention_key: str = "control_flag"
     intervention_value: float = -1.0
+    # Frame-aligned Tac G2 indentation maps (scripts/build_ar3_tactile_cache.py): a cache directory, "auto" for the
+    # default cache of the dataset (<dataset>/tactile_cache/depth_48x64) or None. Items then hold the maps of the
+    # frames of the history keys (``TACTILE_DEPTH_KEY``, ``TACTILE_VALID_KEY``, ``TACTILE_PAD_KEY``).
+    tactile_cache: str | None = None
 
 
 def is_lerobot_v3_dataset(repo_id_or_root: str | os.PathLike[str]) -> bool:
@@ -237,13 +249,18 @@ class LeRobotV3Dataset:
         *,
         sequence_keys: Sequence[str] = (),
         sequence_length: int = 1,
+        history_keys: Sequence[str] = (),
+        history_length: int = 0,
         options: LeRobotV3Options | None = None,
     ):
         self.meta = LeRobotV3Metadata(repo_id_or_root)
         self.options = options or LeRobotV3Options()
         if sequence_length < 1:
             raise ValueError(f"sequence_length must be positive, got {sequence_length}")
+        if history_length < 0:
+            raise ValueError(f"history_length must not be negative, got {history_length}")
         self.sequence_length = int(sequence_length)
+        self.history_length = int(history_length)
 
         episodes = list(self.meta.episodes) if self.options.episodes is None else list(self.options.episodes)
         if missing_episodes := sorted(set(episodes) - set(self.meta.episodes)):
@@ -256,6 +273,9 @@ class LeRobotV3Dataset:
         if unknown := sorted(set(sequence_keys) - set(numeric_keys)):
             raise ValueError(f"Unknown sequence keys {unknown}. Numeric features: {numeric_keys}")
         self.sequence_keys = tuple(sequence_keys)
+        if unknown := sorted(set(history_keys) - set(self.sequence_keys)):
+            raise ValueError(f"History keys {unknown} are not sequence keys {list(self.sequence_keys)}")
+        self.history_keys = tuple(history_keys)
         self.video_keys = tuple(self.meta.video_keys if self.options.video_keys is None else self.options.video_keys)
         if unknown := sorted(set(self.video_keys) - set(self.meta.video_keys)):
             raise ValueError(f"Unknown video keys {unknown}. Video features: {self.meta.video_keys}")
@@ -277,10 +297,22 @@ class LeRobotV3Dataset:
             if not np.array_equal(self._arrays["frame_index"][start:end], np.arange(length)):
                 raise ValueError(f"Episode {episode_index}: frame indices are not consecutive from 0")
             self._episode_bounds[episode_index] = (start, end)
-        # Last row (inclusive) of the episode of every row, used to clamp sequences to the episode.
+        # First and last row (inclusive) of the episode of every row, used to clamp sequences to the episode.
+        self._episode_first_row = np.empty(len(episode_column), dtype=np.int64)
         self._episode_last_row = np.empty(len(episode_column), dtype=np.int64)
         for start, end in self._episode_bounds.values():
+            self._episode_first_row[start:end] = start
             self._episode_last_row[start:end] = end - 1
+
+        self._tactile = None
+        if self.options.tactile_cache is not None:
+            from openpi.data import tactile_cache as _tactile_cache
+
+            directory = self.options.tactile_cache
+            if directory == "auto":
+                directory = _tactile_cache.default_cache_dir(self.meta.root)
+            self._tactile = _tactile_cache.TactileCache(directory)
+            self._tactile.check_episodes({index: end - start for index, (start, end) in self._episode_bounds.items()})
 
         valid = np.ones(len(episode_column), dtype=bool)
         if self.options.require_valid:
@@ -308,13 +340,17 @@ class LeRobotV3Dataset:
         self._video_decoder: _VideoDecoder | None = None
 
         logger.info(
-            "Loaded LeRobot v3.0 dataset %s: %d episodes, %d frames (%d samples), sequences=%s x %d, videos=%s",
+            "Loaded LeRobot v3.0 dataset %s: %d episodes, %d frames (%d samples), sequences=%s x %d, "
+            "history=%s x %d, tactile=%s, videos=%s",
             self.meta.root,
             len(self.episode_indices),
             len(episode_column),
             len(self._samples),
             list(self.sequence_keys),
             self.sequence_length,
+            list(self.history_keys),
+            self.history_length,
+            self._tactile.directory if self._tactile is not None else None,
             list(self.video_keys) if self.options.decode_videos else "placeholders",
         )
 
@@ -363,8 +399,23 @@ class LeRobotV3Dataset:
         is_pad = rows > last_row
         rows = np.minimum(rows, last_row)
         for key in self.sequence_keys:
-            item[key] = self._arrays[key][rows]
-            item[f"{key}_is_pad"] = is_pad
+            if key not in self.history_keys:
+                item[key] = self._arrays[key][rows]
+                item[f"{key}_is_pad"] = is_pad
+        if self.history_keys or self._tactile is not None:
+            first_row = int(self._episode_first_row[row])
+            window = np.arange(row - self.history_length, row + self.sequence_length)
+            window_pad = (window < first_row) | (window > last_row)
+            window = np.clip(window, first_row, last_row)
+            for key in self.history_keys:
+                item[key] = self._arrays[key][window]
+                item[f"{key}_is_pad"] = window_pad
+            if self._tactile is not None:
+                # Frame indices are consecutive from 0 at the first row of an episode (checked in __init__).
+                item[TACTILE_DEPTH_KEY], item[TACTILE_VALID_KEY] = self._tactile.frames(
+                    episode_index, window - first_row
+                )
+                item[TACTILE_PAD_KEY] = window_pad
 
         timestamp = float(self._arrays["timestamp"][row])
         for key in self.video_keys:

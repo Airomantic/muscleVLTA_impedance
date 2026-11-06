@@ -121,7 +121,11 @@ def _create_lerobot_v3_dataset(
         repo_id,
         sequence_keys=action_sequence_keys,
         sequence_length=action_horizon,
-        options=_lerobot_v3.LeRobotV3Options(decode_videos=decode_videos, intervention_only=intervention_only),
+        history_keys=tuple(key for key in data_config.history_keys if key in available_features),
+        history_length=data_config.history_length,
+        options=_lerobot_v3.LeRobotV3Options(
+            decode_videos=decode_videos, intervention_only=intervention_only, tactile_cache=data_config.tactile_cache
+        ),
     )
     if data_config.prompt_from_task:
         return TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(meta.tasks)])
@@ -233,6 +237,8 @@ def create_torch_dataset(
         return MixtureDataset(dataset, dagger)
     if data_config.dagger_repo_ids:
         raise ValueError("dagger_repo_ids are only supported with a LeRobot v3.0 offline dataset.")
+    if data_config.history_length or data_config.tactile_cache is not None:
+        raise ValueError("history_length and tactile_cache are only supported with LeRobot v3.0 datasets.")
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     available_features = set(dataset_meta.features)

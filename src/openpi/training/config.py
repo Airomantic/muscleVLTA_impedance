@@ -146,6 +146,13 @@ class DataConfig:
     dagger_repo_ids: tuple[str, ...] = ()
     dagger_ratio: float = 0.5
 
+    # LeRobot v3.0 only: action sequence keys that also hold the ``history_length`` frames before the current one
+    # (sensor history of the muscleVLTA reactive memory), and the Tac G2 indentation map cache of the datasets
+    # (a directory or "auto", see ``LeRobotV3Options.tactile_cache``) loaded over the same frames.
+    history_keys: Sequence[str] = ()
+    history_length: int = 0
+    tactile_cache: str | None = None
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
