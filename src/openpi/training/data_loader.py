@@ -132,6 +132,55 @@ def _create_lerobot_v3_dataset(
     return dataset
 
 
+def _check_same_recording_setup(metas: Sequence[_lerobot_v3.LeRobotV3Metadata], sequence_keys: Sequence[str]) -> None:
+    """Datasets read as one must share the frame rate and the shapes of their common numeric features, and provide the
+    same sequence keys (a missing one would be dropped silently from that dataset's items)."""
+    first = metas[0]
+    first_keys = set(first.numeric_keys)
+    for meta in metas[1:]:
+        if meta.fps != first.fps:
+            raise ValueError(
+                f"{meta.root} is recorded at {meta.fps:g} fps but {first.root} at {first.fps:g} fps: action chunks "
+                "and sensor histories count frames, so these datasets cannot be trained as one."
+            )
+        keys = set(meta.numeric_keys)
+        for key in sequence_keys:
+            if (key in keys) != (key in first_keys):
+                having, lacking = (first, meta) if key in first_keys else (meta, first)
+                raise ValueError(f"{having.root} records {key} but {lacking.root} does not.")
+        for key in sorted(first_keys & keys):
+            shape, other_shape = list(first.features[key].get("shape", [])), list(meta.features[key].get("shape", []))
+            if not key.startswith("sync.") and shape != other_shape:
+                raise ValueError(f"{key} has shape {shape} in {first.root} but {other_shape} in {meta.root}.")
+
+
+def _create_offline_lerobot_v3_dataset(
+    data_config: _config.DataConfig, action_horizon: int, *, decode_videos: bool
+) -> Dataset:
+    """The LeRobot v3.0 dataset ``repo_id``, followed by the ``extra_repo_ids`` recorded alike, as one dataset."""
+    repo_ids = (data_config.repo_id, *data_config.extra_repo_ids)
+    if len(repo_ids) == 1:
+        return _create_lerobot_v3_dataset(data_config, action_horizon, decode_videos=decode_videos)
+    if data_config.tactile_cache not in (None, "auto"):
+        raise ValueError(
+            f"The tactile cache {data_config.tactile_cache} belongs to one dataset; use 'auto' (the own cache of every "
+            "dataset) with extra_repo_ids."
+        )
+    _check_same_recording_setup(
+        [_lerobot_v3.LeRobotV3Metadata(repo_id) for repo_id in repo_ids], data_config.action_sequence_keys
+    )
+    datasets = [
+        _create_lerobot_v3_dataset(data_config, action_horizon, decode_videos=decode_videos, repo_id=repo_id)
+        for repo_id in repo_ids
+    ]
+    logging.info(
+        "Reading %d LeRobot v3.0 datasets as one: %s",
+        len(datasets),
+        ", ".join(f"{repo_id} ({len(dataset)} samples)" for repo_id, dataset in zip(repo_ids, datasets, strict=True)),
+    )
+    return torch.utils.data.ConcatDataset(datasets)
+
+
 class MixtureDataset(Dataset):
     """A primary (offline) dataset followed by secondary (DAgger) datasets; ``MixtureSampler`` sets the ratio."""
 
@@ -225,7 +274,7 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
     if _lerobot_v3.is_lerobot_v3_dataset(repo_id):
-        dataset = _create_lerobot_v3_dataset(data_config, action_horizon, decode_videos=decode_videos)
+        dataset = _create_offline_lerobot_v3_dataset(data_config, action_horizon, decode_videos=decode_videos)
         if not data_config.dagger_repo_ids:
             return dataset
         dagger = [
@@ -235,6 +284,8 @@ def create_torch_dataset(
             for dagger_repo_id in data_config.dagger_repo_ids
         ]
         return MixtureDataset(dataset, dagger)
+    if data_config.extra_repo_ids:
+        raise ValueError(f"{repo_id} is not a local LeRobot v3.0 dataset, which extra_repo_ids need.")
     if data_config.dagger_repo_ids:
         raise ValueError("dagger_repo_ids are only supported with a LeRobot v3.0 offline dataset.")
     if data_config.history_length or data_config.tactile_cache is not None:

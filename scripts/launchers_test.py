@@ -181,6 +181,28 @@ def test_muscle_vlta_launcher_builds_the_tactile_cache_before_training(launcher_
     assert not (dataset / "tactile_cache").exists()
 
 
+def test_ar3_configs_train_every_listed_dataset_as_one(launcher_env):
+    root = SCRIPTS_DIR.parent
+    launcher_env.update(
+        {
+            "OPENPI_AR3_REPO_ID": "/data/plug_in:/data/plug_in_35:",
+            "JAX_PLATFORMS": "cpu",
+            "PYTHONPATH": f"{root / 'src'}:{root / 'packages/openpi-client/src'}",
+        }
+    )
+    script = (
+        "import json\nfrom openpi.training import config\n"
+        "configs = map(config.get_config, ['pi05_ar3_muscle_vlta', 'pi05_ar3_lift_reactive_dagger'])\n"
+        "print(json.dumps([[c.data.repo_id, c.data.base_config.extra_repo_ids, c.data.assets.asset_id] for c in configs]))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], env=launcher_env, cwd="/tmp", capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    expected = ["/data/plug_in", ["/data/plug_in_35"], "plug_in+plug_in_35"]
+    assert json.loads(result.stdout.splitlines()[-1]) == [expected, expected]
+
+
 def test_vscode_configurations_pass_arguments_the_launcher_and_scripts_accept(tmp_path, monkeypatch):
     root = SCRIPTS_DIR.parent
     text = (root / ".vscode" / "launch.json").read_text()

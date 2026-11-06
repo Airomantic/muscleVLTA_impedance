@@ -1,3 +1,4 @@
+import dataclasses
 import json
 
 import numpy as np
@@ -122,3 +123,63 @@ def test_dagger_corrections_are_mixed_one_to_one_with_offline_data(tmp_path):
     assert list(data_loader.MixtureSampler(24, 6, batch_size=8, ratio=0.5, seed=3)) == first
     with pytest.raises(ValueError, match="ratio"):
         data_loader.MixtureSampler(24, 6, batch_size=8, ratio=0.01)
+
+
+def test_offline_sessions_are_read_as_one_dataset(tmp_path):
+    human = recorder_lib.HUMAN_FLAG
+    # A later session with longer episodes (e.g. 35 s instead of 30 s) and its own task string.
+    _record(_recorder(tmp_path / "plug_in"), [human] * 12)
+    longer = recorder_lib.EpisodeRecorder(
+        tmp_path / "plug_in_35", task="Insert the plug", fps=FPS, image_size=(HEIGHT, WIDTH)
+    )
+    _record(longer, [human] * 14)
+    _record(longer, [human] * 14)
+    data_config = _config.DataConfig(
+        repo_id=str(tmp_path / "plug_in"), extra_repo_ids=(str(tmp_path / "plug_in_35"),), prompt_from_task=True
+    )
+    dataset = data_loader.create_torch_dataset(data_config, 4, None, decode_videos=False)
+    assert len(dataset) == 12 + 2 * 14
+    rows = [(dataset[i]["episode_index"], dataset[i]["frame_index"], dataset[i]["prompt"]) for i in (11, 12, 39)]
+    assert rows == [(0, 11, TASK), (0, 0, "Insert the plug"), (1, 13, "Insert the plug")]
+    np.testing.assert_array_equal(dataset[39]["actions_is_pad"], [False, True, True, True])
+
+    # DAgger post-training mixes its corrections with all offline sessions.
+    _record(_recorder(tmp_path / "dagger"), [human] * 6)
+    mixture = data_loader.create_torch_dataset(
+        dataclasses.replace(data_config, dagger_repo_ids=(str(tmp_path / "dagger"),)), 4, None, decode_videos=False
+    )
+    assert (mixture.primary_size, mixture.secondary_size) == (40, 6)
+
+
+def test_offline_sessions_must_be_recorded_alike(tmp_path):
+    _record(_recorder(tmp_path / "plug_in"), [1] * 4)
+
+    def read_with(other, **changes):
+        data_config = _config.DataConfig(
+            repo_id=str(tmp_path / "plug_in"),
+            extra_repo_ids=(str(other),),
+            action_sequence_keys=("actions", "observation.tau_m"),
+            **changes,
+        )
+        return data_loader.create_torch_dataset(data_config, 4, None, decode_videos=False)
+
+    fast = tmp_path / "fast"
+    _record(recorder_lib.EpisodeRecorder(fast, task=TASK, fps=15, image_size=(HEIGHT, WIDTH)), [1] * 4)
+    with pytest.raises(ValueError, match="15 fps"):
+        read_with(fast)
+    other = tmp_path / "other"
+    _record(_recorder(other), [1] * 4)
+    assert len(read_with(other)) == 8
+    with pytest.raises(ValueError, match="belongs to one dataset"):
+        read_with(other, tactile_cache=str(tmp_path / "cache"))
+    info_path = other / "meta" / "info.json"
+    info = json.loads(info_path.read_text())
+    tau_m = info["features"].pop("observation.tau_m")
+    info_path.write_text(json.dumps(info))
+    with pytest.raises(ValueError, match="records observation.tau_m but"):
+        read_with(other)
+    info["features"]["observation.tau_m"] = tau_m
+    info["features"]["observation.tcp_pose"]["shape"] = [7]
+    info_path.write_text(json.dumps(info))
+    with pytest.raises(ValueError, match=r"observation.tcp_pose has shape \[6\]"):
+        read_with(other)

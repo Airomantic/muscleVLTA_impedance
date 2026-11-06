@@ -61,11 +61,23 @@ _DEFAULT_TOWEL_CHECKPOINT_DIR = pathlib.Path(
 ).expanduser()
 _DEFAULT_TOWEL_REPO_ID = os.environ.get("OPENPI_TOWEL_REPO_ID", "flexiv/towelv3_100")
 _DEFAULT_TOWEL_ASSET_ID = os.environ.get("OPENPI_TOWEL_ASSET_ID", "flexiv/towelv3_100")
-# AR3 Cartesian impedance + DM V3 gripper presets (pi05_ar3_lift*): a local LeRobot v3.0 dataset directory, the
-# normalization asset id (assets/<config>/<asset_id>/norm_stats.json; default: the dataset directory name) and the
-# initialization params (default: pi05_base).
-_DEFAULT_AR3_REPO_ID = os.environ.get("OPENPI_AR3_REPO_ID", "/data/jiang/ar3_eef_forceVisuoTactaile_front_wrist")
-_DEFAULT_AR3_ASSET_ID = os.environ.get("OPENPI_AR3_ASSET_ID") or pathlib.Path(_DEFAULT_AR3_REPO_ID).name
+
+
+def _split_paths(value: str) -> tuple[str, ...]:
+    """':'-separated paths, as in PATH (empty entries are ignored)."""
+    return tuple(path for path in value.split(":") if path)
+
+
+# AR3 Cartesian impedance + DM V3 gripper presets (pi05_ar3_lift*): a local LeRobot v3.0 dataset directory, or several
+# ':'-separated ones of the same recording setup (e.g. sessions of 30 s and of 35 s episodes) trained as one dataset;
+# the normalization asset id (assets/<config>/<asset_id>/norm_stats.json; default: the dataset directory names joined
+# by '+', so every combination gets its own statistics) and the initialization params (default: pi05_base).
+_DEFAULT_AR3_REPO_IDS = _split_paths(os.environ.get("OPENPI_AR3_REPO_ID", "")) or (
+    "/data/jiang/ar3_eef_forceVisuoTactaile_front_wrist",
+)
+_DEFAULT_AR3_ASSET_ID = os.environ.get("OPENPI_AR3_ASSET_ID") or "+".join(
+    pathlib.Path(path).name for path in _DEFAULT_AR3_REPO_IDS
+)
 _DEFAULT_AR3_WEIGHT_PATH = os.environ.get(
     "OPENPI_AR3_WEIGHT_PATH", "/data/jiang/checkpoints/openpi-assets/checkpoints/pi05_base/params"
 )
@@ -73,9 +85,7 @@ _DEFAULT_AR3_WEIGHT_PATH = os.environ.get(
 # LeRobot v3.0 recordings of scripts/ar3_lift_robot_client.py --dagger, the per-batch share of their human-correction
 # chunks (LIFT 1:1 offline:online = 0.5), the offline checkpoint params to continue from and its assets directory
 # (<step>/assets, so the offline normalization statistics are reused).
-_DEFAULT_AR3_DAGGER_REPO_IDS = tuple(
-    path for path in os.environ.get("OPENPI_AR3_DAGGER_REPO_IDS", "").split(":") if path
-)
+_DEFAULT_AR3_DAGGER_REPO_IDS = _split_paths(os.environ.get("OPENPI_AR3_DAGGER_REPO_IDS", ""))
 _DEFAULT_AR3_DAGGER_RATIO = float(os.environ.get("OPENPI_AR3_DAGGER_RATIO", "0.5"))
 _DEFAULT_AR3_DAGGER_INIT_PARAMS = os.environ.get(
     "OPENPI_AR3_DAGGER_INIT_PARAMS", "<set OPENPI_AR3_DAGGER_INIT_PARAMS to the offline checkpoint <step>/params>"
@@ -139,6 +149,11 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+
+    # LeRobot v3.0 only: further offline datasets of the same recording setup (frame rate, sensor features), read
+    # together with repo_id as one dataset in which every frame is equally likely. Each keeps its own task prompts and
+    # tactile cache ("auto"); the normalization statistics cover all of them (scripts/compute_norm_stats.py).
+    extra_repo_ids: tuple[str, ...] = ()
 
     # DAgger post-training (LIFT stage two, LeRobot v3.0 only): robot rollout recordings with human corrections. Only
     # chunks recorded entirely under human control (control_flag == -1, LIFT --online-intervention-only) are used, and
@@ -651,8 +666,8 @@ def _ar3_lift_train_config(
         name=name,
         model=model,
         data=LeRobotAR3LiftDataConfig(
-            repo_id=_DEFAULT_AR3_REPO_ID,
-            base_config=DataConfig(prompt_from_task=True),
+            repo_id=_DEFAULT_AR3_REPO_IDS[0],
+            base_config=DataConfig(prompt_from_task=True, extra_repo_ids=_DEFAULT_AR3_REPO_IDS[1:]),
             extra_delta_transform=True,
             force_keys=force_keys,
             assets=AssetsConfig(asset_id=_DEFAULT_AR3_ASSET_ID),
@@ -691,6 +706,7 @@ def _ar3_lift_dagger_train_config(
             config.data,
             base_config=DataConfig(
                 prompt_from_task=True,
+                extra_repo_ids=_DEFAULT_AR3_REPO_IDS[1:],
                 dagger_repo_ids=_DEFAULT_AR3_DAGGER_REPO_IDS,
                 dagger_ratio=_DEFAULT_AR3_DAGGER_RATIO,
             ),
