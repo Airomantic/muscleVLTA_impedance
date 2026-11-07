@@ -2529,7 +2529,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     run.add_argument("--execute", action="store_true", help="move the arm and gripper (default: dry run, preview only)")
     run.add_argument("--check", action="store_true", help="check controller, cameras and gripper, then exit")
     run.add_argument(
-        "--max-chunks", type=int, default=30, help="1 s action chunks to run (recordings: 30 s); 0 = until Ctrl+C"
+        "--max-chunks",
+        type=int,
+        default=30,
+        help="action chunks to run (nominal seconds = chunks * action_horizon / control_hz); 0 = until Ctrl+C",
     )
     run.add_argument(
         "--move-to-start",
