@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from scripts import ar3_lift_robot_client as client
+from scripts.launchers_test import parse_jsonc
 
 
 def copy_pose(pose):
@@ -314,7 +315,7 @@ def test_invalid_home_file_stops_before_a_session_can_start(saved_home, capsys):
 
 
 def test_vscode_execute_configuration_passes_the_requested_saved_home_to_the_client():
-    launch = json.loads((Path(__file__).resolve().parents[1] / ".vscode" / "launch.json").read_text())
+    launch = parse_jsonc((Path(__file__).resolve().parents[1] / ".vscode" / "launch.json").read_text())
     configuration = next(config for config in launch["configurations"] if "--execute" in config["args"])
     args = configuration["args"]
     client_args = args[args.index("--") + 1 :]

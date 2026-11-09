@@ -235,6 +235,75 @@
                 "--", "--max-chunks", "3",
                 "--task=plug the two-pronged white charger on the table into the white socket, don't bump your fingers into other objects"
             ]
+        },
+        {
+            // 直接运行 scripts/train.py：配置、数据、初始权重和学习率同 scripts/train_ar3_muscle_vlta.sh 批量训练，
+            // 只改为 2 卡 FSDP、batch 32、主进程读数据（--num-workers 0，数据集和 transforms 里的断点才会停下）。
+            // 这组数据须先用该脚本训练过一次（已生成 Tac G2 缓存和 assets/ 下的 norm_stats.json）。
+            // --overwrite 每次清空 /data/jiang/train_checkpoints_debug/pi05_ar3_muscle_vlta/debug_2gpu，勿改成批量实验目录。
+            // train_step 经 jax.jit 编译：模型代码里的断点只在首次 trace 时停（只有形状）；看数值用 jax.debug.print。
+            "name": "muscleVLTA 训练调试：2 卡 FSDP（同批量训练）",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "program": "${workspaceFolder}/scripts/train.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "${input:trainDebugGpus}",
+                "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.95",
+                // 单机：NCCL 只走本机回环、不用 IB（同 scripts/train_ar3_lift_gpu012.sh）。
+                "NCCL_SOCKET_IFNAME": "lo",
+                "NCCL_IB_DISABLE": "1",
+                "PYTHONPATH": "${workspaceFolder}/src:${workspaceFolder}/packages/openpi-client/src",
+                "PYTHONUNBUFFERED": "1",
+                // 多个数据集用 : 分隔，norm stats 取 assets/pi05_ar3_muscle_vlta/<目录名用 + 连接>/。
+                "OPENPI_AR3_REPO_ID": "/data/jiang/ar3_eef_forceVisuoTactaile_plugIn:/data/jiang/ar3_eef_forceVisuoTactaile_plugIn_35"
+            },
+            "args": [
+                "pi05_ar3_muscle_vlta",
+                "--exp-name", "debug_2gpu",
+                "--checkpoint-base-dir", "/data/jiang/train_checkpoints_debug",
+                "--overwrite",
+                "--fsdp-devices", "2",
+                "--batch-size", "32",
+                "--num-workers", "0",
+                "--log-interval", "1",
+                "--no-wandb-enabled"
+            ]
+        },
+        {
+            // 只有 1 张空闲卡时：关闭 EMA（--ema-decay None）省下一份参数显存，batch 4；其余同上。
+            "name": "muscleVLTA 训练调试：1 卡（关 EMA，batch 4）",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "program": "${workspaceFolder}/scripts/train.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "${input:trainDebugGpu}",
+                "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.95",
+                "PYTHONPATH": "${workspaceFolder}/src:${workspaceFolder}/packages/openpi-client/src",
+                "PYTHONUNBUFFERED": "1",
+                "OPENPI_AR3_REPO_ID": "/data/jiang/ar3_eef_forceVisuoTactaile_plugIn:/data/jiang/ar3_eef_forceVisuoTactaile_plugIn_35"
+            },
+            "args": [
+                "pi05_ar3_muscle_vlta",
+                "--exp-name", "debug_1gpu",
+                "--checkpoint-base-dir", "/data/jiang/train_checkpoints_debug",
+                "--overwrite",
+                "--fsdp-devices", "1",
+                "--batch-size", "4",
+                "--ema-decay", "None",
+                "--num-workers", "0",
+                "--log-interval", "1",
+                "--no-wandb-enabled"
+            ]
         }
     ],
     "inputs": [
@@ -243,6 +312,18 @@
             "type": "promptString",
             "description": "DAgger 纠正数据集目录（LeRobot v3.0，已存在则追加；建议每轮一个；相对路径相对本仓库）",
             "default": "outputs/ar3_lift_dagger/round1"
+        },
+        {
+            "id": "trainDebugGpus",
+            "type": "promptString",
+            "description": "训练调试用的 2 张 GPU，逗号分隔（先用 nvidia-smi 确认空闲）",
+            "default": "6,7"
+        },
+        {
+            "id": "trainDebugGpu",
+            "type": "promptString",
+            "description": "训练调试用的 1 张 GPU（先用 nvidia-smi 确认空闲）",
+            "default": "7"
         }
     ]
 }

@@ -237,10 +237,45 @@ def test_ar3_configs_train_every_listed_dataset_as_one(launcher_env):
     assert json.loads(result.stdout.splitlines()[-1]) == [expected, expected]
 
 
+def parse_jsonc(text):
+    """VS Code's launch.json is JSONC: drop comments and trailing commas outside strings."""
+    pattern = r'("(?:\\.|[^"\\])*")|//[^\n]*|/\*.*?\*/|,(?=\s*[}\]])'
+    return json.loads(re.sub(pattern, lambda match: match[1] or "", text, flags=re.DOTALL))
+
+
+def check_debug_training(configuration, root, inputs):
+    """train.py's CLI accepts the arguments in the configuration's environment, which config.py reads on import."""
+
+    def resolve(value):
+        return inputs.get(value, value).replace("${workspaceFolder}", str(root))
+
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("OPENPI_")}
+    environment.update({name: resolve(value) for name, value in configuration["env"].items()}, JAX_PLATFORMS="cpu")
+    script = (
+        "import json\nfrom openpi.training import config\n"
+        "c = config.cli()\nprint(json.dumps([str(c.checkpoint_dir), c.batch_size, c.fsdp_devices]))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, *map(resolve, configuration["args"])],
+        env=environment,
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    checkpoint_dir, batch_size, fsdp_devices = json.loads(result.stdout.splitlines()[-1])
+    gpus = len(environment["CUDA_VISIBLE_DEVICES"].split(","))
+    assert batch_size % gpus == 0, configuration["name"]
+    assert gpus % fsdp_devices == 0, configuration["name"]
+    # --overwrite deletes the experiment directory: debugging must never point at the batch runs.
+    assert not Path(checkpoint_dir).is_relative_to("/data/jiang/train_checkpoints"), configuration["name"]
+
+
 def test_vscode_configurations_pass_arguments_the_launcher_and_scripts_accept(tmp_path, monkeypatch):
     root = SCRIPTS_DIR.parent
     text = (root / ".vscode" / "launch.json").read_text()
-    launch = json.loads(text)
+    launch = parse_jsonc(text)
     # The configurations name the saved home of the adjacent arm workspace.
     workspace = tmp_path / "muscleVLTA_impedance"
     saved_home = tmp_path / "ar3_CartesianImpedanceControl" / "config" / "cartesian_home.json"
@@ -264,6 +299,9 @@ def test_vscode_configurations_pass_arguments_the_launcher_and_scripts_accept(tm
     for config in launch["configurations"]:
         program = Path(config["program"].replace("${workspaceFolder}", str(root)))
         assert program.is_file(), config["name"]
+        if program.name == "train.py":
+            check_debug_training(config, root, inputs)
+            continue
         for name, value in config.get("env", {}).items():
             monkeypatch.setenv(name, value.replace("${workspaceFolder}", str(workspace)))
         args = [inputs.get(arg, arg).replace("${workspaceFolder}", str(workspace)) for arg in config["args"]]

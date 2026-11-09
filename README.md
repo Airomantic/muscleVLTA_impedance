@@ -413,6 +413,12 @@ episodes would train muscleVLTA with the fingers missing.
 传感服务和触觉桥，并检查两指的深度图与六维力；检查项使用 `--hardware skip`，需先运行 `./infer_oneclick.sh --tactile`。
 三项均设置 `OPENPI_CONFIG_NAME=pi05_ar3_muscle_vlta`，并在 `--` 之后用 `--task=` 指定插入任务提示词。
 
+**VS Code 训练调试**：`muscleVLTA 训练调试：2 卡 FSDP（同批量训练）` 直接运行 `scripts/train.py`，配置、数据、初始权重和
+学习率同 `scripts/train_ar3_muscle_vlta.sh`，改为 batch 32、`--num-workers 0`（数据集和 transforms 中的断点才会停下）、
+每步打印 loss；检查点写入 `/data/jiang/train_checkpoints_debug`，`--overwrite` 每次只清空该调试实验。只有一张空闲卡时选
+`muscleVLTA 训练调试：1 卡（关 EMA，batch 4）`。启动时输入空闲 GPU；数据集在配置的 `OPENPI_AR3_REPO_ID` 中修改，
+这组数据须先用启动脚本训练过一次（已有 Tac G2 缓存和 norm stats）。
+
 ## 🙏 Acknowledgements
 
 LIFT is built on [OpenPI (π₀/π₀.₅)](https://github.com/Physical-Intelligence/openpi).
