@@ -266,10 +266,16 @@ Fx, Fy, Fz, Tx, Ty, Tz) still awaits vendor or physical validation.
 
 **VS Code 本机真机调试**：打开本项目，在“运行和调试”中选择
 `AR3 LIFT：真机推理（回起点并执行）`，点击绿色三角或按 F5。配置位于
-[.vscode/launch.json](.vscode/launch.json)，默认加载 `infer_checkpoint/20000`、GPU 0、ROS domain 111。
-每个 Debug 配置的 `args` 都显式包含 `--task=Unplug ...`；切换任务时修改等号后的整段提示词，
+[.vscode/launch.json](.vscode/launch.json)，checkpoint 以对应配置的 `--checkpoint` 为准，GPU 0、ROS domain 111。
+每个 Debug 配置的 `args` 都显式包含 `--task=...`；切换任务时修改等号后的整段提示词，
 保留为一个 JSON 字符串，并放在参数分隔符 `--` 后。该提示词用于模型预热和每块动作推理；
 命令行的 `--prompt` 仍可作为同义参数使用。
+“真机推理（回起点并执行）”配置显式设置 `"--max-chunks", "35"`，在 `args` 中修改这个数字即可调节
+执行总块数。名义执行时长为 `max_chunks × action_horizon / control_hz`：当前模型每块 10 个动作，
+客户端默认 10 Hz，因此 30 块约 30 秒、35 块约 35 秒；实际耗时还包含各块的模型等待时间，
+模型加载、预热和回起点发生在执行循环之前。未指定该参数的入口仍默认执行 30 块。
+这个参数改变执行多少块，不改变模型每块预测的动作数 `action_horizon`；训练回合采集 30 秒或 35 秒
+也不等于每块预测 30 秒或 35 秒，无需为了延长本次执行而修改模型的动作窗口或控制频率。
 无需先激活 `.venv`：模型服务使用项目 Python 3.11，机器人客户端使用夹爪 Python 3.12 和 ROS Jazzy。
 启动器等待模型服务就绪，复用已有硬件，启动缺少的设备并检查传感器后，执行
 `--execute --move-to-start`（机械臂先回到录制项目保存的原点，随后机械臂和夹爪执行模型动作）。
