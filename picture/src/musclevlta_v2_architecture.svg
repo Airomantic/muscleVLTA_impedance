@@ -1,0 +1,361 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1000" height="690" viewBox="0 0 1000 690" font-family="Arial, Helvetica, 'Liberation Sans', 'Nimbus Sans', sans-serif">
+  <title>muscleVLTA v2: load-interaction decomposition of the arm force and stream-wise causal attention</title>
+  <defs>
+    <style>
+      .h { font-size: 15px; font-weight: bold; fill: #102A43; }
+      .m { font-size: 13px; font-weight: bold; fill: #102A43; }
+      .t { font-size: 12.5px; fill: #243B53; }
+      .n { font-size: 12px; fill: #52606D; }
+      .i { font-style: italic; }
+      .c { text-anchor: middle; }
+      .e { text-anchor: end; }
+      .bd { font-size: 11px; font-weight: bold; fill: #FFFFFF; text-anchor: middle; }
+      .x { font-size: 10px; fill: #52606D; }
+      .dash { fill: none; stroke: #6B7785; stroke-width: 1.2; stroke-dasharray: 3 2.5; }
+      .nw { font-size: 8.5px; font-weight: bold; fill: #FFFFFF; text-anchor: middle; }
+      .ln { fill: none; stroke: #4A5568; stroke-width: 1.2; stroke-linejoin: round; }
+      .tile { fill: #F7F9FB; stroke: #DDE3EA; stroke-width: 1; }
+      .pre { fill: #E9EEF5; stroke: #7C8DA6; stroke-width: 1.2; }
+      .vl { fill: #E3EDF9; stroke: #3B6FB6; stroke-width: 1.2; }
+      .arm { fill: #FDEBD7; stroke: #DD7A1E; stroke-width: 1.2; }
+      .hand { fill: #DDF3EE; stroke: #1E9E87; stroke-width: 1.2; }
+      .act { fill: #ECE6F8; stroke: #7A5BC2; stroke-width: 1.2; }
+      .card { fill: #FFFFFF; stroke: #CBD2DA; stroke-width: 1; }
+      .trn { fill: #FFFFFF; stroke: #6B7785; stroke-width: 1.2; stroke-dasharray: 4 3; }
+    </style>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" markerUnits="userSpaceOnUse" orient="auto">
+      <path d="M0 1 L10 5 L0 9 Z" fill="#4A5568"/>
+    </marker>
+    <marker id="ahS" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="5.5" markerHeight="5.5" markerUnits="userSpaceOnUse" orient="auto">
+      <path d="M0 1 L10 5 L0 9 Z" fill="#6B7785"/>
+    </marker>
+    <g id="new-tag"><rect width="26" height="12" rx="6" fill="#D7263D"/><text class="nw" x="13" y="9.2">NEW</text></g>
+  </defs>
+  <rect width="1000" height="690" fill="#FFFFFF"/>
+
+  <!-- ===================== (a) NETWORK ===================== -->
+  <rect class="tile" x="6" y="6" width="988" height="372" rx="10"/>
+  <text class="h" x="16" y="24">(a) muscleVLTA v2: balanced joint force fusion</text>
+  <use xlink:href="#new-tag" x="352" y="13.5"/>
+  <text class="n" x="383" y="23.5">marks the changes to muscleVLTA v1</text>
+  <rect x="12" y="32" width="582" height="110" rx="8" fill="#EEF4FB"/>
+  <rect x="12" y="148" width="582" height="224" rx="8" fill="#FCF6EC"/>
+
+  <!-- semantic lane -->
+  <text x="22" y="46" font-size="12" font-weight="bold" fill="#2F5D9E">SLOW · semantic stream · once per action chunk (1 Hz)</text>
+  <image x="20" y="51" width="64" height="48" xlink:href="frames/view_front.png"/>
+  <image x="88" y="51" width="64" height="48" xlink:href="frames/view_wrist.png"/>
+  <rect x="20" y="51" width="64" height="48" rx="4" fill="none" stroke="#3B6FB6" stroke-width="1"/>
+  <rect x="88" y="51" width="64" height="48" rx="4" fill="none" stroke="#3B6FB6" stroke-width="1"/>
+  <text class="n c" x="52" y="111">front view</text>
+  <text class="n c" x="120" y="111">wrist view</text>
+  <text class="n c" x="229" y="68">current RGB frames</text>
+  <path class="ln" d="M156 74 H304" marker-end="url(#ah)"/>
+  <text class="n c" x="229" y="88">2 × 224 × 224</text>
+  <rect x="22" y="116" width="268" height="20" rx="10" fill="#FFFFFF" stroke="#3B6FB6" stroke-width="1"/>
+  <text class="n i c" x="156" y="130">“plug the charger into the socket”</text>
+  <path class="ln" d="M290 126 H304" marker-end="url(#ah)"/>
+  <rect class="pre" x="306" y="60" width="120" height="28" rx="6"/>
+  <text class="m c" x="366" y="78.5">SigLIP So400m</text>
+  <rect class="pre" x="306" y="114" width="120" height="24" rx="6"/>
+  <text class="t c" x="366" y="130.5">Token embedding</text>
+  <path class="ln" d="M426 74 H440" marker-end="url(#ah)"/>
+  <path class="ln" d="M426 126 H440" marker-end="url(#ah)"/>
+  <g fill="#5B8FD4">
+    <rect x="444" y="69" width="7.5" height="10" rx="1.5"/><rect x="453" y="69" width="7.5" height="10" rx="1.5"/><rect x="462" y="69" width="7.5" height="10" rx="1.5"/><rect x="471" y="69" width="7.5" height="10" rx="1.5"/>
+    <rect x="480" y="69" width="7.5" height="10" rx="1.5"/><rect x="489" y="69" width="7.5" height="10" rx="1.5"/><rect x="498" y="69" width="7.5" height="10" rx="1.5"/><rect x="507" y="69" width="7.5" height="10" rx="1.5"/>
+  </g>
+  <g fill="#8DB3E6">
+    <rect x="519" y="69" width="7.5" height="10" rx="1.5"/><rect x="528" y="69" width="7.5" height="10" rx="1.5"/><rect x="537" y="69" width="7.5" height="10" rx="1.5"/><rect x="546" y="69" width="7.5" height="10" rx="1.5"/>
+    <rect x="555" y="69" width="7.5" height="10" rx="1.5"/><rect x="564" y="69" width="7.5" height="10" rx="1.5"/><rect x="573" y="69" width="7.5" height="10" rx="1.5"/><rect x="582" y="69" width="7.5" height="10" rx="1.5"/>
+  </g>
+  <text class="n c" x="517" y="94">2 × 256 image tokens</text>
+  <g fill="#BCD2F1">
+    <rect x="444" y="121" width="7.5" height="10" rx="1.5"/><rect x="453" y="121" width="7.5" height="10" rx="1.5"/><rect x="462" y="121" width="7.5" height="10" rx="1.5"/><rect x="471" y="121" width="7.5" height="10" rx="1.5"/>
+    <rect x="480" y="121" width="7.5" height="10" rx="1.5"/><rect x="489" y="121" width="7.5" height="10" rx="1.5"/><rect x="498" y="121" width="7.5" height="10" rx="1.5"/>
+  </g>
+  <text class="n" x="511" y="130">text tokens</text>
+  <path class="ln" d="M592 74 H604" marker-end="url(#ah)"/>
+  <path class="ln" d="M580 126 H604" marker-end="url(#ah)"/>
+
+  <!-- policy: three experts with shared self-attention -->
+  <rect class="pre" x="606" y="50" width="380" height="88" rx="8"/>
+  <text class="m c" x="796" y="82">Vision-language model (VLM)</text>
+  <text class="t c" x="796" y="99">PaliGemma · Gemma-2B · 18 layers</text>
+  <text class="n c" x="796" y="115">pre-trained π<tspan dy="3" font-size="9">0.5</tspan><tspan dy="-3">, fine-tuned</tspan></text>
+  <path class="ln" d="M646 138 V160" marker-end="url(#ah)"/>
+  <text class="n" x="654" y="153">prefix</text>
+  <path class="ln" d="M836 138 V258" marker-end="url(#ah)"/>
+  <text class="n c" transform="translate(853,198) rotate(-90)">shared self-attention</text>
+  <rect class="pre" x="606" y="162" width="200" height="74" rx="8"/>
+  <text class="m" x="618" y="180">Action expert</text>
+  <text class="n" x="618" y="195">Gemma-300M · flow matching</text>
+  <path d="M618 213 h105" fill="none" stroke="#C4BAE0" stroke-width="9" stroke-dasharray="9 1.5"/>
+  <text class="n" x="730" y="217">nominal</text>
+  <path class="ln" d="M646 236 V258" marker-end="url(#ah)"/>
+  <text class="n" x="654" y="251">future nominal tokens</text>
+  <rect class="act" x="606" y="260" width="260" height="108" rx="8"/>
+  <rect class="card" x="614" y="268" width="112" height="20" rx="4"/>
+  <text class="n c" x="670" y="282">Self-attention</text>
+  <path class="ln" d="M670 288 V295" stroke-width="1" marker-end="url(#ahS)"/>
+  <rect x="614" y="296" width="112" height="26" rx="4" fill="#FFFFFF" stroke="#7A5BC2" stroke-width="1.8"/>
+  <text class="c" x="670" y="313" font-size="12" font-weight="bold" fill="#4B2E9B">Stream-wise attn</text>
+  <use xlink:href="#new-tag" x="706" y="290"/>
+  <path class="ln" d="M670 322 V329" stroke-width="1" marker-end="url(#ahS)"/>
+  <rect class="card" x="614" y="330" width="112" height="20" rx="4"/>
+  <text class="n c" x="670" y="344">Feed-forward</text>
+  <text class="n c" x="670" y="363">× 18 layers</text>
+  <text class="m" x="742" y="280">Reactive expert</text>
+  <text class="n" x="742" y="295">Gemma-300M, copied</text>
+  <text class="n" x="742" y="309">from the action expert</text>
+  <path d="M742 327 h105" fill="none" stroke="#7A5BC2" stroke-width="9" stroke-dasharray="9 1.5"/>
+  <text class="n" x="742" y="348">10 flow steps</text>
+  <path class="ln" d="M866 327 H880" marker-end="url(#ah)"/>
+  <rect class="act" x="882" y="286" width="104" height="82" rx="8"/>
+  <text class="m c" x="934" y="304">Action chunk</text>
+  <text class="n c" x="934" y="320">10 steps × 7-D</text>
+  <text class="n c" x="934" y="335">Δ TCP pose (6)</text>
+  <text class="n c" x="934" y="350">+ aperture (1)</text>
+  <!-- force lane: robot, arm stream, hand stream -->
+  <circle cx="27" cy="159" r="7.5" fill="#E4572E"/><text class="bd" x="27" y="163">1</text>
+  <text x="39" y="163" font-size="12" font-weight="bold" fill="#A85A08">FAST · joint force stream · every control step (10 Hz)</text>
+  <g id="robot">
+    <text class="n c" x="82" y="181">AR3 arm + Tac G2</text>
+    <image id="robot-photo" x="15" y="186" width="134" height="178.7" xlink:href="../forceVisuotactile_robot.svg"/>
+    <path d="M57 234 L154 222" fill="none" stroke="#FFFFFF" stroke-width="3" stroke-opacity="0.85"/>
+    <path d="M57 234 L154 222" fill="none" stroke="#DD7A1E" stroke-width="1.2"/>
+    <circle cx="57" cy="234" r="3.2" fill="#FFFFFF" stroke="#DD7A1E" stroke-width="1.6"/>
+    <path d="M52 305 L154 311" fill="none" stroke="#FFFFFF" stroke-width="3" stroke-opacity="0.85"/>
+    <path d="M52 305 L154 311" fill="none" stroke="#1E9E87" stroke-width="1.2"/>
+    <circle cx="52" cy="305" r="3.2" fill="#FFFFFF" stroke="#1E9E87" stroke-width="1.6"/>
+  </g>
+  <rect class="card" x="154" y="172" width="136" height="84" rx="6"/>
+  <circle cx="165" cy="184" r="4" fill="#E8853A"/>
+  <text class="m" x="174" y="188.5">Arm stream</text>
+  <text class="t i e" x="283" y="188.5">x</text>
+  <text class="n" x="162" y="204">joint torques τ (7)</text>
+  <text class="n" x="162" y="218">TCP wrench F (6)</text>
+  <rect x="162" y="225" width="120" height="24" rx="3" fill="#FFFBF5" stroke="#F0D9BF" stroke-width="1"/>
+  <path d="M222 226 V248" stroke="#B8A58F" stroke-width="1" stroke-dasharray="2 2"/>
+  <path d="M165 244 L171 243.5 L177 242.8 L183 245.5 L189 242.3 L195 242.9 L201 241.1 L207 239.8 L213 237.8 L219 235.8 L225 234.2 L231 232.8 L237 232.2 L243 232.7 L249 233.4 L255 234.2 L261 233.8 L267 232.9 L273 232.2 L279 228.5" fill="none" stroke="#E07B24" stroke-width="1.4" stroke-linejoin="round"/>
+  <path d="M165 228.7 L171 229.5 L177 230.4 L183 228.5 L189 231.1 L195 231.3 L201 232.8 L207 234.9 L213 238 L219 240.6 L225 242.8 L231 244.7 L237 245 L243 244.3 L249 243.7 L255 242.4 L261 242.7 L267 243.6 L273 244.4 L279 245.5" fill="none" stroke="#F2A65A" stroke-width="1.4" stroke-linejoin="round"/>
+  <rect class="card" x="154" y="264" width="136" height="102" rx="6"/>
+  <circle cx="165" cy="276" r="4" fill="#1E9E87"/>
+  <text class="m" x="174" y="280.5">Hand stream</text>
+  <g id="depth-tiles">
+    <image x="162" y="287" width="27" height="20.25" xlink:href="frames/tactile_depth_f0.png"/>
+    <image x="192" y="287" width="27" height="20.25" xlink:href="frames/tactile_change_f0.png"/>
+    <image x="225" y="287" width="27" height="20.25" xlink:href="frames/tactile_depth_f1.png"/>
+    <image x="255" y="287" width="27" height="20.25" xlink:href="frames/tactile_change_f1.png"/>
+    <path d="M162 287 h27 v20.25 h-27 Z M192 287 h27 v20.25 h-27 Z M225 287 h27 v20.25 h-27 Z M255 287 h27 v20.25 h-27 Z" fill="none" stroke="#9AA5B1" stroke-width="0.8"/>
+  </g>
+  <text class="n" x="161" y="322">2 × depth maps D, ΔD</text>
+  <text class="n" x="161" y="336">finger wrenches (2 × 6)</text>
+  <text class="n" x="161" y="350">gripper aperture (1)</text>
+  <!-- sensor encoders and the joint force memory -->
+  <path class="ln" d="M290 216 H298 V208 H304" marker-end="url(#ah)"/>
+  <path class="ln" d="M298 216 V236 H304" marker-end="url(#ah)"/>
+  <path class="ln" d="M290 309 H304" marker-end="url(#ah)"/>
+  <rect class="arm" x="306" y="196" width="120" height="24" rx="6" stroke-width="1.8"/>
+  <text class="m" x="313" y="212.5">Load token: <tspan font-style="italic" font-weight="normal">x</tspan><tspan dy="3" font-size="9" font-style="italic" font-weight="normal">ref</tspan></text>
+  <rect class="arm" x="306" y="224" width="120" height="24" rx="6" stroke-width="1.8"/>
+  <text class="m" x="313" y="240.5">Arm GRU: <tspan font-style="italic" font-weight="normal">x − x</tspan><tspan dy="3" font-size="9" font-style="italic" font-weight="normal">ref</tspan></text>
+  <use xlink:href="#new-tag" x="394" y="183"/>
+  <rect class="hand" x="306" y="282" width="120" height="54" rx="6" stroke-width="1.8"/>
+  <text class="m c" x="366" y="301">Contact-gated</text>
+  <text class="m c" x="366" y="316">hand encoder</text>
+  <text class="n c" x="366" y="330">detailed in (b)</text>
+  <circle cx="426" cy="282" r="7.5" fill="#E4572E"/><text class="bd" x="426" y="286">2</text>
+  <path class="ln" d="M426 208 H440" marker-end="url(#ah)"/>
+  <path class="ln" d="M426 236 H440" marker-end="url(#ah)"/>
+  <path class="ln" d="M426 309 H440" marker-end="url(#ah)"/>
+  <rect x="442" y="176" width="148" height="190" rx="8" fill="#FFFFFF" stroke="#7C8DA6" stroke-width="1.2"/>
+  <text class="m c" x="516" y="192">Joint force memory</text>
+  <rect x="448" y="203" width="10" height="10" rx="1.5" fill="#9C4A12"/>
+  <text class="n" x="464" y="212">sustained load (1 key)</text>
+  <path d="M448 236 h68" fill="none" stroke="#F5C08C" stroke-width="10" stroke-dasharray="5.6 1.2"/>
+  <path d="M519 236 h68" fill="none" stroke="#E07B24" stroke-width="10" stroke-dasharray="5.6 1.2"/>
+  <path d="M448.5 245 v4 h66 v-4 M519.5 245 v4 h66 v-4" fill="none" stroke="#7B8794" stroke-width="1"/>
+  <text class="n c" x="481.5" y="263">1 s history</text>
+  <text class="n c" x="552.5" y="263">chunk</text>
+  <circle cx="590" cy="176" r="7.5" fill="#E4572E"/><text class="bd" x="590" y="180">3</text>
+  <text class="n c" x="516" y="280">interaction force (above),</text>
+  <text class="n c" x="516" y="294">touch (below)</text>
+  <path d="M448 309 h68" fill="none" stroke="#9FDCCF" stroke-width="10" stroke-dasharray="5.6 1.2"/>
+  <path d="M519 309 h68" fill="none" stroke="#1E9E87" stroke-width="10" stroke-dasharray="5.6 1.2"/>
+  <text class="n c" x="516" y="333">2 × 20 + 1 keys (1024-D)</text>
+  <text class="n c" x="516" y="348">row-validity masks</text>
+  <path class="ln" d="M590 309 H612" marker-end="url(#ah)"/>
+  <g id="legend">
+    <rect class="card" x="874" y="150" width="112" height="124" rx="6"/>
+    <rect class="pre" x="882" y="158" width="14" height="10" rx="2"/><text class="n" x="902" y="167.5">pre-trained</text>
+    <rect class="arm" x="882" y="177" width="14" height="10" rx="2"/><text class="n" x="902" y="186.5">arm force</text>
+    <rect class="hand" x="882" y="196" width="14" height="10" rx="2"/><text class="n" x="902" y="205.5">touch</text>
+    <rect class="act" x="882" y="215" width="14" height="10" rx="2"/><text class="n" x="902" y="224.5">reactive policy</text>
+    <circle cx="889" cy="239" r="6.5" fill="#E4572E"/><text class="bd" x="889" y="243" font-size="10">1</text><text class="n" x="902" y="243.5">contribution</text>
+    <rect class="trn" x="882" y="253" width="14" height="10" rx="2"/><text class="n" x="902" y="262.5">training only</text>
+  </g>
+  <!-- ===================== (b) CONTACT-GATED HAND ENCODER ===================== -->
+  <rect class="tile" x="6" y="384" width="360" height="300" rx="10"/>
+  <circle cx="23.5" cy="397" r="7.5" fill="#E4572E"/><text class="bd" x="23.5" y="401">2</text>
+  <text class="h" x="36" y="402">(b) Contact-gated hand encoder</text>
+  <text class="n e" x="358" y="402">one finger shown</text>
+  <image x="16" y="426" width="28" height="21" xlink:href="frames/tactile_depth_f1.png"/>
+  <image x="47" y="426" width="28" height="21" xlink:href="frames/tactile_change_f1.png"/>
+  <path d="M16 426 h28 v21 h-28 Z M47 426 h28 v21 h-28 Z" fill="none" stroke="#9AA5B1" stroke-width="0.8"/>
+  <text class="n" x="16" y="461">D, ΔD (48 × 64)</text>
+  <rect x="16" y="474" width="28" height="21" rx="2" fill="#FFFFFF" stroke="#9AA5B1" stroke-width="0.8"/>
+  <ellipse cx="30" cy="484.5" rx="8.5" ry="5" transform="rotate(-20 30 484.5)" fill="#DDF3EE" stroke="#1E9E87" stroke-width="1.2"/>
+  <path d="M20.6 487.9 L39.4 481.1 M28.5 480.3 L31.5 488.7" stroke="#1E9E87" stroke-width="0.8"/>
+  <circle cx="30" cy="484.5" r="1.7" fill="#0E6B5B"/>
+  <text class="t i" x="50" y="489">g(D)</text>
+  <text class="n" x="16" y="509">8 patch features</text>
+  <rect x="16" y="522" width="28" height="21" rx="2" fill="#FFFFFF" stroke="#9AA5B1" stroke-width="0.8"/>
+  <path d="M23 538.5 V526.5 M23 538.5 H38 M23 538.5 L33 530" fill="none" stroke="#1E9E87" stroke-width="1.4" stroke-linecap="round"/>
+  <circle cx="23" cy="538.5" r="1.8" fill="#0E6B5B"/>
+  <text class="t i" x="50" y="537">w</text>
+  <text class="n" x="16" y="557">wrench (6-D)</text>
+  <path class="ln" d="M79 436.5 H122" marker-end="url(#ah)"/>
+  <path class="ln" d="M82 484.5 H122" marker-end="url(#ah)"/>
+  <path class="ln" d="M64 532.5 H122" marker-end="url(#ah)"/>
+  <rect class="card" x="124" y="424.5" width="76" height="24" rx="5"/><text class="t c" x="162" y="441">3 × Conv</text>
+  <rect class="card" x="124" y="472.5" width="76" height="24" rx="5"/><text class="t c" x="162" y="489">Linear</text>
+  <rect class="card" x="124" y="520.5" width="76" height="24" rx="5"/><text class="t c" x="162" y="537">MLP</text>
+  <path class="ln" d="M200 436.5 H224 V474.5" marker-end="url(#ah)"/>
+  <path class="ln" d="M200 484.5 H214" marker-end="url(#ah)"/>
+  <path class="ln" d="M200 532.5 H224 V494.5" marker-end="url(#ah)"/>
+  <circle cx="224" cy="484.5" r="8.5" fill="#FFFFFF" stroke="#4A5568" stroke-width="1.2"/>
+  <path d="M219.5 484.5 h9 M224 480 v9" stroke="#4A5568" stroke-width="1.2"/>
+  <path class="ln" d="M232.5 484.5 H242" marker-end="url(#ah)"/>
+  <rect class="card" x="244" y="472.5" width="70" height="24" rx="5"/><text class="t c" x="279" y="489">LayerNorm</text>
+  <path class="ln" d="M314 484.5 H340 V564" marker-end="url(#ah)"/>
+  <text class="t i" x="346" y="522">φ</text>
+  <path class="ln" d="M112 484.5 V590 H122" marker-end="url(#ah)"/>
+  <circle cx="112" cy="484.5" r="2" fill="#4A5568"/><circle cx="112" cy="532.5" r="2" fill="#4A5568"/>
+  <text class="n i e" x="105" y="594">g, w</text>
+  <rect class="trn" x="232" y="528" width="96" height="22" rx="5"/><text class="n c" x="280" y="543.5">label: max D &gt; δ</text>
+  <path class="dash" d="M280 550 V564" marker-end="url(#ahS)"/>
+  <rect class="hand" x="124" y="566" width="234" height="62" rx="6" stroke-width="1.8"/>
+  <text class="m" x="134" y="583">Contact gate</text>
+  <text class="t i" x="222" y="583">c = σ(MLP[g, w])</text>
+  <text class="t i" x="134" y="602">z = c · φ + (1 − c) · e<tspan dy="3" font-size="9">free</tspan></text>
+  <text class="n" x="134" y="620">no contact: <tspan font-style="italic">e</tspan><tspan dy="3" font-size="9" font-style="italic">free</tspan><tspan dy="-3"> ,  missing finger:</tspan><tspan font-style="italic" dx="4">e</tspan><tspan dy="3" font-size="9" font-style="italic">miss</tspan></text>
+  <path class="ln" d="M162 628 V640" marker-end="url(#ah)"/>
+  <rect x="16" y="642" width="180" height="22" rx="11" fill="#FFFFFF" stroke="#1E9E87" stroke-width="1.2"/>
+  <text class="t i c" x="106" y="657.5">[ z<tspan dy="3" font-size="9">1</tspan><tspan dy="-3"> , z</tspan><tspan dy="3" font-size="9">2</tspan><tspan dy="-3"> , c</tspan><tspan dy="3" font-size="9">1</tspan><tspan dy="-3"> , c</tspan><tspan dy="3" font-size="9">2</tspan><tspan dy="-3"> , aperture ]</tspan></text>
+  <path class="ln" d="M196 653 H212" marker-end="url(#ah)"/>
+  <rect class="hand" x="214" y="641" width="76" height="24" rx="6"/><text class="m c" x="252" y="657.5">Hand GRU</text>
+  <path class="ln" d="M290 653 H304" marker-end="url(#ah)"/>
+  <path d="M306 653 h51" fill="none" stroke="#1E9E87" stroke-width="10" stroke-dasharray="5.6 1.2"/>
+  <text class="n c" x="106" y="678">both fingers + gripper, per step</text>
+  <text class="n c" x="286" y="678">hand tokens (1024-D)</text>
+  <!-- ===================== (c) BALANCED FUSION ===================== -->
+  <rect class="tile" x="372" y="384" width="234" height="300" rx="10"/>
+  <circle cx="389.5" cy="397" r="7.5" fill="#E4572E"/><text class="bd" x="389.5" y="401">3</text>
+  <text class="h" x="402" y="402">(c) Balanced fusion</text>
+  <use xlink:href="#new-tag" x="546" y="391.5"/>
+  <text class="n" x="384" y="424">Arm reading <tspan font-style="italic">x</tspan> over the sensor window</text>
+  <rect x="384" y="431" width="210" height="62" rx="3" fill="#FFFFFF" stroke="#DDE3EA" stroke-width="1"/>
+  <path d="M392 478.5 L402.2 477.3 L412.4 475.5 L422.6 482.4 L432.8 474 L443.1 475.8 L453.3 471 L463.5 468 L473.7 462.9 L483.9 457.8 L494.1 453.6 L504.3 450 L514.5 448.5 L524.7 450 L534.9 451.5 L545.2 453.6 L555.4 452.7 L565.6 450.3 L575.8 448.5 L586 439.2 L586 478.5 Z" fill="#F5C08C" fill-opacity="0.65"/>
+  <path d="M392 478.5 H586" fill="none" stroke="#9C4A12" stroke-width="1.4" stroke-dasharray="4 2.5"/>
+  <path d="M392 478.5 L402.2 477.3 L412.4 475.5 L422.6 482.4 L432.8 474 L443.1 475.8 L453.3 471 L463.5 468 L473.7 462.9 L483.9 457.8 L494.1 453.6 L504.3 450 L514.5 448.5 L524.7 450 L534.9 451.5 L545.2 453.6 L555.4 452.7 L565.6 450.3 L575.8 448.5 L586 439.2" fill="none" stroke="#E07B24" stroke-width="1.6" stroke-linejoin="round"/>
+  <path d="M494.1 434 V490" fill="none" stroke="#4A5568" stroke-width="1" stroke-dasharray="3 2"/>
+  <circle cx="392" cy="478.5" r="2.6" fill="#9C4A12"/>
+  <text x="397" y="489.5" font-size="10" font-weight="bold" fill="#9C4A12">load</text>
+  <text x="508" y="470" font-size="10" font-weight="bold" fill="#A85A08">interaction</text>
+  <text class="x c" x="443" y="505">1 s history</text>
+  <text class="x c" x="540" y="505">action chunk</text>
+  <text class="n" x="384" y="521"><tspan font-style="italic">x</tspan><tspan dy="3" font-size="9" font-style="italic">ref</tspan><tspan dy="-3">: first valid reading of the window</tspan></text>
+  <text class="n" x="384" y="535">= load (posture, payload, sensor bias)</text>
+  <path d="M384 544 H594" stroke="#DDE3EA" stroke-width="1"/>
+  <text class="m" x="384" y="560">Stream-wise attention</text>
+  <g id="stream-attention">
+    <text class="x e" x="432" y="579.5">load</text>
+    <rect x="448" y="571" width="10" height="10" rx="1.5" fill="#9C4A12"/>
+    <text class="x e" x="432" y="597.5">interaction</text>
+    <path d="M438 594 h30" fill="none" stroke="#E07B24" stroke-width="10" stroke-dasharray="5 1.25"/>
+    <text class="x e" x="432" y="615.5">touch</text>
+    <path d="M438 612 h30" fill="none" stroke="#1E9E87" stroke-width="10" stroke-dasharray="5 1.25"/>
+    <path class="ln" d="M470 576 H484" marker-end="url(#ah)"/>
+    <path class="ln" d="M470 594 H484" marker-end="url(#ah)"/>
+    <path class="ln" d="M470 612 H484" marker-end="url(#ah)"/>
+    <rect class="card" x="486" y="569" width="46" height="14" rx="4"/><text class="x c" x="509" y="579.5">softmax</text>
+    <rect class="card" x="486" y="587" width="46" height="14" rx="4"/><text class="x c" x="509" y="597.5">softmax</text>
+    <rect class="card" x="486" y="605" width="46" height="14" rx="4"/><text class="x c" x="509" y="615.5">softmax</text>
+    <path class="ln" d="M532 576 H552 V585" marker-end="url(#ah)"/>
+    <path class="ln" d="M532 594 H543" marker-end="url(#ah)"/>
+    <path class="ln" d="M532 612 H552 V603" marker-end="url(#ah)"/>
+    <circle cx="552" cy="594" r="8.5" fill="#FFFFFF" stroke="#4A5568" stroke-width="1.2"/>
+    <path d="M547.5 594 h9 M552 589.5 v9" stroke="#4A5568" stroke-width="1.2"/>
+    <path class="ln" d="M560.5 594 H576" marker-end="url(#ah)"/>
+    <rect x="578" y="589" width="12" height="10" rx="2" fill="#7A5BC2"/>
+    <text class="x c" x="584" y="583" font-style="italic">a<tspan dy="2.5" font-size="8">i</tspan></text>
+  </g>
+  <text class="n" x="384" y="634">One softmax per stream, outputs</text>
+  <text class="n" x="384" y="648">summed: streams do not compete</text>
+  <text class="n" x="384" y="662">for attention. Same latency mask</text>
+  <text class="n" x="384" y="676">as v1 (there: one softmax over all).</text>
+  <!-- ===================== (d) TRAINING OBJECTIVES ===================== -->
+  <rect class="tile" x="612" y="384" width="188" height="300" rx="10"/>
+  <text class="h" x="622" y="402">(d) Training objectives</text>
+  <rect class="pre" x="620" y="412" width="172" height="58" rx="6"/>
+  <text class="m" x="629" y="429">Flow matching × 2</text>
+  <text class="n" x="629" y="445">nominal + reactive expert,</text>
+  <text class="n" x="629" y="460">velocity target ε − a</text>
+  <rect class="trn" x="620" y="480" width="172" height="116" rx="6"/>
+  <circle cx="621" cy="481" r="7.5" fill="#E4572E"/><text class="bd" x="621" y="485">4</text>
+  <text class="m" x="635" y="497">Forward model</text>
+  <rect class="card" x="628" y="505" width="36" height="20" rx="4"/>
+  <text class="t i c" x="646" y="519.5">m<tspan dy="3" font-size="9">p</tspan></text>
+  <text class="t c" x="672" y="519.5">+</text>
+  <rect class="card" x="680" y="505" width="58" height="20" rx="4"/>
+  <text class="t i c" x="709" y="519.5">a<tspan dy="3" font-size="9">p−1</tspan><tspan dy="-3"> , a</tspan><tspan dy="3" font-size="9">p</tspan></text>
+  <path class="ln" d="M738 515 H750" marker-end="url(#ah)"/>
+  <rect class="card" x="752" y="505" width="34" height="20" rx="4"/><text class="t c" x="769" y="519.5">MLP</text>
+  <path class="ln" d="M769 525 V539 H742" marker-end="url(#ah)"/>
+  <text class="n" x="629" y="543">predicts step p + 1:</text>
+  <text class="n" x="629" y="558">interaction force, finger</text>
+  <text class="n" x="629" y="573">wrenches, patch geometry,</text>
+  <text class="n" x="629" y="588">contact; Huber + BCE, × 0.1</text>
+  <rect class="card" x="620" y="604" width="172" height="72" rx="6"/>
+  <text class="n" x="629" y="621">Contact gate: BCE (× 0.05)</text>
+  <text class="n" x="629" y="637">Sensor dropout: hand 10%,</text>
+  <text class="n" x="629" y="651">finger 10%, arm <tspan font-style="italic">p</tspan></text>
+  <use xlink:href="#new-tag" x="730" y="641.5"/>
+  <text class="n" x="629" y="668">AdamW, lr 5e-5, EMA 0.999</text>
+
+  <!-- ===================== (e) REAL-ROBOT ROLLOUT ===================== -->
+  <rect class="tile" x="806" y="384" width="188" height="300" rx="10"/>
+  <text class="h" x="816" y="402">(e) Real-robot rollout</text>
+  <text class="n" x="816" y="420">VLM prefix: once per chunk</text>
+  <rect x="822" y="426" width="14" height="9" rx="2" fill="#5B8FD4"/>
+  <path d="M838 430.5 H980" fill="none" stroke="#5B8FD4" stroke-width="1.4" stroke-dasharray="4 3"/>
+  <text class="n" x="816" y="452">sensors: every 0.1 s</text>
+  <g fill="#E8853A" stroke="#1E9E87" stroke-width="1.6">
+    <circle cx="829" cy="461" r="3.6"/><circle cx="845" cy="461" r="3.6"/><circle cx="861" cy="461" r="3.6"/><circle cx="877" cy="461" r="3.6"/><circle cx="893" cy="461" r="3.6"/>
+    <circle cx="909" cy="461" r="3.6"/><circle cx="925" cy="461" r="3.6"/><circle cx="941" cy="461" r="3.6"/><circle cx="957" cy="461" r="3.6"/><circle cx="973" cy="461" r="3.6"/>
+  </g>
+  <g fill="none" stroke="#8793A1" stroke-width="0.9">
+    <path d="M831 466 L875 483" marker-end="url(#ahS)"/><path d="M847 466 L891 483" marker-end="url(#ahS)"/><path d="M863 466 L907 483" marker-end="url(#ahS)"/><path d="M879 466 L923 483" marker-end="url(#ahS)"/>
+    <path d="M895 466 L939 483" marker-end="url(#ahS)"/><path d="M911 466 L955 483" marker-end="url(#ahS)"/><path d="M927 466 L971 483" marker-end="url(#ahS)"/>
+  </g>
+  <g fill="#7A5BC2">
+    <rect x="823" y="485" width="12" height="10" rx="2" fill="#B9A9E3"/><rect x="839" y="485" width="12" height="10" rx="2" fill="#B9A9E3"/><rect x="855" y="485" width="12" height="10" rx="2" fill="#B9A9E3"/>
+    <rect x="871" y="485" width="12" height="10" rx="2"/><rect x="887" y="485" width="12" height="10" rx="2"/><rect x="903" y="485" width="12" height="10" rx="2"/><rect x="919" y="485" width="12" height="10" rx="2"/>
+    <rect x="935" y="485" width="12" height="10" rx="2"/><rect x="951" y="485" width="12" height="10" rx="2"/><rect x="967" y="485" width="12" height="10" rx="2"/>
+  </g>
+  <text class="n" x="816" y="511">action i reads rows ≤ i − 3</text>
+  <rect class="act" x="816" y="522" width="168" height="40" rx="6"/>
+  <text class="m" x="825" y="538">Policy server</text>
+  <text class="n" x="825" y="554">10 flow steps per request</text>
+  <path class="ln" d="M852 562 V580" marker-end="url(#ah)"/>
+  <text class="x" x="859" y="575">Δ pose → TCP target</text>
+  <rect class="pre" x="816" y="582" width="168" height="40" rx="6"/>
+  <text class="m" x="825" y="598">Robot client, 10 Hz</text>
+  <text class="n" x="825" y="614">impedance control, 100 Hz</text>
+  <path class="ln" d="M984 602 H989 V461 H979" marker-end="url(#ah)"/>
+  <text class="n" x="816" y="641">Same client and requests as v1;</text>
+  <text class="n" x="816" y="655">the load is re-read from the 1 s</text>
+  <text class="n" x="816" y="669">history at every request.</text>
+</svg>
