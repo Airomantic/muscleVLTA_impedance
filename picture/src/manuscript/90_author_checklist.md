@@ -16,13 +16,13 @@ This page is for the authors and is not part of the paper. It lists where every 
 
 ### B. Still missing (yellow in the paper)
 
-**B1.** Baseline counts for Table 1 at both start distances (LIFT, ForceVLA2, GR00T), π_{0.5} and the model without touch from the near start, and for every baseline its inputs on this robot and its training budget. State which GR00T version was run: the code of GR00T 2 is announced for December 2026, the versions that can be fine-tuned today are N1.5 to N1.7.
+**B1.** Baseline counts for Table 1 at both start distances (LIFT, ForceVLA2, GR00T), π_{0.5} and the model without touch from the near start, and for every baseline its inputs on this robot and its training budget. State which GR00T version was run: the code of GR00T 2 is announced for December 2026, the versions that can be fine-tuned today are N1.5 to N1.7. With 60 trials per cell a baseline is significantly below muscleVLTA (Fisher's exact test, *p* < 0.05) only at 4/60 or fewer from the far start and at 46/60 or fewer from the near start; report the test wherever a difference is claimed.
 
 **B2.** Evaluation protocol: success criterion, time limit, variation of start and plug poses, and the evaluated checkpoint step.
 
 **B3.** Number of demonstrations: the sets used for training hold 130 insertion episodes (65 + 65) and 84 unplugging episodes; the earlier abstract said 120.
 
-**B4.** Test-time touch ablation: run the evaluated checkpoint with both fingers masked (add --mask-tactile to scripts/run_ar3_lift_robot.sh; same server, same protocol, 60 trials from the far start). This decides whether the paper may say that touch is needed in training only (Section 4.3), and it is the first experiment a reviewer will ask for. It needs no training.
+**B4.** Test-time touch ablation: run the evaluated checkpoint with both fingers masked (add --mask-tactile to scripts/run_ar3_lift_robot.sh; same server, same protocol, 60 trials from the far start). This decides whether the paper may say that touch is needed in training only (Section 4.3), and it is the first experiment a reviewer will ask for. It needs no training. A masked result between 5/60 and 23/60 does not differ significantly from 13/60 and supports “needed in training only”; 4/60 or fewer shows that the policy does use touch at test time, and Sections 4.3 and 5 must then be rewritten.
 
 **B5.** Real-robot result of balanced fusion. The full training (config pi05_ar3_muscle_vlta_v2, run muscle_vlta_v2_3sets) was started on 10 November 2026; evaluate a checkpoint with the same 60-trial protocol and check its held-out error with scripts/ar3_sensor_attribution.py --holdout-every 8.
 
