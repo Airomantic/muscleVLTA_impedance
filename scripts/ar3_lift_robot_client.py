@@ -1528,6 +1528,8 @@ def sensor_reading(robot: Any, force: np.ndarray, gripper_position: float, confi
     reading = {"wrench": np.asarray(force, dtype=np.float32), "sensor_valid": np.True_}
     if config.tactile:
         depth, valid, wrench = robot.hand_reading(max_age=config.max_tactile_age)
+        if config.mask_tactile:
+            depth, valid, wrench = np.zeros_like(depth), np.zeros_like(valid), np.zeros_like(wrench)
         reading.update(
             tactile_depth=depth,
             tactile_valid=valid,
@@ -1788,6 +1790,8 @@ class RunConfig:
     sensor_history: int = 0  # muscleVLTA: readings of the steps before each chunk sent with it (0: LIFT requests)
     tactile: bool = False  # muscleVLTA: every reading carries the Tac G2 fingers and the gripper opening
     max_tactile_age: float = MAX_TACTILE_AGE
+    # Ablation: the policy sees both fingers as missing (as under finger dropout); the gripper opening stays.
+    mask_tactile: bool = False
 
 
 def run_chunks(
@@ -2386,7 +2390,10 @@ class Session:
             assumed_gripper=args.assumed_gripper,
             sensor_history=sensor_history,
             tactile=tactile,
+            mask_tactile=args.mask_tactile,
         )
+        if tactile and args.mask_tactile:
+            logger.warning("--mask-tactile: the policy receives both Tac G2 fingers as missing (ablation run)")
         # Parameter/gripper setup can outlast the first camera samples. Wait for fresh observations while the
         # controller is still inactive; execution keeps the normal fail-fast sensor checks and age limits.
         robot.wait_ready(
@@ -2797,6 +2804,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     run = parser.add_argument_group("run")
     run.add_argument("--execute", action="store_true", help="move the arm and gripper (default: dry run, preview only)")
     run.add_argument("--check", action="store_true", help="check controller, cameras and gripper, then exit")
+    run.add_argument(
+        "--mask-tactile",
+        action="store_true",
+        help="ablation of tactile muscleVLTA policies: send both Tac G2 fingers as missing (the gripper opening "
+        "stays; the fingers must still run, so that everything else is unchanged)",
+    )
     run.add_argument(
         "--max-chunks",
         type=int,

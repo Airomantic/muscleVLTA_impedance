@@ -971,6 +971,24 @@ def test_run_chunks_sends_muscle_vlta_readings_with_the_episode_history():
         assert len(requests[-1]["wrench"]) >= history + HORIZON - planner.latency  # last action saw its readings
 
 
+def test_mask_tactile_sends_both_fingers_as_missing_and_keeps_the_other_readings():
+    robot = TactileRobot([np.zeros(13, dtype=np.float32)])
+    robot.measured = 2  # both fingers deliver samples
+    force = np.arange(13, dtype=np.float32)
+    config = client.RunConfig(sensor_history=10, tactile=True)
+    seen = client.sensor_reading(robot, force, 640.0, config)
+    assert seen["tactile_valid"].all()
+    assert seen["tactile_depth"].any()
+
+    masked = client.sensor_reading(robot, force, 640.0, dataclasses.replace(config, mask_tactile=True))
+    assert not masked["tactile_valid"].any()
+    assert not masked["tactile_depth"].any()
+    assert not masked["tactile_wrench"].any()
+    assert masked["tactile_depth"].dtype == seen["tactile_depth"].dtype
+    np.testing.assert_array_equal(masked["wrench"], force)
+    assert masked["gripper_aperture"] == seen["gripper_aperture"] == 640.0
+
+
 def test_gripper_resends_targets_after_someone_else_moved_the_fingers():
     gripper, _, log = _gripper()
     gripper.command(600)

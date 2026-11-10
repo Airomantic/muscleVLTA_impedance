@@ -8,6 +8,7 @@
 #   scripts/run_ar3_lift_robot.sh --max-chunks 3                # dry run: targets only on preview_command
 #   scripts/run_ar3_lift_robot.sh --execute --move-to-start     # MOVES the arm and gripper
 #   scripts/run_ar3_lift_robot.sh --execute --record-dir DIR    # MOVES; records each episode (LeRobot v3.0)
+#   scripts/run_ar3_lift_robot.sh --execute --mask-tactile      # MOVES; ablation: Tac G2 fingers sent as missing
 #   scripts/run_ar3_lift_robot.sh --execute --dagger --record-dir DIR   # DAgger (./infer_oneclick.sh --dagger)
 #   scripts/run_ar3_lift_robot.sh --help                        # all client options
 #
