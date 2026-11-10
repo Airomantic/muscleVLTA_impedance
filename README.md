@@ -419,6 +419,60 @@ episodes would train muscleVLTA with the fingers missing.
 `muscleVLTA 训练调试：1 卡（关 EMA，batch 4）`。启动时输入空闲 GPU；数据集在配置的 `OPENPI_AR3_REPO_ID` 中修改，
 这组数据须先用启动脚本训练过一次（已有 Tac G2 缓存和 norm stats）。
 
+### muscleVLTA v2: balanced joint force fusion
+
+`scripts/ar3_sensor_attribution.py` measures which sensor streams a trained policy uses: it samples every action chunk
+from the recorded readings and from counterfactual ones (a stream removed, or taken from another sample) with the same
+noise. The 141k-step `pi05_ar3_muscle_vlta` policy follows the *level* of the arm force and ignores the hand stream
+(512 chunks of its training episodes; change of the chunk in standard deviations of the recorded actions):
+
+| counterfactual readings | free space | finger in contact |
+| --- | --- | --- |
+| arm force level of another sample, changes kept | 0.32 | 0.45 |
+| arm force changes removed, level kept | 0.04 | 0.06 |
+| hand stream removed (Tac G2 + gripper opening) | 0.002 | 0.003 |
+
+The level of the 13D arm force is mostly the posture-dependent load (in free space the first three joint torques are
+predictable from the TCP pose, R² 0.85–0.95), so the policy reads it in place of the zeroed state.
+`pi05_ar3_muscle_vlta_v2` keeps the inputs, the losses and the robot client, and changes the fusion:
+
+* **Load–interaction decomposition**: the oldest valid arm reading of the sensor window becomes one load token, and the
+  wrench GRU reads the rows relative to it (the interaction force).
+* **Stream-wise attention**: the reactive cross-attention normalises its weights within each stream (load,
+  interaction, hand) and sums the streams, under the same latency mask.
+* `--model.arm-dropout P` (default 0) drops the interaction stream of a training sample.
+
+Pilots of 5k steps (batch 32, one seed, every 8th episode held out: 768 held-out chunks; action error = MSE of the
+normalized actions; free space / finger in contact):
+
+| policy | action error | with the arm level swapped | with the hand removed |
+| --- | --- | --- | --- |
+| `pi05_ar3_muscle_vlta` | 0.0505 / 0.0536 | +44% / +58% | +0.2% / +1.5% |
+| `pi05_ar3_muscle_vlta_v2` | 0.0498 / 0.0536 | +25% / +34% | +1.6% / +1.1% |
+| v2 with `--model.arm-dropout 0.3` | 0.0593 / 0.0641 | +10% / +16% | +1.2% / +4.1% |
+
+v2 matches the held-out action error of v1 and depends less on the force level. It does not lower the error, and the
+hand stream stays almost unused unless the arm stream is dropped in training, which costs accuracy at this training
+length. These are offline numbers of short runs, not robot success rates.
+
+```bash
+PLUG_IN_DATA=/data/jiang/ar3_eef_forceVisuoTactaile_plugIn:/data/jiang/ar3_eef_forceVisuoTactaile_plugIn_35
+# OPENPI_AR3_HOLDOUT_EVERY=8 keeps every 8th episode of each dataset out of training (validation split)
+OPENPI_CONFIG_NAME=pi05_ar3_muscle_vlta_v2 OPENPI_AR3_REPO_ID=$PLUG_IN_DATA OPENPI_AR3_HOLDOUT_EVERY=8 \
+  OPENPI_EXP_NAME=muscle_vlta_v2 bash scripts/train_ar3_muscle_vlta.sh
+# held-out action error and sensor use of a checkpoint (without --holdout-every: all episodes)
+.venv/bin/python scripts/ar3_sensor_attribution.py --config-name pi05_ar3_muscle_vlta_v2 --dataset $PLUG_IN_DATA \
+  --checkpoint /data/jiang/train_checkpoints/pi05_ar3_muscle_vlta_v2/muscle_vlta_v2/<step> --holdout-every 8
+```
+
+Serving, replay validation and the robot client are those of muscleVLTA above with
+`OPENPI_CONFIG_NAME=pi05_ar3_muscle_vlta_v2`.
+
+**Figures**: `picture/musclevlta_architecture.{svg,pdf,png}` (v1) and `picture/musclevlta_v2_architecture.*` are
+exported by `scripts/build_figures.py` from the editable sources in `picture/src/` (which link
+`picture/forceVisuotactile_robot.svg` and `picture/src/frames/`). The exported SVGs are single files that only use
+what PowerPoint and Word display; `scripts/build_figure_assets.py` extracts the recorded frames they show.
+
 ## 🙏 Acknowledgements
 
 LIFT is built on [OpenPI (π₀/π₀.₅)](https://github.com/Physical-Intelligence/openpi).

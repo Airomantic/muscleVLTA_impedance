@@ -117,6 +117,18 @@ def _create_lerobot_v3_dataset(
         )
     if "actions" not in action_sequence_keys:
         raise ValueError(f"Dataset {repo_id} does not contain the required 'actions' feature.")
+    episodes = None
+    if data_config.holdout_every > 0 and not intervention_only:
+        stride = data_config.holdout_every
+        episodes = tuple(index for index in meta.episodes if (index % stride == stride - 1) == data_config.holdout)
+        logging.info(
+            "%s: %d of %d episodes (%s split, every %d-th episode held out)",
+            repo_id,
+            len(episodes),
+            len(meta.episodes),
+            "held-out" if data_config.holdout else "training",
+            stride,
+        )
     dataset = _lerobot_v3.LeRobotV3Dataset(
         repo_id,
         sequence_keys=action_sequence_keys,
@@ -124,7 +136,10 @@ def _create_lerobot_v3_dataset(
         history_keys=tuple(key for key in data_config.history_keys if key in available_features),
         history_length=data_config.history_length,
         options=_lerobot_v3.LeRobotV3Options(
-            decode_videos=decode_videos, intervention_only=intervention_only, tactile_cache=data_config.tactile_cache
+            decode_videos=decode_videos,
+            episodes=episodes,
+            intervention_only=intervention_only,
+            tactile_cache=data_config.tactile_cache,
         ),
     )
     if data_config.prompt_from_task:

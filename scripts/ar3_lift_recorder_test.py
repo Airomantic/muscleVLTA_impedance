@@ -151,6 +151,21 @@ def test_offline_sessions_are_read_as_one_dataset(tmp_path):
     assert (mixture.primary_size, mixture.secondary_size) == (40, 6)
 
 
+def test_validation_split_holds_out_every_nth_episode(tmp_path):
+    recorder = _recorder(tmp_path / "plug_in")
+    for length in (4, 5, 6, 7):
+        _record(recorder, [recorder_lib.HUMAN_FLAG] * length)
+    data_config = _config.DataConfig(repo_id=str(tmp_path / "plug_in"), holdout_every=2)
+
+    def episodes(config):
+        dataset = data_loader.create_torch_dataset(config, 4, None, decode_videos=False)
+        return [int(dataset[index]["episode_index"]) for index in range(len(dataset))]
+
+    training, held_out = episodes(data_config), episodes(dataclasses.replace(data_config, holdout=True))
+    assert (sorted(set(training)), len(training)) == ([0, 2], 4 + 6)
+    assert (sorted(set(held_out)), len(held_out)) == ([1, 3], 5 + 7)
+
+
 def test_offline_sessions_must_be_recorded_alike(tmp_path):
     _record(_recorder(tmp_path / "plug_in"), [1] * 4)
 

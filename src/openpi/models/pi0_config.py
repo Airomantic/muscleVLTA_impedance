@@ -53,6 +53,17 @@ class Pi0Config(_model.BaseModelConfig):
     # chunk step p + commands a_{p-1}, a_p -> arm wrench, finger wrenches, contact patches and contact of step p + 1).
     contact_loss_weight: float = 0.05
     forward_loss_weight: float = 0.1
+    # Balanced joint force fusion (muscleVLTA v2; False / 0 keeps the fusion above). A trained policy reads little
+    # more from its sensors than the level of the arm force (its sustained load: posture, payload, bias), and ignores
+    # the hand stream (scripts/ar3_sensor_attribution.py). ``force_reference`` + ``load_token`` decompose the arm
+    # force of the sensor window: the oldest valid row becomes one load token, and the wrench GRU reads the rows
+    # relative to it, i.e. the interaction force. ``stream_attention``: the reactive cross-attention normalises its
+    # weights within each stream (interaction, hand, load) and sums the streams, so none is crowded out of a shared
+    # softmax. ``arm_dropout``: training-time dropout of the whole interaction stream of a sample.
+    stream_attention: bool = False
+    force_reference: bool = False
+    load_token: bool = False
+    arm_dropout: float = 0.0
 
     # The residual branch reuses the frozen base-policy SigLIP. These settings
     # control only the trainable correction decoder and wrench encoder.
@@ -84,6 +95,14 @@ class Pi0Config(_model.BaseModelConfig):
             raise ValueError("reactive_in_use and residual_policy_in_use cannot both be enabled.")
         if self.sensor_history < 0:
             raise ValueError("sensor_history must be non-negative.")
+        if not 0.0 <= self.arm_dropout < 1.0:
+            raise ValueError("arm_dropout must be in [0, 1).")
+        if (self.stream_attention or self.force_reference or self.arm_dropout) and not (
+            self.sensor_history or self.tactile_in_use
+        ):
+            raise ValueError("stream_attention, force_reference and arm_dropout need sensor_history or tactile_in_use.")
+        if self.load_token and not self.force_reference:
+            raise ValueError("load_token holds the reference of force_reference: enable both.")
         if self.sensor_history or self.tactile_in_use:
             if not self.reactive_in_use:
                 raise ValueError("sensor_history and tactile_in_use require reactive_in_use=True.")

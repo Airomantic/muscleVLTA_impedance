@@ -81,6 +81,8 @@ _DEFAULT_AR3_ASSET_ID = os.environ.get("OPENPI_AR3_ASSET_ID") or "+".join(
 _DEFAULT_AR3_WEIGHT_PATH = os.environ.get(
     "OPENPI_AR3_WEIGHT_PATH", "/data/jiang/checkpoints/openpi-assets/checkpoints/pi05_base/params"
 )
+# Validation split of the AR3 presets: N > 0 keeps every N-th episode of each offline dataset out of training.
+_DEFAULT_AR3_HOLDOUT_EVERY = int(os.environ.get("OPENPI_AR3_HOLDOUT_EVERY", "0"))
 # AR3 DAgger post-training presets (pi05_ar3_lift*_dagger, scripts/train_ar3_lift_dagger_gpu012.sh): ':'-separated
 # LeRobot v3.0 recordings of scripts/ar3_lift_robot_client.py --dagger, the per-batch share of their human-correction
 # chunks (LIFT 1:1 offline:online = 0.5), the offline checkpoint params to continue from and its assets directory
@@ -154,6 +156,11 @@ class DataConfig:
     # together with repo_id as one dataset in which every frame is equally likely. Each keeps its own task prompts and
     # tactile cache ("auto"); the normalization statistics cover all of them (scripts/compute_norm_stats.py).
     extra_repo_ids: tuple[str, ...] = ()
+    # LeRobot v3.0 only: validation split by episode. With ``holdout_every`` = N > 0, every N-th episode of each
+    # offline dataset (index % N == N - 1) is kept out of training; ``holdout`` reads only those episodes instead
+    # (evaluation of a checkpoint on episodes it has not seen, see scripts/ar3_sensor_attribution.py).
+    holdout_every: int = 0
+    holdout: bool = False
 
     # DAgger post-training (LIFT stage two, LeRobot v3.0 only): robot rollout recordings with human corrections. Only
     # chunks recorded entirely under human control (control_flag == -1, LIFT --online-intervention-only) are used, and
@@ -657,6 +664,17 @@ pi05_ar3_lift_reactive = pi0_config.Pi0Config(
 # supervision of the sensor encoders. Needs the tactile cache (scripts/build_ar3_tactile_cache.py).
 pi05_ar3_muscle_vlta = dataclasses.replace(pi05_ar3_lift_reactive, sensor_history=10, tactile_in_use=True)
 
+# muscleVLTA v2, balanced joint force fusion: the arm force of the sensor window is split into its load (one token)
+# and the changes relative to it (wrench GRU), and the reactive cross-attention keeps one distribution per stream.
+# Same inputs and robot client as pi05_ar3_muscle_vlta, whose trained policies read mostly the load level of the arm
+# force and ignore the hand stream (scripts/ar3_sensor_attribution.py measures both). In 5k-step pilots on held-out
+# episodes v2 matched the action error of v1 while its actions followed the force changes 1.4-2.3 times as much and
+# the force level 25-30% less; --model.arm-dropout 0.3 doubled the use of the hand stream at an 18-20% higher action
+# error.
+pi05_ar3_muscle_vlta_v2 = dataclasses.replace(
+    pi05_ar3_muscle_vlta, stream_attention=True, force_reference=True, load_token=True
+)
+
 
 def _ar3_lift_train_config(
     name: str, model: pi0_config.Pi0Config, force_keys: tuple[str, ...] = ar3_lift_policy.FORCE_KEYS_WRENCH_TAU_M
@@ -667,7 +685,11 @@ def _ar3_lift_train_config(
         model=model,
         data=LeRobotAR3LiftDataConfig(
             repo_id=_DEFAULT_AR3_REPO_IDS[0],
-            base_config=DataConfig(prompt_from_task=True, extra_repo_ids=_DEFAULT_AR3_REPO_IDS[1:]),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                extra_repo_ids=_DEFAULT_AR3_REPO_IDS[1:],
+                holdout_every=_DEFAULT_AR3_HOLDOUT_EVERY,
+            ),
             extra_delta_transform=True,
             force_keys=force_keys,
             assets=AssetsConfig(asset_id=_DEFAULT_AR3_ASSET_ID),
@@ -707,6 +729,7 @@ def _ar3_lift_dagger_train_config(
             base_config=DataConfig(
                 prompt_from_task=True,
                 extra_repo_ids=_DEFAULT_AR3_REPO_IDS[1:],
+                holdout_every=_DEFAULT_AR3_HOLDOUT_EVERY,
                 dagger_repo_ids=_DEFAULT_AR3_DAGGER_REPO_IDS,
                 dagger_ratio=_DEFAULT_AR3_DAGGER_RATIO,
             ),
@@ -966,6 +989,7 @@ _CONFIGS = [
     _ar3_lift_train_config("pi05_ar3_lift", dataclasses.replace(pi05_ar3_lift_reactive, reactive_in_use=False)),
     # scripts/train_ar3_muscle_vlta.sh (plug insertion dataset by default).
     _ar3_lift_train_config("pi05_ar3_muscle_vlta", pi05_ar3_muscle_vlta),
+    _ar3_lift_train_config("pi05_ar3_muscle_vlta_v2", pi05_ar3_muscle_vlta_v2),
     # DAgger post-training of the presets above (scripts/train_ar3_lift_dagger_gpu012.sh). Serve the resulting
     # checkpoints with the matching offline preset name (same model; normalization statistics in the checkpoint).
     _ar3_lift_dagger_train_config("pi05_ar3_lift_reactive_dagger", pi05_ar3_lift_reactive),

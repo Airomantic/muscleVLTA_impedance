@@ -282,19 +282,25 @@ class CrossAttention(nn.Module):
         assert q.dtype == k.dtype == v.dtype
         q = einops.rearrange(q, "B T (K G) H -> B T K G H", K=self.cross_config.num_kv_heads)
         logits = jnp.einsum("BTKGH,BSKH->BKGTS", q, k, preferred_element_type=jnp.float32)
-        if attn_mask.shape != (q.shape[0], 1, q.shape[1], k.shape[1]):
+        if attn_mask.ndim != 4 or (attn_mask.shape[0], *attn_mask.shape[2:]) != (q.shape[0], q.shape[1], k.shape[1]):
             raise ValueError(
                 f"Attention mask with shape {attn_mask.shape} but shapes for q and k are: {q.shape} and {k.shape}"
             )
 
         # big_neg = jnp.finfo(logits.dtype).min
         big_neg = -2.3819763e38  # See gemma/modules.py
-        masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
-        row_mask = jnp.all(~attn_mask, axis=-1, keepdims=True)
-        masked_logits = jnp.where(row_mask[:, :, None, :, :], -jnp.inf, masked_logits)
-        probs = jax.nn.softmax(masked_logits, axis=-1).astype(q.dtype)
-        probs = jnp.nan_to_num(probs, nan=0.0)
-        encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
+        # One attention distribution per mask group (axis 1), their outputs summed: a single group attends over all
+        # visible keys; several groups (e.g. one per sensor stream) keep a stream from being crowded out by another.
+        encoded = None
+        for group in range(attn_mask.shape[1]):
+            group_mask = attn_mask[:, group : group + 1]
+            masked_logits = jnp.where(group_mask[:, :, None, :, :], logits, big_neg)
+            row_mask = jnp.all(~group_mask, axis=-1, keepdims=True)
+            masked_logits = jnp.where(row_mask[:, :, None, :, :], -jnp.inf, masked_logits)
+            probs = jax.nn.softmax(masked_logits, axis=-1).astype(q.dtype)
+            probs = jnp.nan_to_num(probs, nan=0.0)
+            attended = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
+            encoded = attended if encoded is None else encoded + attended
         encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
         out_einsum = lora.Einsum(
             shape=(self.cross_config.num_heads, self.cross_config.head_dim, self.cross_config.width),

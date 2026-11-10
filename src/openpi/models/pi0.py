@@ -136,13 +136,17 @@ def make_sensor_cross_attn_mask(
     latency: int,
     use_force_history: bool = True,
     num_streams: int = 1,
-) -> at.Bool[at.Array, "b 1 h m"]:
+    stream_valid: at.Bool[at.Array, "b n"] | None = None,
+    per_stream: bool = False,
+) -> at.Bool[at.Array, "b g h m"]:
     """Reactive cross-attention mask over time-aligned sensor streams (``r = history_length + h`` rows each).
 
     Row j holds the reading at chunk step p = j - history_length. Action token i attends to it iff p <= i - latency
     and the row is valid; without force history only the chunk-start reading (p = 0) is visible, as in
     ``make_cross_attn_mask`` (which this reproduces for one stream without history). The streams share the row layout
-    and are concatenated along the memory axis (m = num_streams * r).
+    and are concatenated along the memory axis (m = num_streams * r); ``stream_valid`` hides whole streams of a
+    sample. ``per_stream`` returns one mask group per stream (g = num_streams) that only sees its own rows, for an
+    attention distribution per stream; otherwise one group (g = 1) sees the rows of all streams.
     """
     rows = sensor_valid.shape[-1]
     steps = jnp.arange(rows) - history_length
@@ -150,7 +154,25 @@ def make_sensor_cross_attn_mask(
     if not use_force_history:
         visible = visible & (steps[None, :] == 0)
     mask = visible[None] & sensor_valid.astype(bool)[:, None, :]
-    return jnp.tile(mask, (1, 1, num_streams))[:, None]
+    mask = jnp.broadcast_to(mask[:, None], (mask.shape[0], num_streams, *mask.shape[1:]))
+    if stream_valid is not None:
+        mask = mask & stream_valid.astype(bool)[:, :, None, None]
+    if per_stream:
+        own = jnp.eye(num_streams, dtype=bool)[None, :, None, :, None]
+        return (mask[:, :, :, None, :] & own).reshape(*mask.shape[:3], num_streams * rows)
+    return einops.rearrange(mask, "b n h r -> b 1 h (n r)")
+
+
+def add_cross_attn_key(
+    mask: at.Bool[at.Array, "b g h m"], visible: at.Bool[at.Array, "b h"], *, own_group: bool
+) -> at.Bool[at.Array, "b _g h _m"]:
+    """Appends one key to a cross-attention mask; ``visible`` tells which queries see it. The key joins the single
+    mask group, or forms a group of its own (``own_group``, with per-stream masks)."""
+    if not own_group:
+        return jnp.concatenate([mask, jnp.broadcast_to(visible[:, None, :, None], (*mask.shape[:3], 1))], axis=-1)
+    mask = jnp.concatenate([mask, jnp.zeros_like(mask[..., :1])], axis=-1)
+    group = jnp.zeros_like(mask[:, :1]).at[:, 0, :, -1].set(visible)
+    return jnp.concatenate([mask, group], axis=1)
 
 
 class ReactiveContext(NamedTuple):
@@ -201,6 +223,10 @@ class Pi0(_model.BaseModel):
         self.finger_dropout = config.finger_dropout
         self.contact_loss_weight = config.contact_loss_weight
         self.forward_loss_weight = config.forward_loss_weight
+        self.stream_attention = config.stream_attention
+        self.force_reference = config.force_reference
+        self.load_token = config.load_token
+        self.arm_dropout = config.arm_dropout
         self.cross_attention_latency = config.cross_attention_latency
         self.residual_image_keys = config.residual_image_keys
         self.residual_action_dim = len(config.residual_action_scale) if config.residual_policy_in_use else 0
@@ -266,9 +292,15 @@ class Pi0(_model.BaseModel):
                 model_parts["hand_encoder"] = hand_encoder
         self.PaliGemma = nnx.Dict(**model_parts)
         if config.sensor_history or config.tactile_in_use:
-            # Added to the arm (and hand) stream tokens, which share time positions in the force memory.
+            # Added to the arm (and hand) stream tokens, which share time positions in the force memory, and to the
+            # load token.
             num_streams = 2 if config.tactile_in_use else 1
-            self.sensor_stream_embedding = nnx.Param(jnp.zeros((num_streams, action_expert_config.width)))
+            self.sensor_stream_embedding = nnx.Param(
+                jnp.zeros((num_streams + int(config.load_token), action_expert_config.width))
+            )
+            if config.load_token:
+                self.load_token_in = nnx.Linear(config.wrench_dim, 512, rngs=rngs)
+                self.load_token_out = nnx.Linear(512, action_expert_config.width, rngs=rngs)
             # Training-only forward model of the readings (``_sensor_forward``): arm wrench, then per finger the
             # wrench with the contact-patch geometry, then the finger contact logits.
             fingers = config.tactile_num_fingers if config.tactile_in_use else 0
@@ -422,7 +454,8 @@ class Pi0(_model.BaseModel):
 
         LIFT (no sensor history, no hand stream): the wrench GRU tokens of the action horizon. muscleVLTA: the arm
         (wrench GRU) and hand (``HandEncoder``) streams over the sensor history and the action horizon, each tagged by
-        a stream embedding; rows before the episode start are skipped by the GRUs and masked out.
+        a stream embedding; rows before the episode start are skipped by the GRUs and masked out. With ``load_token``
+        the arm reading that the wrench GRU rows are relative to follows as one more key.
         """
         if not (self.sensor_history or self.tactile_in_use):
             memory = self._get_wrench_memory(observation)
@@ -439,7 +472,13 @@ class Pi0(_model.BaseModel):
         if valid is None:
             valid = jnp.ones((batch_size, rows), dtype=jnp.bool_)
 
-        streams = [self.PaliGemma.wrench_gru(observation.wrench, valid=valid)]
+        streams = [self.PaliGemma.wrench_gru(self._arm_rows(observation), valid=valid)]
+        stream_valid = None
+        if train and rng is not None and self.arm_dropout:
+            rng, arm_rng = jax.random.split(rng)
+            keep_arm = jax.random.bernoulli(arm_rng, 1.0 - self.arm_dropout, (batch_size,))
+            streams[0] = streams[0] * keep_arm[:, None, None].astype(streams[0].dtype)
+            stream_valid = jnp.stack([keep_arm] + [jnp.ones_like(keep_arm)] * int(self.tactile_in_use), axis=1)
         contact_logits = None
         if self.tactile_in_use:
             if observation.tactile_depth is None:
@@ -459,21 +498,52 @@ class Pi0(_model.BaseModel):
         memory = jnp.concatenate(
             [stream + stream_embedding[i].astype(stream.dtype) for i, stream in enumerate(streams)], axis=1
         )
-        memory = memory * self._get_wrench_mask(observation)[:, None, None].astype(memory.dtype)
         cross_attn_mask = make_sensor_cross_attn_mask(
             valid,
             history_length=self.sensor_history,
             latency=self.cross_attention_latency,
             use_force_history=self.use_force_history,
             num_streams=len(streams),
+            stream_valid=stream_valid,
+            per_stream=self.stream_attention,
         )
         query_positions = self.sensor_history + jnp.arange(self.action_horizon, dtype=jnp.int32)
         key_positions = jnp.tile(jnp.arange(rows, dtype=jnp.int32), len(streams))
-        cross_positions = [
-            jnp.broadcast_to(query_positions, (batch_size, self.action_horizon)),
-            jnp.broadcast_to(key_positions, (batch_size, key_positions.shape[0])),
-        ]
+        key_positions = jnp.broadcast_to(key_positions, (batch_size, key_positions.shape[0]))
+        if self.load_token:
+            # The sustained load of the arm (posture, payload, bias): as visible as the row it is read from.
+            reference, reference_row = self._arm_reference(observation)
+            load = self.load_token_out(nnx.swish(self.load_token_in(reference.astype(jnp.float32))))
+            memory = jnp.concatenate([memory, (load + stream_embedding[len(streams)]).astype(memory.dtype)], axis=1)
+            steps = reference_row - self.sensor_history
+            visible = steps[:, None] <= jnp.arange(self.action_horizon)[None, :] - self.cross_attention_latency
+            cross_attn_mask = add_cross_attn_key(
+                cross_attn_mask, visible & valid.any(axis=1)[:, None], own_group=self.stream_attention
+            )
+            key_positions = jnp.concatenate([key_positions, reference_row[:, None]], axis=1)
+        memory = memory * self._get_wrench_mask(observation)[:, None, None].astype(memory.dtype)
+        cross_positions = [jnp.broadcast_to(query_positions, (batch_size, self.action_horizon)), key_positions]
         return ReactiveContext(memory, cross_attn_mask, cross_positions, contact_logits)
+
+    def _arm_reference(self, observation: _model.Observation) -> tuple[jax.Array, jax.Array]:
+        """The oldest valid arm force row of the sensor window [b, 1, q] and its row index [b]."""
+        wrench, valid = observation.wrench, observation.sensor_valid
+        if valid is None:
+            row = jnp.zeros(wrench.shape[0], dtype=jnp.int32)
+        else:
+            row = jnp.argmax(valid, axis=1).astype(jnp.int32)
+        return jnp.take_along_axis(wrench, row[:, None, None], axis=1), row
+
+    def _arm_rows(self, observation: _model.Observation) -> jax.Array:
+        """The arm force rows read by the wrench GRU. With ``force_reference`` they are relative to the oldest valid
+        row of the window: the sustained load of the arm is removed and the changes within the window remain."""
+        wrench = observation.wrench
+        if not self.force_reference:
+            return wrench
+        relative = wrench - self._arm_reference(observation)[0]
+        if observation.sensor_valid is None:
+            return relative
+        return jnp.where(observation.sensor_valid[..., None], relative, 0.0)
 
     def _drop_fingers(self, rng: at.KeyArrayLike, finger_valid: jax.Array) -> jax.Array:
         """Training-time sensor dropout, constant over a sample: the whole hand, or single fingers, become missing."""
@@ -489,6 +559,7 @@ class Pi0(_model.BaseModel):
         Step 0 is left out: its previous command precedes the chunk.
         """
         batch_size, rows = memory.shape[0], self.sensor_history + self.action_horizon
+        memory = memory[:, : (1 + int(self.tactile_in_use)) * rows]
         memory = memory.reshape(batch_size, -1, rows, memory.shape[-1])[:, :, self.sensor_history + 1 : rows - 1]
         state = einops.rearrange(memory, "b n p w -> b p (n w)")
         commands = jnp.concatenate([actions[:, :-2], actions[:, 1:-1]], axis=-1)
@@ -503,7 +574,8 @@ class Pi0(_model.BaseModel):
         ``contact_loss``: the finger contact gates against the indentation-map labels. ``forward_*_loss``: the
         action-conditioned forward model (``_sensor_forward``) against the next arm wrench, finger wrenches with
         contact-patch geometry, and finger contact. It reads the training memory, after sensor dropout, so the next
-        reading of a dropped finger has to be inferred from the arm and the other finger.
+        reading of a dropped finger has to be inferred from the arm and the other finger, and that of a dropped arm
+        stream (``arm_dropout``) from the hand.
         """
         batch_size, rows = observation.wrench.shape[:2]
         valid = observation.sensor_valid
@@ -524,7 +596,7 @@ class Pi0(_model.BaseModel):
         prediction = self._sensor_forward(context.memory, actions)
         current, following = slice(self.sensor_history + 1, rows - 1), slice(self.sensor_history + 2, rows)
         step_valid = valid[:, current] & valid[:, following]
-        arm_target = observation.wrench[:, following].astype(jnp.float32)
+        arm_target = self._arm_rows(observation)[:, following].astype(jnp.float32)
         losses["forward_arm_loss"] = _masked_mean(
             optax.huber_loss(prediction[..., : self.wrench_dim], arm_target), step_valid[..., None]
         )
@@ -845,7 +917,7 @@ class Pi0(_model.BaseModel):
             return jnp.mean(jnp.square(v_t - u_t), axis=-1), {}
 
         sensor_rng = None
-        if self.tactile_in_use:
+        if self.tactile_in_use or self.arm_dropout:
             rng, sensor_rng = jax.random.split(rng)
         preprocess_rng, noise_rng, time_rng, reac_noise_rng = jax.random.split(rng, 4)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)

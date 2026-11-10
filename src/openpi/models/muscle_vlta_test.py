@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from openpi.models import gemma as _gemma
 from openpi.models import gru as _gru
 from openpi.models import hand_encoder as _hand_encoder
 from openpi.models import pi0 as _pi0
@@ -143,9 +144,12 @@ def _copy_collisions(tree, path=()):
 
 def test_new_params_are_safe_from_reactive_expert_copy():
     # maybe_copy_reactive_expert_params overwrites every "*_2" entry that has a "*_1" sibling; only the experts may.
-    params = nnx.state(nnx.eval_shape(_config().create, jax.random.key(0))).to_pure_dict()
+    params = nnx.state(
+        nnx.eval_shape(_config(force_reference=True, load_token=True).create, jax.random.key(0))
+    ).to_pure_dict()
     del params["PaliGemma"]["llm"]
     assert params["PaliGemma"]["hand_encoder"]
+    assert params["load_token_out"]
     assert _copy_collisions(params) == []
 
 
@@ -295,3 +299,81 @@ def test_muscle_vlta_training_loss_adds_the_sensor_supervision(reactive_model):
         tactile_wrench=missing.tactile_wrench.at[:, :, 6:].add(3.0),
     )
     jax.tree.map(np.testing.assert_array_equal, losses(changed), losses(missing))
+
+
+def test_sensor_mask_groups_one_distribution_per_stream():
+    valid = jnp.ones((2, 6), dtype=bool)
+    options = {"history_length": 2, "latency": 1, "num_streams": 2, "stream_valid": jnp.array([[1, 1], [0, 1]])}
+    shared = _pi0.make_sensor_cross_attn_mask(valid, **options)
+    grouped = _pi0.make_sensor_cross_attn_mask(valid, **options, per_stream=True)
+
+    assert (shared.shape, grouped.shape) == ((2, 1, 4, 12), (2, 2, 4, 12))
+    # Every group sees the rows of its own stream only; together they see what the shared mask sees.
+    np.testing.assert_array_equal(grouped.any(axis=1, keepdims=True), shared)
+    assert not grouped[:, 0, :, 6:].any()
+    assert not grouped[:, 1, :, :6].any()
+    # The hidden arm stream of the second sample is not attended to; its hand stream still is.
+    assert not shared[1, 0, :, :6].any()
+    assert shared[1, 0, :, 6:].any()
+
+
+def test_cross_attention_sums_one_distribution_per_mask_group():
+    config = _gemma.get_config("dummy")
+    module = _gemma.CrossAttention(cross_config=config)
+    keys = jax.random.split(jax.random.key(0), 4)
+    inputs = [jax.random.normal(keys[0], (1, 3, config.width)), jax.random.normal(keys[1], (1, 4, config.width))]
+    positions = [jnp.arange(3)[None], jnp.arange(4)[None]]
+    mask = jnp.ones((1, 1, 3, 4), dtype=bool).at[:, :, 0, :2].set(False)
+    params = module.init(keys[2], inputs, positions, mask)
+    out = params["params"]["cross_attn_vec_einsum"]
+    out["w"] = jax.random.normal(keys[3], out["w"].shape)  # zero-initialised
+
+    def attend(mask):
+        return np.asarray(module.apply(params, inputs, positions, mask), dtype=np.float32)
+
+    # Keys 0-1 and 2-3 as two streams; query 0 sees nothing of the first one.
+    first, second = mask.at[..., 2:].set(False), mask.at[..., :2].set(False)
+    grouped = attend(jnp.concatenate([first, second], axis=1))
+    np.testing.assert_allclose(grouped, attend(first) + attend(second), rtol=1e-5, atol=1e-6)
+    assert not np.allclose(grouped[0, 1:], attend(mask)[0, 1:], atol=1e-3)
+
+
+def test_balanced_fusion_splits_the_arm_force_into_load_and_changes():
+    config = _config(stream_attention=True, force_reference=True, load_token=True, arm_dropout=0.5)
+    model = config.create(jax.random.key(0))
+    rows, batch = HISTORY + HORIZON, 8
+    observation = dataclasses.replace(
+        config.fake_obs(batch_size=batch),
+        wrench=jax.random.normal(jax.random.key(3), (batch, rows, 13)),
+        sensor_valid=jnp.ones((batch, rows), dtype=bool).at[:, 0].set(False),
+    )
+
+    def memory(wrench):
+        context = model._reactive_context(dataclasses.replace(observation, wrench=wrench))
+        return np.asarray(context.memory, dtype=np.float32)
+
+    base = memory(observation.wrench)
+    assert base.shape == (batch, 2 * rows + 1, 64)
+    # A constant offset of the readings (posture, payload, sensor bias) only reaches the load token, a change within
+    # the window only the arm stream, and the row before the episode start nothing.
+    offset = memory(observation.wrench + 5.0)
+    np.testing.assert_allclose(offset[:, :-1], base[:, :-1], atol=2e-2)
+    assert np.abs(offset[:, -1] - base[:, -1]).max() > 0.1
+    changed = memory(observation.wrench.at[:, -1].add(5.0))
+    assert np.abs(changed[:, :rows] - base[:, :rows]).max() > 0.1
+    np.testing.assert_array_equal(changed[:, -1], base[:, -1])
+    np.testing.assert_array_equal(memory(observation.wrench.at[:, 0].add(5.0)), base)
+
+    # One attention group per stream; the load token (read from history) is its own group, seen by every action.
+    mask = np.asarray(model._reactive_context(observation).cross_attn_mask)
+    assert mask.shape == (batch, 3, HORIZON, 2 * rows + 1)
+    assert mask[:, :2].any(axis=(2, 3)).all()
+    assert not mask[:, :2, :, -1].any()
+    assert mask[:, 2, :, -1].all()
+    assert not mask[:, 2, :, :-1].any()
+    # Training hides the arm stream of some samples and keeps their hand stream and load token.
+    dropped = model._reactive_context(observation, jax.random.key(1), train=True)
+    groups = np.asarray(dropped.cross_attn_mask.any(axis=(2, 3)))
+    assert 0 < groups[:, 0].sum() < batch
+    assert groups[:, 1:].all()
+    assert not np.asarray(dropped.memory, dtype=np.float32)[~groups[:, 0], :rows].any()
