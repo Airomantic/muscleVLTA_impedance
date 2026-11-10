@@ -473,6 +473,28 @@ exported by `scripts/build_figures.py` from the editable sources in `picture/src
 `picture/forceVisuotactile_robot.svg` and `picture/src/frames/`). The exported SVGs are single files that only use
 what PowerPoint and Word display; `scripts/build_figure_assets.py` extracts the recorded frames they show.
 
+**Result figures, smoothness and the manuscript.** `scripts/build_result_figures.py` draws the real-robot success
+rates (95% Wilson intervals; unmeasured cells stay marked TBD) and the sensor-attribution chart from the counts in
+`picture/src/results.json`: edit the counts when trials are added and re-run it. `scripts/ar3_smoothness.py` compares
+the motion smoothness of recordings (SPARC, log dimensionless jerk, RMS jerk, chunk-boundary ratio); record the
+rollouts of every method with `--record-dir` on the robot and pass them as runs:
+
+```bash
+.venv/bin/python scripts/build_result_figures.py
+.venv/bin/python scripts/ar3_smoothness.py --out picture/results_smoothness \
+  --run "muscleVLTA=/path/to/rollouts_muscle_vlta" --run "LIFT=/path/to/rollouts_lift" \
+  --run "Demonstrations=/data/jiang/ar3_eef_forceVisuoTactaile_plugIn"
+.venv/bin/python scripts/build_manuscript.py   # picture/muscleVLTA_manuscript_v2.docx from picture/src/manuscript/
+```
+
+`scripts/build_manuscript.py` writes the Word manuscript from the text sources in `picture/src/manuscript/` with the
+styles of the authors' template `picture/muscleVLTA_CVPR_style_manuscript.docx`; `{{...}}` in the sources marks what
+the authors still have to measure or confirm and is highlighted in the document.
+
+To test whether a tactile muscleVLTA policy needs its fingers at test time, run it with `--mask-tactile`
+(`scripts/run_ar3_lift_robot.sh --execute --mask-tactile ...`): the policy then receives both Tac G2 fingers as
+missing, as under finger dropout, while the sensors, the gripper opening and everything else stay unchanged.
+
 ## 🙏 Acknowledgements
 
 LIFT is built on [OpenPI (π₀/π₀.₅)](https://github.com/Physical-Intelligence/openpi).

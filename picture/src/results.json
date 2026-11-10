@@ -1,0 +1,53 @@
+{
+  "real_robot": {
+    "note": "Success counts of occluded charger insertion on the AR3, as reported by the authors: [successes, trials]. null = not measured yet (drawn as TBD). The measured 'Ours, shared fusion' counts are the pi05_ar3_muscle_vlta policy; fill 'Ours, balanced fusion' once pi05_ar3_muscle_vlta_v2 has been evaluated.",
+    "conditions": {
+      "near": "Start within 20 cm of the socket",
+      "far": "Start 40-50 cm from the socket"
+    },
+    "methods": [
+      {"name": "π0.5", "near": null, "far": [0, 60]},
+      {"name": "GR00T", "near": null, "far": null},
+      {"name": "ForceVLA2", "near": null, "far": null},
+      {"name": "LIFT", "near": null, "far": null},
+      {"name": "Ours w/o touch", "near": null, "far": [3, 60]},
+      {"name": "Ours, shared fusion", "near": [55, 60], "far": [13, 60]},
+      {"name": "Ours, balanced fusion", "near": null, "far": null}
+    ]
+  },
+  "attribution": {
+    "note": "scripts/ar3_sensor_attribution.py: change of the sampled action chunk (xyz, in standard deviations of the recorded actions) and action error (MSE of normalized actions) under counterfactual readings; free = chunks starting in free space, contact = a finger in contact at the chunk start.",
+    "trained_policy": {
+      "label": "shared fusion, 141k steps, 512 chunks of its training episodes",
+      "change": {
+        "arm level swapped": {"free": 0.3228, "contact": 0.4476},
+        "arm changes removed": {"free": 0.0418, "contact": 0.0612},
+        "hand removed": {"free": 0.0015, "contact": 0.0029},
+        "hand swapped": {"free": 0.0025, "contact": 0.0069}
+      }
+    },
+    "pilots": {
+      "label": "5k-step pilots, batch 32, one seed; 768 chunks of 16 held-out episodes",
+      "policies": {
+        "shared fusion": {
+          "error": {"free": 0.0505, "contact": 0.0536},
+          "arm level swapped": {"free": 0.0727, "contact": 0.0847},
+          "arm changes removed": {"free": 0.0539, "contact": 0.0572},
+          "hand removed": {"free": 0.0506, "contact": 0.0544}
+        },
+        "balanced fusion": {
+          "error": {"free": 0.0498, "contact": 0.0536},
+          "arm level swapped": {"free": 0.0623, "contact": 0.0718},
+          "arm changes removed": {"free": 0.0562, "contact": 0.0602},
+          "hand removed": {"free": 0.0506, "contact": 0.0542}
+        },
+        "balanced fusion + arm dropout 0.3": {
+          "error": {"free": 0.0593, "contact": 0.0641},
+          "arm level swapped": {"free": 0.0655, "contact": 0.0746},
+          "arm changes removed": {"free": 0.0639, "contact": 0.0692},
+          "hand removed": {"free": 0.0600, "contact": 0.0667}
+        }
+      }
+    }
+  }
+}
