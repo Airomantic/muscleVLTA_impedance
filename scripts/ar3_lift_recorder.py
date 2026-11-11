@@ -12,9 +12,15 @@ training dataset written by the lerobot AR3 recorder (``record_lift.json``, e.g.
   demonstrations are all -1, and LIFT trains on chunks whose flags are all -1 (``intervention_only``),
 * the ``sync.*`` host-clock bookkeeping columns of the lerobot recorder.
 
-The tactile gripper wrenches of the lerobot recordings are not recorded (LIFT does not use them). Every episode gets
-its own data / video files, so recordings can be appended across sessions and are read by ``openpi.data.lerobot_v3``.
-pyarrow and PyAV are only imported when recording.
+The tactile gripper wrenches of the lerobot recordings are not recorded by default (LIFT does not use them). With
+``tactile=True`` (rollouts of muscleVLTA policies) every frame also carries the two Tac G2 finger wrenches
+(``observation.gripper_wrench.sensor_0`` / ``sensor_2``) and the finger indentation maps. The maps go where the
+lerobot recorder stores them (``tactile/episode-XXXXXX/tactile_depth.<sensor>.parquet``), but already area-pooled to
+48x64 and as one row per frame at which the finger had a reading, stamped with the frame time:
+``scripts/build_ar3_tactile_cache.py`` then gives every frame exactly the map it was recorded with, and the rollouts
+train like the demonstrations. ``write_outcome`` records how an episode ended for offline RL (``rl/outcomes.json``,
+``openpi.rl.outcomes``). Every episode gets its own data / video files, so recordings can be appended across sessions
+and are read by ``openpi.data.lerobot_v3``. pyarrow and PyAV are only imported when recording.
 """
 
 from __future__ import annotations
@@ -25,6 +31,7 @@ import json
 import os
 import pathlib
 import queue
+import shutil
 import threading
 from typing import Any
 
@@ -48,6 +55,11 @@ IMAGE_STATS_PIXEL_STRIDE = 4
 VIDEO_CODEC = "libx264"
 VIDEO_OPTIONS = {"g": "2", "crf": "30", "preset": "fast"}
 _ARROW_TYPES = {"float32": "float32", "float64": "float64", "int64": "int64"}
+# Tac G2 fingers and their pooled map shape (openpi_client.tactile.SENSORS / DEPTH_SHAPE).
+TACTILE_SENSORS = ("sensor_0", "sensor_2")
+TACTILE_DEPTH_SHAPE = (48, 64)
+OUTCOMES_PATH = "rl/outcomes.json"
+OUTCOMES = ("success", "failure")
 
 
 class RecorderError(RuntimeError):
@@ -82,8 +94,10 @@ def _video_feature(height: int, width: int, fps: int) -> dict[str, Any]:
     }
 
 
-def lift_features(height: int = 480, width: int = 640, fps: int = 10) -> dict[str, dict[str, Any]]:
-    """Features of the lerobot ``record_lift.json`` recordings, without the tactile gripper wrenches."""
+def lift_features(
+    height: int = 480, width: int = 640, fps: int = 10, *, tactile: bool = False
+) -> dict[str, dict[str, Any]]:
+    """Features of the lerobot ``record_lift.json`` recordings; the tactile gripper wrenches only with ``tactile``."""
     receipt = ["host_receipt", "ros_stamp"]
     scalar_int = {"dtype": "int64", "shape": [1], "names": None}
     features: dict[str, dict[str, Any]] = {
@@ -102,6 +116,10 @@ def lift_features(height: int = 480, width: int = 640, fps: int = 10) -> dict[st
         "sync.control_flag.timing_s": _vector(receipt, "float64"),
         "sync.tau_m.timing_s": _vector(receipt, "float64"),
     }
+    if tactile:
+        for sensor in TACTILE_SENSORS:
+            features[f"observation.gripper_wrench.{sensor}"] = _vector(["Fx", "Fy", "Fz", "Mx", "My", "Mz"])
+            features[f"sync.gripper_wrench.{sensor}.timing_s"] = _vector(receipt, "float64")
     for camera, key in CAMERAS.items():
         features[key] = _video_feature(height, width, fps)
         features[f"sync.{camera}.timing_s"] = _vector(
@@ -294,6 +312,22 @@ class _Episode:
     writers: dict[str, _VideoWriter]
     rows: list[dict[str, np.ndarray]] = dataclasses.field(default_factory=list)
     image_samples: dict[str, list[np.ndarray]] = dataclasses.field(default_factory=dict)
+    # Per frame of a tactile recording: (maps float32 [fingers, h, w], finger validity bool [fingers]).
+    tactile: list[tuple[np.ndarray, np.ndarray]] = dataclasses.field(default_factory=list)
+
+
+def write_outcome(root: str | os.PathLike[str], episode_index: int, outcome: str) -> pathlib.Path:
+    """Records how an episode ended ("success" / "failure") in ``rl/outcomes.json`` (``openpi.rl.outcomes``)."""
+    if outcome not in OUTCOMES:
+        raise RecorderError(f"unknown outcome {outcome!r}: use one of {OUTCOMES}")
+    path = pathlib.Path(root) / OUTCOMES_PATH
+    data = json.loads(path.read_text()) if path.is_file() else {}
+    data.setdefault("default", None)
+    data.setdefault("completion", "release")
+    data.setdefault("episodes", {})[str(int(episode_index))] = outcome
+    data.setdefault("completion_frames", {})
+    _write_json(path, data)
+    return path
 
 
 class EpisodeRecorder:
@@ -307,13 +341,18 @@ class EpisodeRecorder:
         fps: int = 10,
         image_size: tuple[int, int] = (480, 640),
         capture_info: dict[str, Any] | None = None,
+        tactile: bool = False,
     ):
         self.root = pathlib.Path(root).expanduser().resolve()
         self.fps = int(fps)
         self.task = task
-        self.features = lift_features(*image_size, self.fps)
+        self.tactile = tactile
+        self.features = lift_features(*image_size, self.fps, tactile=tactile)
         self.frame_keys = frame_keys(self.features)
         self._capture_info = capture_info
+        # The tactile cache gives a frame the newest sidecar map that is at most this old. The sidecars written here
+        # hold the map of a frame at its frame time, so less than a frame period selects that map and nothing else.
+        self._tactile_max_age = 0.5 / self.fps
         self._episode: _Episode | None = None
         info_path = self.root / "meta" / "info.json"
         if info_path.is_file():
@@ -360,6 +399,27 @@ class EpisodeRecorder:
             raise RecorderError(
                 f"{self.root} has different features (or image sizes): {differing}; use a new directory"
             )
+        if self.tactile:
+            capture_path = self.root / "meta" / "ar3_capture.json"
+            capture = json.loads(capture_path.read_text()) if capture_path.is_file() else {}
+            max_age = capture.get("robot", {}).get("max_tactile_age_s")
+            if max_age is None or not 0 < float(max_age) < 1.0 / self.fps:
+                raise RecorderError(
+                    f"{self.root} was not recorded with one Tac G2 map per frame (meta/ar3_capture.json "
+                    f"robot.max_tactile_age_s is {max_age}); use a new directory"
+                )
+
+    def _capture(self) -> dict[str, Any]:
+        """Contents of ``meta/ar3_capture.json``: the caller's description and, for tactile recordings, how
+        ``openpi.data.tactile_cache`` has to read the sidecars."""
+        capture = dict(self._capture_info or {})
+        if self.tactile:
+            capture["robot"] = {
+                **capture.get("robot", {}),
+                "max_tactile_age_s": self._tactile_max_age,
+                "tactile_recording": "one area-pooled map per frame and finger with a reading, at the frame time",
+            }
+        return capture
 
     @property
     def num_episodes(self) -> int:
@@ -392,8 +452,17 @@ class EpisodeRecorder:
         self._episode = _Episode(index, writers, image_samples={camera: [] for camera in CAMERAS})
         return index
 
-    def add_frame(self, values: dict[str, Any], images: dict[str, np.ndarray]) -> int:
-        """Adds one frame: ``values`` maps every key of ``frame_keys``, ``images`` the cameras to HxWx3 uint8 RGB."""
+    def add_frame(
+        self,
+        values: dict[str, Any],
+        images: dict[str, np.ndarray],
+        tactile: tuple[np.ndarray, np.ndarray] | None = None,
+    ) -> int:
+        """Adds one frame: ``values`` maps every key of ``frame_keys``, ``images`` the cameras to HxWx3 uint8 RGB.
+
+        Tactile recorders also take the Tac G2 reading of the frame: (pooled indentation maps [fingers, 48, 64],
+        finger validity [fingers]). The maps of missing fingers are not stored: training reads them as missing.
+        """
         episode = self._episode
         if episode is None:
             raise RecorderError("no episode is being recorded")
@@ -406,6 +475,18 @@ class EpisodeRecorder:
             if value.shape != (int(np.prod(spec["shape"])),) or not np.all(np.isfinite(value)):
                 raise RecorderError(f"invalid {key}: {values[key]!r}")
             row[key] = value.astype(spec["dtype"])
+        reading = None
+        if self.tactile:
+            if tactile is None:
+                raise RecorderError("frame is missing the Tac G2 reading")
+            depth = np.array(tactile[0], dtype=np.float32)
+            valid = np.array(tactile[1], dtype=bool).reshape(-1)
+            shape = (len(TACTILE_SENSORS), *TACTILE_DEPTH_SHAPE)
+            if depth.shape != shape or valid.shape != shape[:1] or not np.all(np.isfinite(depth)):
+                raise RecorderError(f"Tac G2 maps must be finite {shape} with {shape[0]} validity flags")
+            reading = (depth, valid)
+        elif tactile is not None:
+            raise RecorderError("this recorder does not record the Tac G2 fingers (tactile=True)")
         frame_index = len(episode.rows)
         for camera, key in CAMERAS.items():
             image = images.get(camera)
@@ -418,7 +499,49 @@ class EpisodeRecorder:
                 stride = IMAGE_STATS_PIXEL_STRIDE
                 episode.image_samples[camera].append(np.array(images[camera][::stride, ::stride]))
         episode.rows.append(row)
+        if reading is not None:
+            episode.tactile.append(reading)
         return frame_index
+
+    def _write_tactile(
+        self, index: int, frame_times: np.ndarray, readings: list[tuple[np.ndarray, np.ndarray]]
+    ) -> None:
+        """The pooled maps in the sidecar layout of the lerobot recorder: per finger one row for every frame at which
+        it had a reading, stamped with the time of that frame (module docstring)."""
+        import pyarrow as pa
+
+        directory = self.root / "tactile" / f"episode-{index:06d}"
+        shutil.rmtree(directory, ignore_errors=True)  # of an episode that was not saved completely
+        size = int(np.prod(TACTILE_DEPTH_SHAPE))
+        streams = {}
+        for position, sensor in enumerate(TACTILE_SENSORS):
+            frames = np.flatnonzero([valid[position] for _, valid in readings])
+            streams[f"tactile_depth.{sensor}"] = {
+                "dtype": "float32",
+                "shape": list(TACTILE_DEPTH_SHAPE),
+                "names": ["height", "width"],
+                "count": len(frames),
+            }
+            if not len(frames):
+                continue
+            maps = np.stack([readings[frame][0][position] for frame in frames])
+            table = pa.table(
+                {
+                    "episode_index": pa.array(np.full(len(frames), index), type=pa.int64()),
+                    "sample_index": pa.array(frames, type=pa.int64()),
+                    "host_timestamp_s": pa.array(frame_times[frames], type=pa.float64()),
+                    "value": pa.FixedSizeListArray.from_arrays(pa.array(maps.reshape(-1), type=pa.float32()), size),
+                }
+            )
+            _write_parquet(directory / f"tactile_depth.{sensor}.parquet", table)
+        info = {
+            "version": 1,
+            "episode_index": index,
+            "clock": "host_monotonic_receipt",
+            "sampling": "frames: sample_index is the frame index, host_timestamp_s its sync.target_host_s",
+            "streams": streams,
+        }
+        _write_json(directory / "info.json", info)
 
     def discard_episode(self) -> None:
         episode, self._episode = self._episode, None
@@ -464,6 +587,8 @@ class EpisodeRecorder:
             {key: _arrow_column(columns[key], spec) for key, spec in self.features.items() if spec["dtype"] != "video"}
         )
         _write_parquet(self.root / DATA_PATH.format(**location), table)
+        if self.tactile:
+            self._write_tactile(index, columns["sync.target_host_s"].reshape(-1), episode.tactile)
         for camera, writer in episode.writers.items():
             os.replace(writer.path, self.root / VIDEO_PATH.format(video_key=CAMERAS[camera], **location))
 
@@ -495,8 +620,9 @@ class EpisodeRecorder:
         _write_tasks(self.root / "meta" / "tasks.parquet", self.tasks)
         self.stats = aggregate_stats(self.stats, stats)
         _write_json(self.root / "meta" / "stats.json", self.stats)
-        if self._capture_info is not None and not (self.root / "meta" / "ar3_capture.json").is_file():
-            _write_json(self.root / "meta" / "ar3_capture.json", self._capture_info)
+        capture_path = self.root / "meta" / "ar3_capture.json"
+        if (self._capture_info is not None or self.tactile) and not capture_path.is_file():
+            _write_json(capture_path, self._capture())
         self.info.update(
             total_episodes=index + 1,
             total_frames=from_index + length,
@@ -505,6 +631,12 @@ class EpisodeRecorder:
         )
         _write_json(self.root / "meta" / "info.json", self.info)
         return index
+
+    def label_episode(self, episode_index: int, outcome: str) -> None:
+        """Records how a saved episode ended ("success" / "failure") for offline RL (``write_outcome``)."""
+        if not 0 <= int(episode_index) < self.num_episodes:
+            raise RecorderError(f"{self.root} has no episode {episode_index}")
+        write_outcome(self.root, episode_index, outcome)
 
     def close(self) -> None:
         """Discards an unsaved episode."""

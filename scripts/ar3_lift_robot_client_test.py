@@ -12,8 +12,10 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
 
+from openpi.data import tactile_cache
 from openpi.models import model as _model
 from openpi.policies import ar3_lift_policy as ar3
+from scripts import ar3_lift_recorder
 from scripts import ar3_lift_robot_client as client
 
 HORIZON = 10
@@ -107,6 +109,16 @@ def test_hand_reading_sends_stale_or_malformed_fingers_as_missing(monkeypatch, c
     np.testing.assert_allclose(depth.max(axis=(1, 2)), [0.1, 0.2], rtol=1e-3)
     assert valid.tolist() == [True, True]
     np.testing.assert_allclose(wrench, [1, 2, 0.1, 4, 5, 6, 1, 2, 0.2, 4, 5, 6], rtol=1e-6)
+
+    # The recorder reads the same fingers with their receipt times, also while the operator has taken over.
+    robot._takeover_at = 9.0
+    with pytest.raises(client.HumanTakeover):
+        robot.hand_reading()
+    snapshot = robot.hand_snapshot()
+    for recorded, sent in zip(snapshot[:3], (depth, valid, wrench), strict=True):
+        np.testing.assert_array_equal(recorded, sent)
+    assert snapshot[3].tolist() == [9.9, 9.9]
+    robot._takeover_at = None
 
     robot._tactile["wrench", "sensor_2"] = (robot._tactile["wrench", "sensor_2"][0], 9.7)  # older than 0.2 s
     robot._tactile["depth", "sensor_0"][0].encoding = "16UC1"
@@ -1059,15 +1071,25 @@ def test_human_chunks_count_the_training_samples_of_intervention_only():
 
 
 class FakeWriter:
+    root = "/data/rollouts"
+
     def __init__(self):
-        self.frames, self.events = [], []
+        self.frames, self.tactile, self.events = [], [], []
 
     def start_episode(self):
         self.events.append("start")
 
-    def add_frame(self, values, images):
+    def add_frame(self, values, images, tactile=None):
         assert images["front"].shape == (2, 2, 3)
         self.frames.append(values)
+        self.tactile.append(tactile)
+
+    def save_episode(self):
+        self.events.append("save")
+        return 4
+
+    def label_episode(self, index, outcome):
+        self.events.append(("label", index, outcome))
 
     def discard_episode(self):
         self.events.append("discard")
@@ -1090,7 +1112,111 @@ def test_rollout_recorder_records_10_hz_frames_up_to_the_end_time():
     np.testing.assert_allclose(np.diff(times), 0.1)
     assert times[-1] <= until
     assert [values["actions"][6] for values in writer.frames] == [900.0] * 3  # no policy target yet: hold
+    assert writer.tactile == [None] * 3
     assert writer.events == ["start", "discard", "close"]
+
+
+def test_recorded_frames_carry_the_fingers_the_policy_is_sent():
+    tactile = client.tactile_io()
+    maps = np.stack([np.full(tactile.DEPTH_SHAPE, value, dtype=np.float16) for value in (0.1, 0.2)])
+    wrench = np.arange(12, dtype=np.float32)
+    t = 50.0
+    # Polled 10 ms before the frame; the messages of sensor_2 arrived more than the age limit before it.
+    hand = client.Sample(t - 0.01, (maps, np.array([True, True]), wrench, np.array([t - 0.03, t - 0.25])))
+    values, (depth, valid) = client.hand_frame(hand, t, 0.2)
+    assert valid.tolist() == [True, False]
+    assert depth.dtype == np.float32
+    np.testing.assert_array_equal(depth[0], maps[0])
+    assert not depth[1].any()
+    np.testing.assert_array_equal(values["observation.gripper_wrench.sensor_0"], wrench[:6])
+    assert not np.any(values["observation.gripper_wrench.sensor_2"])
+    assert values["sync.gripper_wrench.sensor_0.timing_s"] == [t - 0.03, 0.0]
+    # Before the first poll, or for a finger that never published, the frame has no reading.
+    silent = client.Sample(t - 0.01, (maps * 0, np.array([False, False]), wrench * 0, np.array([-np.inf, -np.inf])))
+    for missing in (None, silent):
+        values, (depth, valid) = client.hand_frame(missing, t, 0.2)
+        assert not valid.any()
+        assert not depth.any()
+        assert values["sync.gripper_wrench.sensor_2.timing_s"] == [0.0, 0.0]
+
+
+def test_rollout_recorder_adds_the_fingers_of_tactile_policies_and_labels_the_outcome():
+    tactile = client.tactile_io()
+    writer = FakeWriter()
+    maps = np.full((2, *tactile.DEPTH_SHAPE), 0.1, dtype=np.float16)
+
+    def hand_snapshot(*, max_age):
+        assert max_age == 0.3
+        received = np.array([time.monotonic() - 0.01, -np.inf])  # sensor_2 never published
+        return maps, np.array([True, False]), np.arange(12, dtype=np.float32), received
+
+    robot = types.SimpleNamespace(
+        recording_samples=lambda t: {k: v for k, v in _samples(t).items() if k != "gripper"},
+        hand_snapshot=hand_snapshot,
+    )
+    gripper = types.SimpleNamespace(read=lambda: 900.0, target=None)
+    recorder = client.RolloutRecorder(robot, writer, gripper, horizon=2, tactile=True, max_tactile_age=0.3)
+    time.sleep(0.1)  # as on the robot, the fingers are polled before the first episode starts
+    recorder.start()
+    summary = recorder.stop(time.monotonic() + 0.25)
+    assert summary == {"frames": 3, "human": 0, "chunks": 0, "stale": {"tactile": 3}}
+    for values, (depth, valid) in zip(writer.frames, writer.tactile, strict=True):
+        assert valid.tolist() == [True, False]
+        np.testing.assert_array_equal(depth[0], maps[0])
+        np.testing.assert_array_equal(values["observation.gripper_wrench.sensor_0"], np.arange(6))
+        received = values["sync.gripper_wrench.sensor_0.timing_s"][0]
+        assert 0 < values["sync.target_host_s"][0] - received <= 0.3
+    assert recorder.save("failure") == 4
+    assert recorder.save() == 4
+    recorder.close()
+    assert writer.events == ["start", "save", ("label", 4, "failure"), "save", "discard", "close"]
+
+
+def test_tactile_rollouts_are_written_as_a_dataset_the_tactile_cache_reads(tmp_path):
+    tactile = client.tactile_io()
+    image = types.SimpleNamespace(encoding="rgb8", height=48, width=64, step=192, data=bytes(48 * 64 * 3))
+    maps = np.random.default_rng(0).uniform(0.0, 0.3, size=(2, *tactile.DEPTH_SHAPE)).astype(np.float16)
+
+    def recording_samples(t):
+        cameras = {"front": client.Sample(t + 0.01, image, 7.0, 3), "wrist": client.Sample(t - 0.02, image, 8.0, 4)}
+        return {k: v for k, v in _samples(t, **cameras).items() if k != "gripper"}
+
+    def hand_snapshot(*, max_age):
+        received = np.array([time.monotonic() - 0.01, -np.inf])
+        return maps, np.array([True, False]), np.arange(12, dtype=np.float32), received
+
+    robot = types.SimpleNamespace(recording_samples=recording_samples, hand_snapshot=hand_snapshot)
+    gripper = types.SimpleNamespace(read=lambda: 900.0, target=None)
+    root = tmp_path / "rollouts"
+    writer = ar3_lift_recorder.EpisodeRecorder(root, task="plug in", image_size=(48, 64), tactile=True)
+    recorder = client.RolloutRecorder(robot, writer, gripper, horizon=2, tactile=True)
+    time.sleep(0.1)
+    recorder.start()
+    assert recorder.stop(time.monotonic() + 0.25)["frames"] == 3
+    assert recorder.save("success") == 0
+    recorder.close()
+
+    depth, valid = tactile_cache.TactileCache(tactile_cache.build_cache(root, workers=1)).frames(0, np.arange(3))
+    assert valid.tolist() == [[True, False]] * 3
+    np.testing.assert_array_equal(depth[:, 0], np.broadcast_to(maps[0], (3, *tactile.DEPTH_SHAPE)))
+    assert not depth[:, 1].any()
+    assert json.loads((root / "rl" / "outcomes.json").read_text())["episodes"] == {"0": "success"}
+
+
+def test_the_operator_can_label_saved_episodes_for_offline_rl():
+    session = client.Session(client.parse_args(["--record-dir", "unused", "--start-pose", *["0"] * 6]))
+    saved, discarded = [], []
+    session.recorder = types.SimpleNamespace(
+        save=lambda outcome=None: saved.append(outcome) or len(saved) - 1,
+        discard=lambda: discarded.append(True),
+        writer=FakeWriter(),
+    )
+    answers = iter(["y", "n", "", "?", "d", "q"])
+    session.console = types.SimpleNamespace(ask=lambda prompt, default: next(answers))
+    summary = {"frames": 5, "human": 0, "chunks": 0, "stale": {}}
+    assert [session._keep_episode(summary) for _ in range(5)] == [True, True, True, True, False]
+    assert saved == ["success", "failure", None, None]
+    assert discarded == [True]
 
 
 def test_takeover_episodes_record_until_the_clutch_release_and_leave_the_stop_to_the_teleoperation(monkeypatch):

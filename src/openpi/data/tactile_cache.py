@@ -188,14 +188,19 @@ def build_cache(
     max_age_s = _capture_max_age(meta.root) if max_age_s is None else float(max_age_s)
     if (out_dir / "meta.json").is_file() and not overwrite:
         cache = TactileCache(out_dir)
-        cache.check_episodes({index: int(episode["length"]) for index, episode in meta.episodes.items()})
         if (cache.sensors, cache.shape, cache.max_age_s) != (tuple(sensors), shape, max_age_s):
             raise ValueError(
                 f"{out_dir} holds {cache.sensors} {cache.shape} maps aligned with max_age_s={cache.max_age_s}; "
                 "rebuild it with overwrite=True"
             )
-        logger.info("Tactile cache %s is up to date", out_dir)
-        return out_dir
+        try:
+            cache.check_episodes({index: int(episode["length"]) for index, episode in meta.episodes.items()})
+        except ValueError:
+            # Episodes were added since (rollouts recorded between RL rounds, DAgger rounds).
+            logger.info("Tactile cache %s does not cover the episodes of the dataset any more: rebuilding", out_dir)
+        else:
+            logger.info("Tactile cache %s is up to date", out_dir)
+            return out_dir
 
     times = _frame_target_times(meta)
     offsets: dict[int, tuple[int, int]] = {}

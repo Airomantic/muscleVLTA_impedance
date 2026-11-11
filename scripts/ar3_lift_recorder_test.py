@@ -2,9 +2,14 @@ import dataclasses
 import json
 
 import numpy as np
+from openpi_client import tactile
 import pytest
 
 from openpi.data import lerobot_v3
+from openpi.data import tactile_cache
+from openpi.policies import ar3_lift_policy as ar3
+from openpi.rl import frames as rl_frames
+from openpi.rl import outcomes as rl_outcomes
 from openpi.training import config as _config
 from openpi.training import data_loader
 from scripts import ar3_lift_recorder as recorder_lib
@@ -198,3 +203,96 @@ def test_offline_sessions_must_be_recorded_alike(tmp_path):
     info_path.write_text(json.dumps(info))
     with pytest.raises(ValueError, match=r"observation.tcp_pose has shape \[6\]"):
         read_with(other)
+
+
+def _record_tactile(recorder: recorder_lib.EpisodeRecorder, depth: np.ndarray, valid: np.ndarray, start: float) -> int:
+    recorder.start_episode()
+    for step in range(len(depth)):
+        values = {key: np.full(recorder.features[key]["shape"], step + 0.25) for key in recorder.frame_keys}
+        values["control_flag"] = recorder_lib.POLICY_FLAG
+        values["sync.target_host_s"] = start + step / FPS
+        recorder.add_frame(values, _images(step), (depth[step], valid[step]))
+    return recorder.save_episode()
+
+
+def test_tactile_rollouts_train_with_the_fingers_of_every_frame(tmp_path):
+    # The recorder runs on the robot PC without openpi and keeps its own copy of the finger layout.
+    assert (recorder_lib.TACTILE_SENSORS, recorder_lib.TACTILE_DEPTH_SHAPE) == (tactile.SENSORS, tactile.DEPTH_SHAPE)
+    root = tmp_path / "rollouts"
+    depth = np.random.default_rng(0).uniform(0.0, 0.3, size=(8, 2, *recorder_lib.TACTILE_DEPTH_SHAPE))
+    depth = depth.astype(np.float16)
+    valid = np.ones((8, 2), dtype=bool)
+    valid[3, 0] = False  # one finger drops out for a frame,
+    valid[[0, 6, 7], 1] = False  # the other one starts late and stops early
+    recorder = _recorder(root, tactile=True, capture_info={"source": "test"})
+    assert _record_tactile(recorder, depth, valid, start=100.0) == 0
+    recorder.label_episode(0, "failure")
+    cache_dir = tactile_cache.build_cache(root, workers=1)
+
+    # A later session appends an episode in which only one finger ever reads; its outcome is added to the labels.
+    one_finger = np.zeros((5, 2), dtype=bool)
+    one_finger[:, 0] = True
+    recorder = _recorder(root, tactile=True)
+    assert _record_tactile(recorder, depth[:5], one_finger, start=300.0) == 1
+    recorder.label_episode(1, "success")
+    with pytest.raises(recorder_lib.RecorderError, match="no episode 2"):
+        recorder.label_episode(2, "success")
+    with pytest.raises(recorder_lib.RecorderError, match="unknown outcome"):
+        recorder.label_episode(1, "ok")
+    assert not (root / "tactile" / "episode-000001" / "tactile_depth.sensor_2.parquet").exists()
+    capture = json.loads((root / "meta" / "ar3_capture.json").read_text())
+    assert capture["source"] == "test"
+    assert 0 < capture["robot"]["max_tactile_age_s"] < 1 / FPS
+
+    # The cache is rebuilt for the new episode and gives every frame exactly the fingers it was recorded with:
+    # a missing finger is not filled with its map of the frame before.
+    assert tactile_cache.build_cache(root, workers=1) == cache_dir
+    cache = tactile_cache.TactileCache(cache_dir)
+    assert cache.episodes == {0: (0, 8), 1: (8, 5)}
+    cached_depth, cached_valid = cache.frames(0, np.arange(8))
+    np.testing.assert_array_equal(cached_valid, valid)
+    np.testing.assert_array_equal(cached_depth, np.where(valid[:, :, None, None], depth, 0))
+    np.testing.assert_array_equal(cache.frames(1, np.arange(5))[1], one_finger)
+
+    # The policy trains on these fingers (wrench columns + maps), ...
+    sensor_keys = (*ar3.FORCE_KEYS_WRENCH_TAU_M, *ar3.HAND_KEYS)
+    data_config = _config.DataConfig(
+        repo_id=str(root),
+        action_sequence_keys=("actions", *sensor_keys),
+        history_keys=sensor_keys,
+        history_length=2,
+        tactile_cache="auto",
+    )
+    dataset = data_loader.create_torch_dataset(data_config, 4, None, decode_videos=False)
+    inputs = ar3.AR3LiftRepack(history_length=2, tactile=True)(dataset[3])
+    np.testing.assert_array_equal(inputs["tactile_valid"], valid[1:7])
+    np.testing.assert_array_equal(inputs["tactile_depth"], cached_depth[1:7])
+    np.testing.assert_array_equal(inputs["tactile_wrench"][:, 0], np.arange(1, 7) + 0.25)
+
+    # ... and offline RL reads them and how the episodes ended.
+    table = rl_frames.load(root)
+    np.testing.assert_array_equal(table.finger_valid, np.concatenate([valid, one_finger]))
+    np.testing.assert_array_equal(table.depth[:8], cached_depth)
+    assert not table.human.any()
+    outcomes = rl_outcomes.load(root)
+    assert [outcomes.success(index) for index in table.lengths] == [False, True]
+
+    # Recordings with and without the fingers do not mix.
+    with pytest.raises(recorder_lib.RecorderError, match="different features"):
+        _recorder(root)
+    plain = _recorder(tmp_path / "plain")
+    plain.start_episode()
+    values = {key: np.zeros(plain.features[key]["shape"]) for key in plain.frame_keys}
+    with pytest.raises(recorder_lib.RecorderError, match="tactile=True"):
+        plain.add_frame(values, _images(0), (depth[0], valid[0]))
+    plain.close()
+    recorder.start_episode()
+    values = {key: np.zeros(recorder.features[key]["shape"]) for key in recorder.frame_keys}
+    with pytest.raises(recorder_lib.RecorderError, match="missing the Tac G2 reading"):
+        recorder.add_frame(values, _images(0))
+    with pytest.raises(recorder_lib.RecorderError, match="Tac G2 maps"):
+        recorder.add_frame(values, _images(0), (depth[0, :1], valid[0]))
+    recorder.close()
+    (root / "meta" / "ar3_capture.json").write_text(json.dumps({"robot": {"max_tactile_age_s": 0.2}}))
+    with pytest.raises(recorder_lib.RecorderError, match="one Tac G2 map per frame"):
+        _recorder(root, tactile=True)

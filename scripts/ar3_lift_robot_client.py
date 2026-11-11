@@ -39,13 +39,15 @@ policy timeouts, gripper errors and Ctrl+C, waiting for the controller to confir
 Recording and DAgger (``--record-dir DIR``, ``--dagger``): episodes (move to the start pose, policy rollout, operator
 prompt to save or discard) are appended to a LeRobot v3.0 dataset with the features of the lerobot AR3 recordings
 (``scripts/ar3_lift_recorder.py``: front / wrist videos, TCP pose, gripper position, TCP wrench, ``tau_m``, the
-accepted TCP target + gripper target as ``actions``, ``control_flag``). With ``--dagger`` the AR3 teleoperation runs
-next to the client for LIFT's human-in-the-loop corrections: pressing its clutch takes over at once (the client stops
-commanding; the teleoperation continues the same controller session from the measured TCP, and the gated gripper
-teleoperation ``scripts/ar3_dagger_gripper_teleop.sh`` gets the gripper once its trigger matches the fingers).
-Releasing the clutch ends the episode (the teleoperation stops the arm). Frames commanded by the operator get
-``control_flag`` -1, policy frames +1; ``scripts/train_ar3_lift_dagger_gpu012.sh`` trains on the human chunks 1:1 with
-the offline demonstrations.
+accepted TCP target + gripper target as ``actions``, ``control_flag``; for muscleVLTA policies with the Tac G2 fingers
+also the finger wrenches and the pooled indentation map of every frame). Saving an episode as a success or a failure
+(``y`` / ``n`` at the prompt) labels it for offline RL (``scripts/train_ar3_muscle_vlta_rl.sh``). With ``--dagger``
+the AR3 teleoperation runs next to the client for LIFT's human-in-the-loop corrections: pressing its clutch takes over
+at once (the client stops commanding; the teleoperation continues the same controller session from the measured TCP,
+and the gated gripper teleoperation ``scripts/ar3_dagger_gripper_teleop.sh`` gets the gripper once its trigger matches
+the fingers). Releasing the clutch ends the episode (the teleoperation stops the arm). Frames commanded by the operator
+get ``control_flag`` -1, policy frames +1; ``scripts/train_ar3_lift_dagger_gpu012.sh`` trains on the human chunks 1:1
+with the offline demonstrations.
 """
 
 import argparse
@@ -1135,20 +1137,46 @@ class Ar3Robot:
         step, like the tactile cache) and decode; otherwise it is sent as missing with zeros, which the policy was
         trained with (finger dropout, recording gaps). Changes of the missing fingers are logged.
         """
-        tactile = tactile_io()
         now = time.monotonic()
         with self._lock:
             self._raise_if_fault_locked()
             samples = dict(self._tactile)
+        depth, valid, wrench, _, problems = self._read_hand(samples, now, max_age)
+        if problems.keys() != self._finger_problems.keys():
+            if problems:
+                logger.warning("Tac G2 fingers missing (%s); the policy continues without them", _describe(problems))
+            else:
+                logger.info("Tac G2 fingers available again")
+        self._finger_problems = problems
+        return depth, valid, wrench
+
+    def hand_snapshot(
+        self, *, max_age: float = MAX_TACTILE_AGE
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """``hand_reading`` for the recorder, with the host times [2] at which the fingers' newest messages arrived
+        (-inf without any). It also reads during a human takeover or after a fault, and does not log."""
+        now = time.monotonic()
+        with self._lock:
+            samples = dict(self._tactile)
+        return self._read_hand(samples, now, max_age)[:4]
+
+    @staticmethod
+    def _read_hand(
+        samples: dict[tuple[str, str], tuple[Any, float]], now: float, max_age: float
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, str]]:
+        """Maps, finger validity, finger wrenches, receipt times and the problems of the missing fingers."""
+        tactile = tactile_io()
         depth = np.zeros((len(tactile.SENSORS), *tactile.DEPTH_SHAPE), dtype=np.float16)
         wrench = np.zeros((len(tactile.SENSORS), tactile.WRENCH_DIM), dtype=np.float32)
         valid = np.zeros(len(tactile.SENSORS), dtype=bool)
+        received = np.full(len(tactile.SENSORS), -math.inf)
         problems: dict[str, str] = {}
         for index, sensor in enumerate(tactile.SENSORS):
             (depth_message, depth_at), (wrench_message, wrench_at) = (
                 samples.get((kind, sensor), (None, -math.inf)) for kind in ("depth", "wrench")
             )
-            age = now - min(depth_at, wrench_at)
+            received[index] = min(depth_at, wrench_at)
+            age = now - received[index]
             if age > max_age:
                 problems[sensor] = "no samples" if math.isinf(age) else f"samples {age:.2f} s old"
                 continue
@@ -1160,13 +1188,7 @@ class Ar3Robot:
                 problems[sensor] = str(error)
                 continue
             valid[index] = True
-        if problems.keys() != self._finger_problems.keys():
-            if problems:
-                logger.warning("Tac G2 fingers missing (%s); the policy continues without them", _describe(problems))
-            else:
-                logger.info("Tac G2 fingers available again")
-        self._finger_problems = problems
-        return depth, valid, wrench.reshape(-1)
+        return depth, valid, wrench.reshape(-1), received, problems
 
     def poses(self) -> tuple[tuple[np.ndarray, np.ndarray], Any, Any]:
         """(measured, last streamed command, current target) poses; the last two are None when not streaming."""
@@ -2049,6 +2071,34 @@ def frame_values(samples: dict[str, Sample | None], t: float) -> tuple[dict[str,
     return values, problems
 
 
+def hand_frame(hand: Sample | None, t: float, max_age: float) -> tuple[dict[str, Any], tuple[np.ndarray, np.ndarray]]:
+    """Tac G2 part of the recorded frame describing host time ``t``: the finger wrench columns and the reading of
+    ``EpisodeRecorder.add_frame`` (pooled maps [2, 48, 64], finger validity [2]).
+
+    ``hand``: the newest ``Ar3Robot.hand_snapshot`` taken at or before ``t``. A finger whose messages arrived more
+    than ``max_age`` before ``t`` is recorded as missing, with zeros, as the policy is sent it.
+    """
+    tactile = tactile_io()
+    fingers = len(tactile.SENSORS)
+    depth = np.zeros((fingers, *tactile.DEPTH_SHAPE), dtype=np.float32)
+    wrench = np.zeros((fingers, tactile.WRENCH_DIM), dtype=np.float32)
+    valid = np.zeros(fingers, dtype=bool)
+    received = np.full(fingers, -math.inf)
+    if hand is not None:
+        maps, fresh, wrenches, received = hand.value
+        valid = np.asarray(fresh, dtype=bool) & (t - received <= max_age)
+        depth[valid] = maps[valid]
+        wrench[valid] = np.reshape(wrenches, (fingers, -1))[valid]
+    values: dict[str, Any] = {}
+    for index, sensor in enumerate(tactile.SENSORS):
+        values[f"observation.gripper_wrench.{sensor}"] = wrench[index]
+        values[f"sync.gripper_wrench.{sensor}.timing_s"] = [
+            received[index] if math.isfinite(received[index]) else 0.0,
+            0.0,
+        ]
+    return values, (depth, valid)
+
+
 def human_chunks(flags: Sequence[int], horizon: int) -> int:
     """Frames LIFT trains on (``intervention_only``): the next ``horizon`` flags (up to the episode end) are human."""
     count = run = 0
@@ -2062,19 +2112,32 @@ class RolloutRecorder:
     """Records episodes with an ``ar3_lift_recorder.EpisodeRecorder`` (``writer``).
 
     Frame ``k`` describes host time ``T = start + k / fps`` and is assembled ``SYNC_DELAY`` after ``T`` from the
-    robot's input history and a 20 Hz gripper poll (position + the policy's current target).
+    robot's input history and a 20 Hz poll of the gripper (position + the policy's current target) and, with
+    ``tactile``, of the Tac G2 fingers (``hand_frame``: the reading the policy is sent, up to a poll period older).
     """
 
     def __init__(
-        self, robot: Any, writer: Any, gripper: Any, *, fps: int = RECORD_FPS, horizon: int = 10, poll_hz: float = 20.0
+        self,
+        robot: Any,
+        writer: Any,
+        gripper: Any,
+        *,
+        fps: int = RECORD_FPS,
+        horizon: int = 10,
+        poll_hz: float = 20.0,
+        tactile: bool = False,
+        max_tactile_age: float = MAX_TACTILE_AGE,
     ) -> None:
         self.writer = writer
         self._robot = robot
         self._gripper = gripper
         self._fps = fps
         self._horizon = horizon
+        self._tactile = tactile
+        self._max_tactile_age = max_tactile_age
         self._lock = threading.Lock()
         self._gripper_samples = Stream(64)
+        self._hand_samples = Stream(64)
         self._closed = threading.Event()
         self._thread: threading.Thread | None = None
         self._until = math.inf
@@ -2092,6 +2155,11 @@ class RolloutRecorder:
         failing = False
         while True:
             started = time.monotonic()
+            if self._tactile:
+                reading = self._robot.hand_snapshot(max_age=self._max_tactile_age)
+                with self._lock:
+                    # Stamped after the snapshot: everything in it had arrived by then.
+                    self._hand_samples.add(Sample(time.monotonic(), reading, time.time()))
             try:
                 position = self._gripper.read()
             except GripperError as error:
@@ -2133,8 +2201,17 @@ class RolloutRecorder:
         samples = self._robot.recording_samples(t)
         with self._lock:
             samples["gripper"] = self._gripper_samples.at(t)
+            hand = self._hand_samples.before(t)
         values, problems = frame_values(samples, t)
-        self.writer.add_frame(values, {name: rgb_image(samples[name].value) for name in ("front", "wrist")})
+        images = {name: rgb_image(samples[name].value) for name in ("front", "wrist")}
+        if self._tactile:
+            hand_values, reading = hand_frame(hand, t, self._max_tactile_age)
+            values.update(hand_values)
+            self.writer.add_frame(values, images, reading)
+            if not reading[1].all():
+                self._stale["tactile"] += 1
+        else:
+            self.writer.add_frame(values, images)
         self._flags.append(int(values["control_flag"][0]))
         self._stale.update(problems)
 
@@ -2158,11 +2235,15 @@ class RolloutRecorder:
         self._join()
         self.writer.discard_episode()
 
-    def save(self) -> int:
+    def save(self, outcome: str | None = None) -> int:
+        """Saves the episode; ``outcome`` ("success" / "failure") also records how it ended, for offline RL."""
         try:
-            return self.writer.save_episode()
+            index = self.writer.save_episode()
+            if outcome is not None:
+                self.writer.label_episode(index, outcome)
         except Exception as error:
             raise RobotError(f"saving the episode failed: {error}") from error
+        return index
 
     def discard(self) -> None:
         self.writer.discard_episode()
@@ -2425,10 +2506,6 @@ class Session:
             args.control_hz,
             args.prompt,
         )
-        if tactile and self.recording:
-            logger.warning(
-                "--record-dir does not save the Tac G2 fingers yet: these episodes train with the fingers missing"
-            )
         if args.warmup:
             warm_up(robot, self.planner, self.gripper, config)
         episodes = args.record_dir is not None or args.dagger or args.episodes != 1
@@ -2467,7 +2544,7 @@ class Session:
         args = self.args
         self.console = Console()
         if self.recording:
-            self._open_recorder(metadata)
+            self._open_recorder(metadata, config)
         logger.info("%s", DAGGER_HELP if args.dagger else "Enter ends an episode early, Ctrl+C aborts.")
         if not args.execute:
             logger.warning("dry run: the arm stays where it is (episodes only exercise the policy and the recording)")
@@ -2484,7 +2561,7 @@ class Session:
         logger.info("finished %d episode(s)", done)
         return 0
 
-    def _open_recorder(self, metadata: dict) -> None:
+    def _open_recorder(self, metadata: dict, config: RunConfig) -> None:
         args = self.args
         try:
             if __package__:
@@ -2515,6 +2592,9 @@ class Session:
             "gripper_force": args.gripper_force,
             "sync_delay_s": SYNC_DELAY,
         }
+        if config.tactile:
+            # The fingers are recorded as measured, also when the policy was not sent them (--mask-tactile).
+            capture_info["tactile"] = {"max_age_s": config.max_tactile_age, "masked_for_policy": config.mask_tactile}
         try:
             writer = ar3_lift_recorder.EpisodeRecorder(
                 args.record_dir,
@@ -2522,11 +2602,24 @@ class Session:
                 fps=RECORD_FPS,
                 image_size=observation.front.shape[:2],
                 capture_info=capture_info,
+                tactile=config.tactile,
             )
         except (ar3_lift_recorder.RecorderError, OSError, ValueError) as error:
             raise RobotError(f"cannot record to {args.record_dir}: {error}") from error
-        self.recorder = RolloutRecorder(self.robot, writer, self.gripper, horizon=self.planner.horizon)
-        logger.info("recording to %s (%d episodes so far)", writer.root, writer.num_episodes)
+        self.recorder = RolloutRecorder(
+            self.robot,
+            writer,
+            self.gripper,
+            horizon=self.planner.horizon,
+            tactile=config.tactile,
+            max_tactile_age=config.max_tactile_age,
+        )
+        logger.info(
+            "recording to %s (%d episodes so far%s)",
+            writer.root,
+            writer.num_episodes,
+            ", with the Tac G2 fingers" if config.tactile else "",
+        )
 
     def _start_episode(self) -> bool:
         """Activates the controller and moves to the start pose. False if the operator quits."""
@@ -2604,10 +2697,21 @@ class Session:
             logger.warning("empty episode discarded")
             return True
         while True:
-            answer = self.console.ask("Enter/s = save, d = discard, q = save and quit, x = discard and quit", "q")
-            if answer in ("", "s", "q"):
-                index = self.recorder.save()
-                logger.info("saved episode %d in %s", index, self.recorder.writer.root)
+            answer = self.console.ask(
+                "Enter/s = save, y = save as success, n = save as failure, d = discard, "
+                "q = save and quit, x = discard and quit",
+                "q",
+            )
+            if answer in ("", "s", "q", "y", "n"):
+                # Offline RL (scripts/ar3_rl.py) trains on how the episodes ended.
+                outcome = {"y": "success", "n": "failure"}.get(answer)
+                index = self.recorder.save(outcome)
+                logger.info(
+                    "saved episode %d in %s%s",
+                    index,
+                    self.recorder.writer.root,
+                    f", labelled {outcome} (rl/outcomes.json)" if outcome else "",
+                )
                 return answer != "q"
             if answer in ("d", "x"):
                 self.recorder.discard()
@@ -2907,7 +3011,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     record.add_argument(
         "--record-dir",
         default=None,
-        help="append the episodes the operator keeps to this LeRobot v3.0 dataset (created if missing)",
+        help="append the episodes the operator keeps to this LeRobot v3.0 dataset (created if missing); tactile "
+        "policies also record the Tac G2 fingers, and y / n at the save prompt label the outcome for offline RL",
     )
     record.add_argument(
         "--dagger",
