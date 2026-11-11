@@ -1172,6 +1172,33 @@ def test_rollout_recorder_adds_the_fingers_of_tactile_policies_and_labels_the_ou
     assert writer.events == ["start", "save", ("label", 4, "failure"), "save", "discard", "close"]
 
 
+def test_a_slow_gripper_request_does_not_make_the_fingers_look_missing():
+    tactile = client.tactile_io()
+    writer = FakeWriter()
+    maps = np.full((2, *tactile.DEPTH_SHAPE), 0.1, dtype=np.float16)
+
+    def hand_snapshot(*, max_age):
+        return maps, np.array([True, True]), np.arange(12, dtype=np.float32), np.full(2, time.monotonic() - 0.01)
+
+    def slow_read():
+        time.sleep(0.25)
+        return 900.0
+
+    robot = types.SimpleNamespace(
+        recording_samples=lambda t: {k: v for k, v in _samples(t).items() if k != "gripper"},
+        hand_snapshot=hand_snapshot,
+    )
+    gripper = types.SimpleNamespace(read=slow_read, target=None)
+    recorder = client.RolloutRecorder(robot, writer, gripper, horizon=2, tactile=True, max_tactile_age=0.15)
+    time.sleep(0.35)  # the first gripper position has arrived
+    recorder.start()
+    summary = recorder.stop(time.monotonic() + 0.45)
+    recorder.close()
+    assert summary["frames"] == 5
+    assert "tactile" not in summary["stale"]
+    assert all(valid.all() for _, valid in writer.tactile)
+
+
 def test_tactile_rollouts_are_written_as_a_dataset_the_tactile_cache_reads(tmp_path):
     tactile = client.tactile_io()
     image = types.SimpleNamespace(encoding="rgb8", height=48, width=64, step=192, data=bytes(48 * 64 * 3))

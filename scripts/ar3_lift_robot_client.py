@@ -2112,7 +2112,7 @@ class RolloutRecorder:
     """Records episodes with an ``ar3_lift_recorder.EpisodeRecorder`` (``writer``).
 
     Frame ``k`` describes host time ``T = start + k / fps`` and is assembled ``SYNC_DELAY`` after ``T`` from the
-    robot's input history and a 20 Hz poll of the gripper (position + the policy's current target) and, with
+    robot's input history and 20 Hz polls of the gripper (position + the policy's current target) and, with
     ``tactile``, of the Tac G2 fingers (``hand_frame``: the reading the policy is sent, up to a poll period older).
     """
 
@@ -2146,6 +2146,9 @@ class RolloutRecorder:
         self._stale: collections.Counter[str] = collections.Counter()
         self._poller = threading.Thread(target=self._poll, args=(1.0 / poll_hz,), name="gripper-poll", daemon=True)
         self._poller.start()
+        if tactile:
+            # A thread of its own: a slow gripper request must not make the fingers look missing.
+            threading.Thread(target=self._poll_hand, args=(1.0 / poll_hz,), name="hand-poll", daemon=True).start()
 
     @property
     def failed(self) -> bool:
@@ -2155,11 +2158,6 @@ class RolloutRecorder:
         failing = False
         while True:
             started = time.monotonic()
-            if self._tactile:
-                reading = self._robot.hand_snapshot(max_age=self._max_tactile_age)
-                with self._lock:
-                    # Stamped after the snapshot: everything in it had arrived by then.
-                    self._hand_samples.add(Sample(time.monotonic(), reading, time.time()))
             try:
                 position = self._gripper.read()
             except GripperError as error:
@@ -2170,6 +2168,16 @@ class RolloutRecorder:
                 failing = False
                 with self._lock:
                     self._gripper_samples.add(Sample(time.monotonic(), (position, self._gripper.target), time.time()))
+            if self._closed.wait(max(period - (time.monotonic() - started), 0.0)):
+                return
+
+    def _poll_hand(self, period: float) -> None:
+        while True:
+            started = time.monotonic()
+            reading = self._robot.hand_snapshot(max_age=self._max_tactile_age)
+            with self._lock:
+                # Stamped after the snapshot: everything in it had arrived by then.
+                self._hand_samples.add(Sample(time.monotonic(), reading, time.time()))
             if self._closed.wait(max(period - (time.monotonic() - started), 0.0)):
                 return
 
