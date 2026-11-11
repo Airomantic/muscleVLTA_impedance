@@ -474,7 +474,7 @@ Serving, replay validation and the robot client are those of muscleVLTA above wi
 
 **Figures**: `picture/musclevlta_architecture.{svg,pdf,png}` (v1) and `picture/musclevlta_v2_architecture.*` are
 exported by `scripts/build_figures.py` from the editable sources in `picture/src/` (which link
-`picture/forceVisuotactile_robot.svg` and `picture/src/frames/`). The exported SVGs are single files that only use
+`picture/robot-plug-no-sticker.svg` and `picture/src/frames/`). The exported SVGs are single files that only use
 what PowerPoint and Word display; `scripts/build_figure_assets.py` extracts the recorded frames they show.
 
 **Result figures, smoothness and the manuscript.** `scripts/build_result_figures.py` draws the real-robot success

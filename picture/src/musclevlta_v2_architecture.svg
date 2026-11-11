@@ -122,7 +122,7 @@
   <text x="39" y="163" font-size="12" font-weight="bold" fill="#A85A08">FAST · joint force stream · every control step (10 Hz)</text>
   <g id="robot">
     <text class="n c" x="82" y="181">AR3 arm + Tac G2</text>
-    <image id="robot-photo" x="15" y="186" width="134" height="178.7" xlink:href="../forceVisuotactile_robot.svg"/>
+    <image id="robot-photo" x="15" y="186" width="134" height="178.7" xlink:href="../robot-plug-no-sticker.svg"/>
     <path d="M57 234 L154 222" fill="none" stroke="#FFFFFF" stroke-width="3" stroke-opacity="0.85"/>
     <path d="M57 234 L154 222" fill="none" stroke="#DD7A1E" stroke-width="1.2"/>
     <circle cx="57" cy="234" r="3.2" fill="#FFFFFF" stroke="#DD7A1E" stroke-width="1.6"/>
