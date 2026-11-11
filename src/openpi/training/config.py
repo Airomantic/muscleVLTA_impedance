@@ -40,6 +40,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.ar3_lift_policy as ar3_lift_policy
 from openpi.policies.flexiv_transforms import ACTION_NAMES
 import openpi.policies.single_iphone_flexiv_policy as single_iphone_flexiv_policy
+import openpi.rl.advantage as _advantage
 import openpi.shared.download as _download
 from openpi.shared.episode_schema import DEFAULT_INTERVENTION_VALUE
 import openpi.shared.normalize as _normalize
@@ -93,6 +94,18 @@ _DEFAULT_AR3_DAGGER_INIT_PARAMS = os.environ.get(
     "OPENPI_AR3_DAGGER_INIT_PARAMS", "<set OPENPI_AR3_DAGGER_INIT_PARAMS to the offline checkpoint <step>/params>"
 )
 _DEFAULT_AR3_DAGGER_ASSETS_DIR = os.environ.get("OPENPI_AR3_DAGGER_ASSETS_DIR") or None
+# AR3 offline RL presets (pi05_ar3_muscle_vlta*_rl*, scripts/train_ar3_muscle_vlta_rl.sh): advantage-conditioned
+# fine-tuning on all OPENPI_AR3_REPO_ID datasets (demonstrations and labelled rollouts, openpi.rl). The tag of their
+# advantage labels (<dataset>/rl/advantage_<tag>.npz), the share of training samples without the indicator (*_recap
+# presets), the policy checkpoint params to continue from and its assets directory (<step>/assets: its normalization
+# statistics are reused), and the indicator of the served policy ("positive", or "negative" / "none" to compare).
+_DEFAULT_AR3_RL_TAG = os.environ.get("OPENPI_AR3_RL_TAG", "recap")
+_DEFAULT_AR3_RL_DROPOUT = float(os.environ.get("OPENPI_AR3_RL_DROPOUT", "0.3"))
+_DEFAULT_AR3_RL_INIT_PARAMS = os.environ.get(
+    "OPENPI_AR3_RL_INIT_PARAMS", "<set OPENPI_AR3_RL_INIT_PARAMS to the policy checkpoint <step>/params>"
+)
+_DEFAULT_AR3_RL_ASSETS_DIR = os.environ.get("OPENPI_AR3_RL_ASSETS_DIR") or None
+_DEFAULT_AR3_RL_ADVANTAGE = os.environ.get("OPENPI_AR3_RL_ADVANTAGE", "positive")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -177,6 +190,13 @@ class DataConfig:
     # Keys that need normalization stats: training fails if the loaded stats lack one (stats computed before the key
     # was added to scripts/compute_norm_stats.py would leave it unnormalized).
     required_norm_stats: Sequence[str] = ()
+
+    # Offline RL (LeRobot v3.0 only, openpi.rl): tag of the advantage labels of every dataset
+    # (<dataset>/rl/advantage_<tag>.npz, scripts/ar3_rl.py fit). Training samples then carry the label of their action
+    # chunk, dropped with probability ``advantage_dropout`` (only for policies with both indicators, which then also
+    # learn the unconditioned behaviour).
+    advantage_tag: str | None = None
+    advantage_dropout: float = 0.0
 
 
 class GroupFactory(Protocol):
@@ -358,6 +378,13 @@ class LeRobotAR3LiftDataConfig(DataConfigFactory):
     # Tac G2 indentation map cache of the datasets of tactile models (Pi0Config.tactile_in_use): a directory, or
     # "auto" for <dataset>/tactile_cache/depth_48x64 (built by scripts/build_ar3_tactile_cache.py).
     tactile_cache: str = "auto"
+    # Offline RL presets: the policy is conditioned on the advantage label of its action chunk, written into the
+    # prompt (openpi.rl.advantage.AdvantagePrompt). ``advantage_indicator`` is the label of requests without one,
+    # i.e. of the served policy: "positive" | "negative" | "none"; None: no advantage conditioning.
+    # ``advantage_marking``: "negative" marks only negative chunks (positive ones keep the prompt of the policy),
+    # "both" writes "Advantage: positive" / "Advantage: negative" as RECAP does.
+    advantage_indicator: str | None = None
+    advantage_marking: str = "negative"
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig, *args, **kwargs) -> DataConfig:
@@ -400,7 +427,12 @@ class LeRobotAR3LiftDataConfig(DataConfigFactory):
                     action_horizon=model_config.action_horizon,
                     history_length=history_length,
                     tactile=tactile,
-                )
+                ),
+                *(
+                    [_advantage.AdvantagePrompt(inference=self.advantage_indicator, marking=self.advantage_marking)]
+                    if self.advantage_indicator is not None
+                    else []
+                ),
             ],
             outputs=[ar3_lift_policy.AR3LiftOutputs()],
         )
@@ -748,6 +780,46 @@ def _ar3_lift_dagger_train_config(
     )
 
 
+def _ar3_rl_train_config(name: str, model: pi0_config.Pi0Config, *, marking: str = "negative") -> TrainConfig:
+    """Offline RL round on the AR3 (openpi.rl): continue a policy checkpoint on all datasets with advantage labels.
+
+    The model and the losses are those of the offline preset; the label of every training chunk is written into its
+    prompt (``openpi.rl.advantage``). ``marking="negative"``: only negative chunks get "Advantage: negative", so the
+    served policy keeps the prompt it was trained with. ``marking="both"`` (the ``*_recap`` presets) is RECAP as
+    published: "Advantage: positive" / "Advantage: negative", dropped for a share of the samples, and the policy is
+    served with "Advantage: positive". Like the DAgger presets a round starts from the complete policy params,
+    reuses the normalization statistics of that checkpoint and keeps the constant 5e-5 learning rate.
+    """
+    config = _ar3_lift_train_config(name, model)
+    return dataclasses.replace(
+        config,
+        data=dataclasses.replace(
+            config.data,
+            base_config=DataConfig(
+                prompt_from_task=True,
+                extra_repo_ids=_DEFAULT_AR3_REPO_IDS[1:],
+                holdout_every=_DEFAULT_AR3_HOLDOUT_EVERY,
+                advantage_tag=_DEFAULT_AR3_RL_TAG,
+                # Without a positive indicator a dropped label would train a negative chunk as a positive one.
+                advantage_dropout=_DEFAULT_AR3_RL_DROPOUT if marking == "both" else 0.0,
+            ),
+            assets=AssetsConfig(assets_dir=_DEFAULT_AR3_RL_ASSETS_DIR, asset_id=_DEFAULT_AR3_ASSET_ID),
+            advantage_indicator=_DEFAULT_AR3_RL_ADVANTAGE,
+            advantage_marking=marking,
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(_DEFAULT_AR3_RL_INIT_PARAMS),
+        copy_reactive_from_action_expert=False,
+        num_train_steps=10_000,
+        keep_period=2_000,
+    )
+
+
 # Use `get_config` if you need to get a config by name in your
 _CONFIGS = [
     TrainConfig(
@@ -998,6 +1070,13 @@ _CONFIGS = [
         dataclasses.replace(pi05_ar3_lift_reactive, wrench_dim=6),
         force_keys=ar3_lift_policy.FORCE_KEYS_WRENCH,
     ),
+    # Offline RL rounds of the muscleVLTA presets (scripts/train_ar3_muscle_vlta_rl.sh): advantage-conditioned
+    # fine-tuning with the force-touch critic of openpi.rl. *_rl marks only negative chunks; *_rl_recap writes both
+    # indicators as RECAP does and must be served with its preset name.
+    _ar3_rl_train_config("pi05_ar3_muscle_vlta_rl", pi05_ar3_muscle_vlta),
+    _ar3_rl_train_config("pi05_ar3_muscle_vlta_v2_rl", pi05_ar3_muscle_vlta_v2),
+    _ar3_rl_train_config("pi05_ar3_muscle_vlta_rl_recap", pi05_ar3_muscle_vlta, marking="both"),
+    _ar3_rl_train_config("pi05_ar3_muscle_vlta_v2_rl_recap", pi05_ar3_muscle_vlta_v2, marking="both"),
     TrainConfig(
         name="debug",
         data=FakeDataConfig(),

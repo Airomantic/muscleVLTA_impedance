@@ -304,6 +304,138 @@
                 "--log-interval", "1",
                 "--no-wandb-enabled"
             ]
+        },
+        {
+            // 离线强化学习第 1 步（README「Offline RL」）：交叉拟合力触觉评论家，并把每个动作块的优势标签写到
+            // <数据集>/rl/advantage_debug.npz。数据集须已标注回合结果（scripts/ar3_rl.py label）并缓存视觉特征
+            // （scripts/ar3_rl.py features；完整跑过一次 scripts/train_ar3_muscle_vlta_rl.sh 即已具备）。
+            // 评论家很小，1 张卡几分钟。fit / gather 经 jax.jit 编译：断点只在首次 trace 时停。
+            "name": "muscleVLTA RL：力触觉评论家 + 优势标注（1 卡）",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "program": "${workspaceFolder}/scripts/ar3_rl.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "${input:trainDebugGpu}",
+                "PYTHONPATH": "${workspaceFolder}/src:${workspaceFolder}/packages/openpi-client/src",
+                "PYTHONUNBUFFERED": "1"
+            },
+            "args": [
+                "fit",
+                "--dataset", "/data/jiang/ar3_eef_forceVisuoTactaile_plugIn:/data/jiang/ar3_eef_forceVisuoTactaile_plugIn_35",
+                "--tag", "debug",
+                "--out", "/data/jiang/train_checkpoints_debug/ar3_rl_critic/debug",
+                "--folds", "2",
+                "--steps", "1000"
+            ]
+        },
+        {
+            // 离线强化学习第 2 步：优势条件化微调（pi05_ar3_muscle_vlta_rl）。模型和损失同 muscleVLTA，从已训练的检查点
+            // 继续并复用它的 norm stats；优势为负的动作块在提示词末尾加 "Advantage: negative"，优势为正的保持原提示词
+            // （RECAP 原版的正负双指示用预设 pi05_ar3_muscle_vlta_rl_recap）。
+            // 先运行上面的「力触觉评论家 + 优势标注」生成 debug 标签。4 卡 FSDP（GPU 4–7）、batch 32、主进程读数据。
+            // --overwrite 每次清空 /data/jiang/train_checkpoints_debug/pi05_ar3_muscle_vlta_rl/debug_rl_4gpu。
+            // 批量训练（含评论家和标注）用 scripts/train_ar3_muscle_vlta_rl.sh <检查点 step 目录>。
+            "name": "muscleVLTA RL 训练调试：4 卡 FSDP（GPU 4–7，优势条件化微调）",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "program": "${workspaceFolder}/scripts/train.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "${input:rlTrainGpus}",
+                "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.95",
+                "NCCL_SOCKET_IFNAME": "lo",
+                "NCCL_IB_DISABLE": "1",
+                "PYTHONPATH": "${workspaceFolder}/src:${workspaceFolder}/packages/openpi-client/src",
+                "PYTHONUNBUFFERED": "1",
+                "OPENPI_AR3_REPO_ID": "/data/jiang/ar3_eef_forceVisuoTactaile_plugIn:/data/jiang/ar3_eef_forceVisuoTactaile_plugIn_35",
+                "OPENPI_AR3_RL_TAG": "debug",
+                // 要做 RL 微调的策略检查点；norm stats 取它 assets/ 下的目录（OPENPI_AR3_ASSET_ID 为该目录名）。
+                "OPENPI_AR3_RL_INIT_PARAMS": "/data/jiang/train_checkpoints/pi05_ar3_muscle_vlta/muscle_vlta_30k_plugin_30s35s/141000/params",
+                "OPENPI_AR3_RL_ASSETS_DIR": "/data/jiang/train_checkpoints/pi05_ar3_muscle_vlta/muscle_vlta_30k_plugin_30s35s/141000/assets",
+                "OPENPI_AR3_ASSET_ID": "ar3_eef_forceVisuoTactaile_plugIn+ar3_eef_forceVisuoTactaile_plugIn_35+ar3_eef_forceVisuoTactaile_front_wrist"
+            },
+            "args": [
+                "pi05_ar3_muscle_vlta_rl",
+                "--exp-name", "debug_rl_4gpu",
+                "--checkpoint-base-dir", "/data/jiang/train_checkpoints_debug",
+                "--overwrite",
+                "--fsdp-devices", "4",
+                "--batch-size", "32",
+                "--num-workers", "0",
+                "--log-interval", "1",
+                "--no-wandb-enabled"
+            ]
+        },
+        {
+            // RL 微调后的检查点（先把 step 目录复制到 infer_checkpoint/muscle_vlta_rl）。pi05_ar3_muscle_vlta_rl 以原提示词
+            // 服务（即“优势为正”的策略），客户端的 --task 不变。把 OPENPI_AR3_RL_ADVANTAGE 改成 "negative"，服务端会在
+            // 提示词后加 "Advantage: negative"：同一检查点的反向对照，动作应更慢或更差，用来确认优势条件确实起作用。
+            "name": "muscleVLTA RL：插充电头真机推理（RL 微调后的检查点，Tac G2，回起点并执行）",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/scripts/ar3_lift_debug_python.sh",
+            "program": "${workspaceFolder}/scripts/debug_ar3_lift_robot.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "subProcess": false,
+            "env": {
+                "INFER_ROS_DOMAIN_ID": "111",
+                "INFER_AR3_WS": "${workspaceFolder}/../ar3_CartesianImpedanceControl",
+                "OPENPI_PYTHON": "${workspaceFolder}/.venv/bin/python",
+                "OPENPI_SERVE_GPU": "0",
+                "OPENPI_CONFIG_NAME": "pi05_ar3_muscle_vlta_rl",
+                "OPENPI_AR3_RL_ADVANTAGE": "positive"
+            },
+            "args": [
+                "--checkpoint", "${workspaceFolder}/infer_checkpoint/muscle_vlta_rl",
+                "--hardware", "auto", "--tactile",
+                "--", "--execute", "--move-to-start",
+                "--home-file", "${workspaceFolder}/../ar3_CartesianImpedanceControl/config/cartesian_home.json",
+                "--task=plug the two-pronged white charger on the table into the white socket, don't bump your fingers into other objects"
+            ]
+        },
+        {
+            // 下一轮 RL 的数据：策略每回合从起点执行，回合结束后在终端回答 y = 保存为成功，n = 保存为失败
+            // （写入 <目录>/rl/outcomes.json），Enter/s = 保存但不标注，d = 丢弃，q / x = 保存 / 丢弃并退出。
+            // 同时记录两指六维力和每帧的压痕图，采到的目录直接加进 scripts/train_ar3_muscle_vlta_rl.sh 的
+            // OPENPI_AR3_REPO_ID。失败回合也要保存：没有失败回合，评论家学不到什么动作会导致失败。
+            // 第一轮还没有 RL 检查点：把 --checkpoint 和 OPENPI_CONFIG_NAME 换成预训练的 muscleVLTA 检查点及其预设名。
+            // 这条触觉录制路径只用模拟传感器测试过：第一次真机采集后请先确认 <目录>/tactile/episode-*/ 下有两指的
+            // parquet，以及 scripts/build_ar3_tactile_cache.py 对每回合打印的 valid 比例接近 1。
+            "name": "muscleVLTA RL：录制回合并标注成败（Tac G2，每回合回起点并执行）",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/scripts/ar3_lift_debug_python.sh",
+            "program": "${workspaceFolder}/scripts/debug_ar3_lift_robot.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "subProcess": false,
+            "env": {
+                "INFER_ROS_DOMAIN_ID": "111",
+                "INFER_AR3_WS": "${workspaceFolder}/../ar3_CartesianImpedanceControl",
+                "OPENPI_PYTHON": "${workspaceFolder}/.venv/bin/python",
+                "OPENPI_SERVE_GPU": "0",
+                "OPENPI_CONFIG_NAME": "pi05_ar3_muscle_vlta_rl"
+            },
+            "args": [
+                "--checkpoint", "${workspaceFolder}/infer_checkpoint/muscle_vlta_rl",
+                "--hardware", "auto", "--tactile",
+                "--", "--execute",
+                "--record-dir", "${input:rlRolloutDir}",
+                "--home-file", "${workspaceFolder}/../ar3_CartesianImpedanceControl/config/cartesian_home.json",
+                "--task=plug the two-pronged white charger on the table into the white socket, don't bump your fingers into other objects"
+            ]
         }
     ],
     "inputs": [
@@ -324,6 +456,18 @@
             "type": "promptString",
             "description": "训练调试用的 1 张 GPU（先用 nvidia-smi 确认空闲）",
             "default": "7"
+        },
+        {
+            "id": "rlTrainGpus",
+            "type": "promptString",
+            "description": "RL 微调调试用的 4 张 GPU，逗号分隔（先用 nvidia-smi 确认空闲）",
+            "default": "4,5,6,7"
+        },
+        {
+            "id": "rlRolloutDir",
+            "type": "promptString",
+            "description": "RL 回合数据集目录（LeRobot v3.0，已存在则追加；建议每轮策略一个；相对路径相对本仓库）",
+            "default": "outputs/ar3_rl_rollouts/round1"
         }
     ]
 }

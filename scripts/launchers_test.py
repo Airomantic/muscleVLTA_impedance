@@ -5,11 +5,13 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 
 import pytest
 
 from scripts import ar3_dagger_gripper_teleop as gate
 from scripts import ar3_lift_robot_client as client
+from scripts import ar3_rl
 from scripts import debug_ar3_lift_robot as debug
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -237,6 +239,185 @@ def test_ar3_configs_train_every_listed_dataset_as_one(launcher_env):
     assert json.loads(result.stdout.splitlines()[-1]) == [expected, expected]
 
 
+def test_rl_presets_continue_a_policy_checkpoint_with_the_advantage_in_the_prompt(launcher_env):
+    root = SCRIPTS_DIR.parent
+    launcher_env.update(
+        {
+            "OPENPI_AR3_REPO_ID": "/data/demos:/data/rollouts",
+            "OPENPI_AR3_ASSET_ID": "plug_in",
+            "OPENPI_AR3_RL_TAG": "round1",
+            "OPENPI_AR3_RL_INIT_PARAMS": "/ckpt/32000/params",
+            "OPENPI_AR3_RL_ASSETS_DIR": "/ckpt/32000/assets",
+            "OPENPI_AR3_RL_ADVANTAGE": "none",
+            "JAX_PLATFORMS": "cpu",
+            "PYTHONPATH": f"{root / 'src'}:{root / 'packages/openpi-client/src'}",
+        }
+    )
+    script = (
+        "import json\nfrom openpi.training import config\n"
+        "def transforms(name):\n"
+        "    c = config.get_config(name)\n"
+        "    return c, c.data.create(c.assets_dirs, c.model).data_transforms.inputs\n"
+        "rl, inputs = transforms('pi05_ar3_muscle_vlta_v2_rl')\n"
+        "recap, recap_inputs = transforms('pi05_ar3_muscle_vlta_v2_rl_recap')\n"
+        "base, base_inputs = transforms('pi05_ar3_muscle_vlta_v2')\n"
+        "print(json.dumps([\n"
+        "    [rl.data.repo_id, rl.data.base_config.extra_repo_ids, rl.data.base_config.advantage_tag],\n"
+        "    [rl.weight_loader.params_path, rl.data.assets.assets_dir, rl.data.assets.asset_id],\n"
+        "    [type(t).__name__ for t in inputs], inputs[1].inference, rl.model == base.model,\n"
+        "    rl.copy_reactive_from_action_expert, base.data.base_config.advantage_tag,\n"
+        "    [type(t).__name__ for t in base_inputs],\n"
+        "    [[c.data.base_config.advantage_dropout, t[1].marking] for c, t in ((rl, inputs), (recap, recap_inputs))],\n"
+        "]))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], env=launcher_env, cwd="/tmp", capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    data, init, inputs, indicator, same_model, copy_expert, base_tag, base_inputs, markings = json.loads(
+        result.stdout.splitlines()[-1]
+    )
+    assert data == ["/data/demos", ["/data/rollouts"], "round1"]
+    assert init == ["/ckpt/32000/params", "/ckpt/32000/assets", "plug_in"]
+    # The same model as the offline preset; only the prompt carries the advantage label.
+    assert inputs == ["AR3LiftInputs", "AdvantagePrompt", "IPhoneZeroStateAndRealRelativeActions"]
+    assert (indicator, same_model, copy_expert) == ("none", True, False)
+    assert base_tag is None
+    assert base_inputs == ["AR3LiftInputs", "IPhoneZeroStateAndRealRelativeActions"]
+    # Labels are only dropped where a positive indicator tells the positive chunks from the unlabelled ones.
+    assert markings == [[0.0, "negative"], [0.3, "both"]]
+
+
+def test_rl_launcher_runs_the_stages_of_a_round_from_a_policy_checkpoint(launcher_env, tmp_path):
+    step = tmp_path / "ckpt" / "pi05_ar3_muscle_vlta_v2" / "run" / "32000"
+    (step / "params").mkdir(parents=True)
+    (step / "assets" / "plug_in").mkdir(parents=True)
+    (step / "assets" / "plug_in" / "norm_stats.json").write_text("{}")
+    datasets = [tmp_path / "demos", tmp_path / "rollouts"]
+    for directory in datasets:
+        (directory / "meta").mkdir(parents=True)
+        (directory / "meta" / "info.json").write_text("{}")
+        (directory / "rl").mkdir()
+        (directory / "rl" / "outcomes.json").write_text("{}")
+    (tmp_path / "home" / "big_vision").mkdir(parents=True)
+    (tmp_path / "home" / "big_vision" / "paligemma_tokenizer.model").write_text("")
+    launcher_env.update(
+        {
+            "OPENPI_AR3_REPO_ID": f"{datasets[0]}:{datasets[1]}",
+            "OPENPI_DATA_HOME": str(tmp_path / "home"),
+            "OPENPI_EXP_NAME": "round1",
+        }
+    )
+
+    def stages(result):
+        assert result.returncode == 0, result.stderr
+        return [line[2:] for line in result.stdout.splitlines() if line.startswith("+ ")]
+
+    roots = f"{datasets[0]} {datasets[1]}"
+    cache, features, fit, train = stages(run_launcher("train_ar3_muscle_vlta_rl.sh", launcher_env, str(step)))
+    assert cache.endswith(f"scripts/build_ar3_tactile_cache.py --dataset {roots} --workers 16")
+    assert features.startswith("env CUDA_VISIBLE_DEVICES=4 ")
+    assert features.endswith(f"scripts/ar3_rl.py features --dataset {roots}")
+    assert fit.endswith(
+        f"scripts/ar3_rl.py fit --dataset {roots} --tag round1 --out /data/jiang/train_checkpoints/ar3_rl_critic/round1"
+    )
+    train = shlex.split(train)
+    assert train[2] == "pi05_ar3_muscle_vlta_v2_rl"
+    assert train[train.index("--fsdp-devices") + 1] == "4"
+    assert train[train.index("--batch-size") + 1] == "128"
+
+    # Labels of this tag are reused unless the critic is to be trained again.
+    for directory in datasets:
+        (directory / "rl" / "advantage_round1.npz").write_text("")
+    result = run_launcher("train_ar3_muscle_vlta_rl.sh", launcher_env, str(step))
+    assert len(stages(result)) == 3
+    assert "Using the existing advantage labels 'round1'" in result.stdout
+    launcher_env.update({"OPENPI_RL_REFIT": "1", "OPENPI_RL_FIT_ARGS": "--n-step 30", "OPENPI_RL_STAGES": "critic"})
+    (fit,) = stages(run_launcher("train_ar3_muscle_vlta_rl.sh", launcher_env, str(step)))
+    assert fit.endswith("ar3_rl_critic/round1 --n-step 30")
+
+    # The next round continues an RL checkpoint with the same preset, also that of RECAP's two indicators.
+    later = tmp_path / "ckpt" / "pi05_ar3_muscle_vlta_v2_rl" / "round1" / "9999"
+    later.parent.mkdir(parents=True)
+    step.rename(later)
+    launcher_env["OPENPI_RL_STAGES"] = "policy"
+    (train,) = stages(run_launcher("train_ar3_muscle_vlta_rl.sh", launcher_env, str(later)))
+    assert shlex.split(train)[2] == "pi05_ar3_muscle_vlta_v2_rl"
+    recap = tmp_path / "ckpt" / "pi05_ar3_muscle_vlta_v2_rl_recap" / "round1" / "9999"
+    recap.parent.mkdir(parents=True)
+    later.rename(recap)
+    (train,) = stages(run_launcher("train_ar3_muscle_vlta_rl.sh", launcher_env, str(recap)))
+    assert shlex.split(train)[2] == "pi05_ar3_muscle_vlta_v2_rl_recap"
+
+    lift = tmp_path / "ckpt" / "pi05_ar3_lift_reactive" / "run" / "29999"
+    lift.parent.mkdir(parents=True)
+    recap.rename(lift)
+    result = run_launcher("train_ar3_muscle_vlta_rl.sh", launcher_env, str(lift))
+    assert result.returncode == 1
+    assert "pi05_ar3_lift_reactive_rl is not an offline RL preset" in result.stderr
+
+    (datasets[1] / "rl" / "outcomes.json").unlink()
+    launcher_env["OPENPI_CONFIG_NAME"] = "pi05_ar3_muscle_vlta_rl"
+    result = run_launcher("train_ar3_muscle_vlta_rl.sh", launcher_env, str(lift))
+    assert result.returncode == 1
+    assert f"{datasets[1]} has no episode outcomes" in result.stderr
+
+
+def test_rl_launcher_finishes_its_round_once_although_the_script_is_edited_meanwhile(launcher_env, tmp_path):
+    """Bash reads a script while running it: an edited launcher once started the finished training again, which
+    deleted its checkpoints (OPENPI_OVERWRITE=1)."""
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    launcher = repo / "scripts" / "train_ar3_muscle_vlta_rl.sh"
+    launcher.write_text((SCRIPTS_DIR / "train_ar3_muscle_vlta_rl.sh").read_text())
+    step = tmp_path / "ckpt" / "pi05_ar3_muscle_vlta" / "run" / "32000"
+    (step / "params").mkdir(parents=True)
+    (step / "assets" / "plug_in").mkdir(parents=True)
+    (step / "assets" / "plug_in" / "norm_stats.json").write_text("{}")
+    dataset = tmp_path / "demos"
+    (dataset / "meta").mkdir(parents=True)
+    (dataset / "meta" / "info.json").write_text("{}")
+    (dataset / "rl").mkdir()
+    (dataset / "rl" / "outcomes.json").write_text("{}")
+    (tmp_path / "home" / "big_vision").mkdir(parents=True)
+    (tmp_path / "home" / "big_vision" / "paligemma_tokenizer.model").write_text("")
+    # Stands in for the interpreter: notes every command of the round and takes a moment.
+    calls, python = tmp_path / "calls", tmp_path / "python"
+    python.write_text(f'#!/usr/bin/env bash\necho "$*" >> "{calls}"\nsleep 1\n')
+    python.chmod(0o755)
+    launcher_env.update(
+        {
+            "OPENPI_PYTHON": str(python),
+            "OPENPI_DRY_RUN": "0",
+            "OPENPI_OVERWRITE": "1",
+            "OPENPI_AR3_REPO_ID": str(dataset),
+            "OPENPI_DATA_HOME": str(tmp_path / "home"),
+            "OPENPI_EXP_NAME": "round1",
+            "OPENPI_CHECKPOINT_BASE_DIR": str(tmp_path / "out"),
+        }
+    )
+    process = subprocess.Popen(
+        ["bash", str(launcher), str(step)], env=launcher_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+    )
+    try:
+        deadline = time.monotonic() + 20
+        while not calls.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        # The first stage runs: every later offset of the file moves, as when a comment is added to the header.
+        launcher.write_text(launcher.read_text().replace("\n", "\n# edited while the round runs\n", 30))
+        output, _ = process.communicate(timeout=60)
+    finally:
+        process.kill()
+    assert process.returncode == 0, output.decode()
+    commands = [line.split()[0] for line in calls.read_text().splitlines()]
+    assert commands == [
+        "scripts/build_ar3_tactile_cache.py",
+        "scripts/ar3_rl.py",
+        "scripts/ar3_rl.py",
+        "scripts/train.py",
+    ]
+
+
 def parse_jsonc(text):
     """VS Code's launch.json is JSONC: drop comments and trailing commas outside strings."""
     pattern = r'("(?:\\.|[^"\\])*")|//[^\n]*|/\*.*?\*/|,(?=\s*[}\]])'
@@ -293,7 +474,7 @@ def test_vscode_configurations_pass_arguments_the_launcher_and_scripts_accept(tm
     for name in list(os.environ):
         if name.startswith(("INFER_", "OPENPI_")):
             monkeypatch.delenv(name)
-    parsers = {"ar3_dagger_gripper_teleop.py": gate.parse_args}
+    parsers = {"ar3_dagger_gripper_teleop.py": gate.parse_args, "ar3_rl.py": ar3_rl.parse_args}
     inputs = {f"${{input:{item['id']}}}": item["default"] for item in launch.get("inputs", [])}
     assert launch["configurations"]
     for config in launch["configurations"]:

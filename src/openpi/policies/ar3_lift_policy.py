@@ -27,6 +27,10 @@ readings measured since the chunk start (L + 1 <= T <= L + horizon rows, all key
 * ``tactile_wrench``: [T, 12] Tac G2 finger wrenches (Fx Fy Fz Mx My Mz of sensor_0, then sensor_2).
 * ``gripper_aperture``: [T] gripper opening in SDK units (0 = closed ... 1000 = open).
 
+Offline RL presets (``pi05_ar3_muscle_vlta_rl``) condition the policy on the advantage of its action chunk, written
+into the prompt. Training samples carry the label of their action chunk under ``rl_advantage`` (``ADVANTAGE_KEY``, see
+``openpi.rl.advantage``); the robot client sends nothing and the policy is served as for a positive advantage.
+
 As in LIFT (``IPhoneZeroStateAndRealRelativeActions``), the policy outputs [action_horizon, 7] actions relative to
 the observed TCP pose: xyz [m] + xyz Euler angles [rad] of ``inv(T_state) @ T_target``, followed by the absolute
 gripper target (0..1000). ``relative_to_absolute_actions`` recovers absolute targets for the controller.
@@ -67,6 +71,8 @@ TACTILE_DEPTH_SCALE = 0.25
 # Per-step sensor keys of the client protocol (module docstring), padded together at inference.
 READING_KEYS = ("wrench", "sensor_valid", "tactile_depth", "tactile_valid", "tactile_wrench", "gripper_aperture")
 TACTILE_READING_KEYS = ("tactile_depth", "tactile_valid", "tactile_wrench", "gripper_aperture")
+# Advantage label of a training sample (offline RL presets only), consumed by openpi.rl.advantage.AdvantagePrompt.
+ADVANTAGE_KEY = "rl_advantage"
 
 ACTION_NAMES = ("x", "y", "z", "rx", "ry", "rz", "gripper")
 GRIPPER_CLOSED = 0.0
@@ -154,6 +160,8 @@ class AR3LiftRepack(transforms.DataTransformFn):
         prompt = data.get("prompt", data.get("task"))
         if prompt is not None:
             inputs["prompt"] = prompt
+        if ADVANTAGE_KEY in data:
+            inputs[ADVANTAGE_KEY] = data[ADVANTAGE_KEY]
         return inputs
 
     def _current_frame(self, data: dict, key: str) -> np.ndarray:
@@ -255,7 +263,7 @@ class AR3LiftInputs(transforms.DataTransformFn):
                 "right_wrist_0_rgb": np.False_,
             },
         }
-        for key in ("prev_state", "actions", "prompt", "wrench", "wrench_mask"):
+        for key in ("prev_state", "actions", "prompt", "wrench", "wrench_mask", ADVANTAGE_KEY):
             if key in data:
                 inputs[key] = data[key]
         if "wrench" in inputs and self.action_horizon is not None:

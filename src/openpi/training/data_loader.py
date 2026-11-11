@@ -20,6 +20,7 @@ import torch
 
 from openpi.data import lerobot_v3 as _lerobot_v3
 import openpi.models.model as _model
+from openpi.rl import advantage as _advantage
 from openpi.shared.episode_schema import CONTROL_FLAG_FEATURE_NAME
 from openpi.shared.episode_schema import CONTROL_FLAG_FEATURE_SPEC
 from openpi.shared.episode_schema import DEFAULT_INTERVENTION_VALUE
@@ -143,7 +144,14 @@ def _create_lerobot_v3_dataset(
         ),
     )
     if data_config.prompt_from_task:
-        return TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(meta.tasks)])
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(meta.tasks)])
+    if data_config.advantage_tag is not None:
+        # Offline RL: every sample carries the advantage label of its action chunk (openpi.rl).
+        labels = _advantage.AdvantageLabels.load(meta.root, data_config.advantage_tag)
+        labels.check_episodes({index: int(episode["length"]) for index, episode in meta.episodes.items()})
+        dataset = TransformedDataset(
+            dataset, [_advantage.AttachAdvantage(labels, dropout=data_config.advantage_dropout)]
+        )
     return dataset
 
 
