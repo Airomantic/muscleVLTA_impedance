@@ -325,7 +325,8 @@ TCP wrench, `tau_m`, the commanded 7D action) and `control_flag` (1 = policy, �
 policy; pressing the teleoperation clutch hands the arm to the operator at once, and the gripper follows the trigger
 once the trigger has matched the fingers' opening
 ([scripts/ar3_dagger_gripper_teleop.py](scripts/ar3_dagger_gripper_teleop.py)).
-Releasing the clutch ends the episode; the terminal then asks whether to save it.
+Releasing the clutch ends the episode; the terminal then asks whether to save it (`y` / `n` save it as a success /
+failure for [offline RL](#offline-rl-advantage-conditioned-fine-tuning-with-a-force-touch-critic)).
 
 ```bash
 ./infer_oneclick.sh --dagger    # also MessageBridge, Puppetry, the Cartesian teleoperation and the gated gripper
@@ -404,8 +405,11 @@ scripts/run_ar3_lift_robot.sh --execute --move-to-start --prompt "$PLUG_IN"     
 ```
 
 A missing finger reading at start-up stops the client; later dropouts are logged and the policy continues with the
-missing-sensor embedding it was trained with. `--record-dir` and `--dagger` do not record the Tac G2 streams yet: their
-episodes would train muscleVLTA with the fingers missing.
+missing-sensor embedding it was trained with. With a tactile policy, `--record-dir` and `--dagger` also record the
+fingers: the two finger wrenches in the frame table and the pooled 48×64 indentation map of every frame under
+`tactile/episode-*/`, stamped with the frame time. After `scripts/build_ar3_tactile_cache.py` (run by the training
+launchers; it rebuilds the cache of a dataset that has grown) rollouts and corrections train with the fingers each
+frame had. This recording path is tested with simulated sensors and has not been run on the robot yet.
 
 **VS Code**：先把检查点步目录复制到 `infer_checkpoint/muscle_vlta_29999`（含 `params/` 与 `assets/`），
 再选择 `muscleVLTA：插充电头真机推理（Tac G2，回起点并执行）`、`muscleVLTA：预览 3 块（Tac G2，不执行机械臂和夹爪动作）`
@@ -494,6 +498,119 @@ the authors still have to measure or confirm and is highlighted in the document.
 To test whether a tactile muscleVLTA policy needs its fingers at test time, run it with `--mask-tactile`
 (`scripts/run_ar3_lift_robot.sh --execute --mask-tactile ...`): the policy then receives both Tac G2 fingers as
 missing, as under finger dropout, while the sensors, the gripper opening and everything else stay unchanged.
+
+### Offline RL: advantage-conditioned fine-tuning with a force-touch critic
+
+On-policy RL such as PPO needs fresh rollouts of the current policy for every update, which one real arm cannot
+supply. muscleVLTA is therefore improved offline, in rounds, with the RECAP recipe of π\*0.6
+([arXiv 2511.14759](https://arxiv.org/abs/2511.14759); [RLinf](https://github.com/RLinf/RLinf) implements it for the
+PyTorch π₀.₅): the current policy runs on the robot and every episode is saved with its outcome; a critic learns from
+all episodes so far how far each state is from success; every recorded action chunk is labelled by its advantage; and
+the policy is fine-tuned on all data, conditioned on that label. The model and its losses stay those of muscleVLTA
+([src/openpi/rl](src/openpi/rl)), and presets without advantage labels are unaffected.
+
+| stage | what it does | written to |
+| --- | --- | --- |
+| outcomes | Success or failure of every episode. The reward is −1 per step until the task is complete (the last release of the gripper), so the value of a state is minus the time left, divided by the longest time of the task; failed episodes sit at −1 | `<dataset>/rl/outcomes.json` |
+| features | Mean-pooled SigLIP tokens of both cameras (the π₀.₅ image encoder) for every frame | `<dataset>/rl/vision_siglip.npy` |
+| critic | A 201-bin distributional value function of the vision features, the TCP pose and gripper, and the policy's 1 s sensor history: the 13D arm force through a GRU and the Tac G2 fingers through the policy's `HandEncoder`. It is cross-fitted in 4 folds by episode, so every frame is scored by a critic that has not seen its episode | `<checkpoint root>/ar3_rl_critic/<tag>/` |
+| advantage | `A(t) = r(t) + … + r(t+n−1) + V(t+n) − V(t)` over n = 50 frames (5 s); beyond the end of the episode the outcome replaces V. Per task, the best 50% of the demonstration frames and the best 40% of the policy frames are positive. Human corrections and the frames after completion are always positive | `<dataset>/rl/advantage_<tag>.npz` |
+| policy | Fine-tuning from the checkpoint with its normalization statistics (constant 5e-5, 10k steps). Chunks with a negative label are trained with `Advantage: negative` appended to the prompt, the others with the prompt as it is | `<checkpoint root>/pi05_ar3_muscle_vlta_rl/<exp>/` |
+
+```bash
+PLUG_IN="plug the two-pronged white charger on the table into the white socket, don't bump your fingers into other objects"
+DEMOS=/data/jiang/ar3_eef_forceVisuoTactaile_plugIn:/data/jiang/ar3_eef_forceVisuoTactaile_plugIn_35
+POLICY=/data/jiang/train_checkpoints/pi05_ar3_muscle_vlta/muscle_vlta_30k_plugin_30s35s/141000
+
+# 1. Robot PC: rollouts of the current policy. At the save prompt y = success, n = failure; keep the failures.
+./infer_oneclick.sh --tactile
+scripts/run_ar3_lift_robot.sh --execute --record-dir outputs/ar3_rl_rollouts/round1 --prompt "$PLUG_IN"
+#    with corrections: ./infer_oneclick.sh --dagger --tactile, then add --dagger (the clutch takes over)
+
+# 2. GPU server, after copying the rollouts: demonstrations are successes, then one round on GPUs 4-7
+.venv/bin/python scripts/ar3_rl.py label --dataset $DEMOS --default success
+OPENPI_AR3_REPO_ID=$DEMOS:/data/jiang/ar3_rl_rollouts/round1 OPENPI_EXP_NAME=rl_round1 \
+  bash scripts/train_ar3_muscle_vlta_rl.sh $POLICY
+
+# 3. Serve the result with its preset name (robot client and prompt as before) and record the next round with it
+OPENPI_CONFIG_NAME=pi05_ar3_muscle_vlta_rl OPENPI_PROMPT="$PLUG_IN" \
+  bash scripts/serve_ar3_lift.sh /data/jiang/train_checkpoints/pi05_ar3_muscle_vlta_rl/rl_round1/9999
+```
+
+The launcher runs the stages in order and skips what exists (`OPENPI_RL_STAGES`, `OPENPI_RL_FIT_ARGS`; see its
+header); a `pi05_ar3_muscle_vlta_v2` checkpoint gets `pi05_ar3_muscle_vlta_v2_rl`. The next round starts from the new
+checkpoint with every dataset collected so far. Give rollouts the prompt of the demonstrations: tasks are matched by
+their prompt. `scripts/ar3_rl.py label` corrects or completes the outcomes, `fit --tag NAME --streams vision pose
+--no-labels` measures the critic without force and touch, and `relabel` changes the lookahead or the positive share
+without training.
+
+The default presets mark only the negative chunks, so the served policy keeps the prompt it was trained with and
+starts a round unchanged. `OPENPI_CONFIG_NAME=pi05_ar3_muscle_vlta_rl_recap` (or `..._v2_rl_recap`) trains RECAP as
+published instead: `Advantage: positive` / `Advantage: negative`, no indicator for 30% of the samples, served with
+`Advantage: positive`. Serve a checkpoint with the preset it was trained with; `OPENPI_AR3_RL_ADVANTAGE=negative`
+serves it conditioned on the negative label, to see what the label changes.
+
+**Measured so far** on the three demonstration datasets (214 episodes, 67.7k frames, all successes). No policy
+rollouts with failures exist yet, and no RL-fine-tuned policy has run on the robot.
+
+*Critic.* Error of the held-out value in seconds to completion (frames before completion; 4 folds of 4000 steps;
+three seeds of the first row give 2.10–2.11 s and 2.57–2.61 s; one insertion episode recorded with another prompt
+forms a task of its own and is left out):
+
+| critic inputs | unplug (84 episodes, up to 29.9 s) | insert (129 episodes, up to 34.9 s) |
+| --- | --- | --- |
+| vision, pose, arm force, touch | 2.11 s | 2.59 s |
+| vision, pose, arm force | 2.21 s | 2.41 s |
+| vision, pose, touch | 2.12 s | 2.65 s |
+| vision, pose | 2.17 s | 2.44 s |
+| pose, arm force, touch | 2.27 s | 2.86 s |
+
+On demonstrations the time left is read from vision and pose: force and touch lower the error by 0.06 s for unplugging
+and raise it by 0.15 s for insertion. Whether they tell a failing insertion from a succeeding one, which is what the
+critic is for, can only be measured once rollouts fail.
+
+*Labels.* The advantage of a single chunk (n = 10) is mostly critic noise at this data size: its standard deviation is
+0.063 against about 0.03 of progress per chunk, and two critics agree on few labels. The default lookahead of 5 s is
+the compromise between local credit and reliable labels (Cohen's κ of the labels):
+
+| lookahead n (frames) | 10 | 30 | 50 | 100 | to the end |
+| --- | --- | --- | --- | --- | --- |
+| two seeds of the same critic | 0.52 | 0.62 | 0.67 | 0.75 | 0.80 |
+| critic with force and touch vs. vision + pose | 0.32–0.37 | 0.39–0.43 | 0.43–0.46 | 0.49 | 0.63–0.64 |
+
+With n = 50 the labels are balanced over the task (35–64% positive in every tenth of the time to completion; 48–53%
+with and without finger contact) and follow the speed of the demonstration (correlation of an episode's positive
+share with its time to completion: −0.63 unplug, −0.53 insert). On demonstrations alone, a round therefore teaches
+the policy to prefer the faster half of the demonstrated chunks, and nothing about failures.
+
+*Policy.* Two checks on held-out episodes (every 8th; batch 64), replaying recorded chunks through the served
+checkpoints as the robot client does:
+
+* **The conditioning is learned when the labels matter.** Control: random labels, which the observation cannot
+  predict, and the recorded targets of negative chunks moved up by 10 mm. After 1000 steps (EMA 0.99) the targets
+  commanded for the negative label lie 9.8 mm [9.75, 9.91] above those of the served prompt
+  (`pi05_ar3_muscle_vlta_rl`), and 9.9 mm [9.78, 10.07] above those for `Advantage: positive` in the `_rl_recap`
+  preset (108 chunks, 95% intervals).
+* **The demonstration labels change nothing yet.** After 3000 steps on the labels above, `Advantage: positive` and
+  `Advantage: negative` command the same targets in the `_rl_recap` preset: they are 0.06 mm apart, as far as two
+  servers of one checkpoint with the same prompt, and the commanded paths are equally long (0.00 mm [−0.01, 0.01];
+  the recorded positive chunks are on average 1.5 mm longer than the negative ones). In the default preset the two
+  prompts differ by 0.35 mm, about what an appended indicator does regardless of its label (0.28 mm between
+  `Advantage: positive` and no indicator in the `_rl_recap` preset). Fine-tuning itself moved the action error
+  against the recorded targets from 0.72 mm (the 141k-step policy, trained on all episodes) to 0.80 mm (216 chunks).
+
+A full round (10k steps at batch 128) on demonstrations alone has not been run.
+
+**Limits.** The gain of this method comes from rollouts: successes of the policy itself, failures the critic can
+learn from, and corrections. Until such episodes are recorded, a round only reweights the demonstrations by speed,
+and the short runs above show no effect of that on the policy. The Tac G2 recording of rollouts and the outcome
+prompt are tested with simulated sensors and with demonstration frames re-recorded through the recorder, not on the
+robot. One chunk cannot be credited reliably with a few hundred episodes, hence the 5 s lookahead.
+
+**VS Code**：`muscleVLTA RL：力触觉评论家 + 优势标注（1 卡）` 调试评论家与标注，`muscleVLTA RL 训练调试：4 卡 FSDP（GPU 4–7，
+优势条件化微调）` 调试微调（先运行前一项生成 `debug` 标签；检查点写入 `/data/jiang/train_checkpoints_debug`）。真机侧：
+`muscleVLTA RL：录制回合并标注成败（Tac G2，每回合回起点并执行）` 采集下一轮的数据，`muscleVLTA RL：插充电头真机推理
+（RL 微调后的检查点，Tac G2，回起点并执行）` 运行微调后的检查点（先把 step 目录复制到 `infer_checkpoint/muscle_vlta_rl`）。
 
 ## 🙏 Acknowledgements
 
