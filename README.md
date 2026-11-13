@@ -379,8 +379,12 @@ losses for the contact gates and for an action-conditioned forward model of the 
 ```bash
 OPENPI_EXP_NAME=muscle_vlta_30k OPENPI_NUM_TRAIN_STEPS=30000 bash scripts/train_ar3_muscle_vlta.sh
 # other GPUs: OPENPI_CUDA_VISIBLE_DEVICES=4,5,6,7; continue a run: OPENPI_RESUME=1 with the same OPENPI_EXP_NAME
+# all 8 GPUs: OPENPI_CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OPENPI_BATCH_SIZE=256 (JAX then preallocates 90% of each
+#   GPU instead of 95%: NCCL needs about 4.2 GB per GPU outside JAX's pool with 8 GPUs)
 # 30 s and 35 s sessions together (one Tac G2 cache each):
 #   OPENPI_AR3_REPO_ID=/data/jiang/ar3_eef_forceVisuoTactaile_plugIn:/data/jiang/ar3_eef_forceVisuoTactaile_plugIn_35
+# the prompt of every frame is the task text recorded in its dataset; to replace the text of a session:
+#   .venv/bin/python scripts/set_ar3_dataset_task.py --dataset <dataset> --task "<prompt>"
 PLUG_IN="plug the two-pronged white charger on the table into the white socket, don't bump your fingers into other objects"
 OPENPI_CONFIG_NAME=pi05_ar3_muscle_vlta OPENPI_PROMPT="$PLUG_IN" \
   bash scripts/serve_ar3_lift.sh /data/jiang/train_checkpoints/pi05_ar3_muscle_vlta/muscle_vlta_30k/29999
