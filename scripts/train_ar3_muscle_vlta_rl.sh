@@ -57,7 +57,7 @@ run() {
 # is therefore a function, which is parsed completely before it starts, and nothing is read after it.
 main() {
     local repo_root step_dir source_config default_config config_name exp_name tag stages gpus num_gpus first_gpu
-    local batch_size checkpoint_base_dir python log_file dataset path labelled
+    local batch_size checkpoint_base_dir python log_file dataset path labelled mem_fraction
     local -a fit_args stats dataset_entries datasets train_args
 
     repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -206,9 +206,16 @@ main() {
     fi
 
     export CUDA_VISIBLE_DEVICES="${gpus}"
-    export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.95}"
+    # As in scripts/train_ar3_lift_gpu012.sh: with more than 4 GPUs NCCL needs more of the memory outside JAX's pool.
+    if ((num_gpus > 4)); then
+        mem_fraction=0.90
+    else
+        mem_fraction=0.95
+    fi
+    export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-${mem_fraction}}"
     mkdir -p "${repo_root}/logs" "${checkpoint_base_dir}"
     log_file="${repo_root}/logs/${config_name}_${exp_name}.log"
+    echo "JAX preallocates ${XLA_PYTHON_CLIENT_MEM_FRACTION} of each of the ${num_gpus} GPUs"
     echo "Logging to ${log_file}"
     if [[ "${OPENPI_DRY_RUN:-0}" == "1" ]]; then
         run "${python}" scripts/train.py "${train_args[@]}"

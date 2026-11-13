@@ -25,7 +25,7 @@
 #   OPENPI_SAVE_INTERVAL   checkpoint interval (default 1000), OPENPI_LOG_INTERVAL (default 100)
 #   OPENPI_KEEP_PERIOD     keep every N-th checkpoint permanently (default 5000); the latest one is always kept
 #   OPENPI_CHECKPOINT_BASE_DIR  checkpoint root (default /data/jiang/train_checkpoints)
-#   XLA_PYTHON_CLIENT_MEM_FRACTION  fraction of each GPU preallocated by JAX (default 0.95)
+#   XLA_PYTHON_CLIENT_MEM_FRACTION  fraction of each GPU preallocated by JAX (default 0.95; 0.90 with more than 4 GPUs)
 #   NCCL_SOCKET_IFNAME / NCCL_IB_DISABLE  NCCL bootstrap interface / IB switch (default lo / 1: single node, NVLink only)
 #   OPENPI_RESUME=1 resumes the experiment, OPENPI_OVERWRITE=1 overwrites it
 #   OPENPI_RECOMPUTE_NORM_STATS=1 recomputes assets/<config>/<asset_id>/norm_stats.json
@@ -76,7 +76,15 @@ export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-${HOME}/.cache/openpi}"
 # Always import this repository's openpi.
 export PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}/packages/openpi-client/src${PYTHONPATH:+:${PYTHONPATH}}"
 export CUDA_VISIBLE_DEVICES="${GPUS}"
-export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.95}"
+# JAX preallocates this fraction of every GPU; NCCL allocates outside of it. On the 81.5 GB H100s the rest was
+# measured at 1.5-2.4 GB per GPU with up to 4 GPUs and 4.2 GB with 8: 0.95 leaves 4.0 GB, and 8-GPU training aborts in
+# its first step with NCCL "Cuda failure 2 'out of memory'".
+if ((NUM_GPUS > 4)); then
+    DEFAULT_MEM_FRACTION=0.90
+else
+    DEFAULT_MEM_FRACTION=0.95
+fi
+export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-${DEFAULT_MEM_FRACTION}}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 # Step / loss lines go through stdout: unbuffered, so they reach the log while training runs.
 export PYTHONUNBUFFERED=1
@@ -103,6 +111,7 @@ if command -v nvidia-smi >/dev/null; then
     echo "GPU memory in use before training (GPUs ${GPUS}):"
     nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader -i "${GPUS}" || true
 fi
+echo "JAX preallocates ${XLA_PYTHON_CLIENT_MEM_FRACTION} of each of the ${NUM_GPUS} GPUs"
 
 # Each checkpoint (params + EMA + AdamW state) needs several tens of GB.
 mkdir -p "${CHECKPOINT_BASE_DIR}"

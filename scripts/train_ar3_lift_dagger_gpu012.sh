@@ -94,7 +94,13 @@ export OPENPI_AR3_DAGGER_RATIO="${OPENPI_AR3_DAGGER_RATIO:-0.5}"
 export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-${HOME}/.cache/openpi}"
 export PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}/packages/openpi-client/src${PYTHONPATH:+:${PYTHONPATH}}"
 export CUDA_VISIBLE_DEVICES="${GPUS}"
-export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.95}"
+# As in scripts/train_ar3_lift_gpu012.sh: with more than 4 GPUs NCCL needs more of the memory outside JAX's pool.
+if ((NUM_GPUS > 4)); then
+    DEFAULT_MEM_FRACTION=0.90
+else
+    DEFAULT_MEM_FRACTION=0.95
+fi
+export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-${DEFAULT_MEM_FRACTION}}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export PYTHONUNBUFFERED=1
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-lo}"
@@ -169,6 +175,7 @@ fi
 
 mkdir -p "${REPO_ROOT}/logs" "${CHECKPOINT_BASE_DIR}"
 LOG_FILE="${REPO_ROOT}/logs/${CONFIG_NAME}_${EXP_NAME}.log"
+echo "JAX preallocates ${XLA_PYTHON_CLIENT_MEM_FRACTION} of each of the ${NUM_GPUS} GPUs"
 echo "Logging to ${LOG_FILE}"
 if [[ "${OPENPI_DRY_RUN:-0}" == "1" ]]; then
     run "${PYTHON}" scripts/train.py "${TRAIN_ARGS[@]}"

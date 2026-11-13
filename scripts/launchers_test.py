@@ -191,6 +191,52 @@ def test_muscle_vlta_launcher_builds_the_tactile_cache_before_training(launcher_
     assert not (dataset / "tactile_cache").exists()
 
 
+@pytest.mark.parametrize(
+    ("launcher", "gpus", "override", "fraction"),
+    [
+        ("train_ar3_muscle_vlta.sh", "4,5,6,7", None, "0.95"),
+        ("train_ar3_muscle_vlta.sh", "0,1,2,3,4,5,6,7", None, "0.90"),
+        ("train_ar3_muscle_vlta.sh", "0,1,2,3,4,5,6,7", "0.8", "0.8"),
+        ("train_ar3_muscle_vlta_rl.sh", "0,1,2,3,4,5,6,7", None, "0.90"),
+        ("train_ar3_lift_dagger_gpu012.sh", "0,1,2,3,4,5,6,7", None, "0.90"),
+    ],
+)
+def test_training_on_many_gpus_leaves_memory_for_nccl(launcher, gpus, override, fraction, launcher_env, tmp_path):
+    """With 8 GPUs NCCL needs about 4.2 GB per GPU outside JAX's pool: preallocating 0.95 of the H100s aborted the
+    first step ("Cuda failure 2 'out of memory'")."""
+    dataset = tmp_path / "plug_in"
+    (dataset / "meta").mkdir(parents=True)
+    (dataset / "meta" / "info.json").write_text("{}")
+    (dataset / "rl").mkdir()
+    (dataset / "rl" / "outcomes.json").write_text("{}")
+    step = tmp_path / "ckpt" / "pi05_ar3_muscle_vlta" / "run" / "32000"
+    (step / "params").mkdir(parents=True)
+    (step / "assets" / "plug_in").mkdir(parents=True)
+    (step / "assets" / "plug_in" / "norm_stats.json").write_text("{}")
+    (tmp_path / "home" / "big_vision").mkdir(parents=True)
+    (tmp_path / "home" / "big_vision" / "paligemma_tokenizer.model").write_text("")
+    launcher_env.update(
+        {
+            "OPENPI_AR3_REPO_ID": str(dataset),
+            "OPENPI_AR3_WEIGHT_PATH": launcher_env["OPENPI_INIT_CHECKPOINT"],
+            "OPENPI_DATA_HOME": str(tmp_path / "home"),
+            "OPENPI_CHECKPOINT_BASE_DIR": str(tmp_path / "checkpoints"),
+            "OPENPI_CUDA_VISIBLE_DEVICES": gpus,
+            "OPENPI_BATCH_SIZE": "256",
+        }
+    )
+    launcher_env.pop("XLA_PYTHON_CLIENT_MEM_FRACTION", None)
+    if override is not None:
+        launcher_env["XLA_PYTHON_CLIENT_MEM_FRACTION"] = override
+    arguments = {
+        "train_ar3_muscle_vlta_rl.sh": [str(step)],
+        "train_ar3_lift_dagger_gpu012.sh": [str(step), str(dataset)],
+    }
+    result = run_launcher(launcher, launcher_env, *arguments.get(launcher, []))
+    assert result.returncode == 0, result.stderr
+    assert f"JAX preallocates {fraction} of each of the {len(gpus.split(','))} GPUs" in result.stdout
+
+
 def test_muscle_vlta_launcher_trains_several_sessions_as_one(launcher_env, tmp_path):
     sessions = [tmp_path / "plug_in", tmp_path / "plug in_35"]
     for session in sessions:
