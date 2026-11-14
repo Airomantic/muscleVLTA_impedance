@@ -267,6 +267,8 @@ Fx, Fy, Fz, Tx, Ty, Tz) still awaits vendor or physical validation.
 **VS Code 本机真机调试**：打开本项目，在“运行和调试”中选择
 `AR3 LIFT：真机推理（回起点并执行）`，点击绿色三角或按 F5。配置位于
 [.vscode/launch.json](.vscode/launch.json)，checkpoint 以对应配置的 `--checkpoint` 为准，GPU 0、ROS domain 111。
+当前模型调试配置统一使用 `infer_checkpoint/23000`。切换模型时修改要运行的配置中的 `--checkpoint`，
+路径应指向包含完整 `params/` 和 `assets/` 的训练步数目录；各启动项的参数独立，修改一个不会同步到其他项。
 每个 Debug 配置的 `args` 都显式包含 `--task=...`；切换任务时修改等号后的整段提示词，
 保留为一个 JSON 字符串，并放在参数分隔符 `--` 后。该提示词用于模型预热和每块动作推理；
 命令行的 `--prompt` 仍可作为同义参数使用。
@@ -320,8 +322,16 @@ scripts/ar3_lift_debug_python.sh scripts/debug_ar3_lift_robot.py -- --execute --
 
 **Record rollouts and DAgger corrections** (LIFT stage two). `--record-dir DIR` appends every episode the operator
 keeps to a LeRobot v3.0 dataset with the offline dataset's features (front/wrist video, TCP pose, gripper opening,
-TCP wrench, `tau_m`, the commanded 7D action) and `control_flag` (1 = policy, −1 = human); the robot Python also needs
-`pip install pyarrow av`. With `--dagger`, each episode starts at the saved home (as `--move-to-start`) and runs the
+TCP wrench, `tau_m`, the commanded 7D action) and `control_flag` (1 = policy, −1 = human).
+Install the recording dependencies into the robot's ROS Python environment, also used by the VS Code recording
+configuration (replace the interpreter path if using `INFER_ROBOT_PYTHON`):
+
+```bash
+PYTHONNOUSERSITE=1 ../V3_Gripper/.venv-ros/bin/python -m pip install pyarrow av
+```
+
+Installing them into the activated model environment does not make them available to the robot Python.
+With `--dagger`, each episode starts at the saved home (as `--move-to-start`) and runs the
 policy; pressing the teleoperation clutch hands the arm to the operator at once, and the gripper follows the trigger
 once the trigger has matched the fingers' opening
 ([scripts/ar3_dagger_gripper_teleop.py](scripts/ar3_dagger_gripper_teleop.py)).
@@ -341,14 +351,15 @@ demonstrations and corrections 1:1 in every batch; serve the result with `script
 collection and training for several rounds.
 
 In VS Code, `AR3 LIFT：真机推理并录制回合` records policy rollouts to `outputs/ar3_lift_rollouts`. For DAgger, run
-`./infer_oneclick.sh --dagger` in a terminal first, then `AR3 LIFT DAgger：检查` and
+`./infer_oneclick.sh --dagger` in a terminal first and wait for **PREPARATION READY** in the ready tab, then
+`AR3 LIFT DAgger：检查` and
 `AR3 LIFT DAgger：推理+接管纠正采集` (it asks for the dataset directory). Both load the local policy like the
 configurations above but use `--hardware skip`: device preparation would refuse the running teleoperation as a
 conflicting command source. `AR3 LIFT DAgger：夹爪门控检查` prints the trigger → gripper target mapping without
 moving the gripper. The command line equivalent of the collection is:
 
 ```bash
-scripts/ar3_lift_debug_python.sh scripts/debug_ar3_lift_robot.py --hardware skip -- --execute --dagger \
+scripts/ar3_lift_debug_python.sh scripts/debug_ar3_lift_robot.py --hardware skip -- --execute --move-to-start --dagger \
   --record-dir outputs/ar3_lift_dagger/round1 --home-file ../ar3_CartesianImpedanceControl/config/cartesian_home.json
 ```
 
@@ -623,6 +634,15 @@ robot. One chunk cannot be credited reliably with a few hundred episodes, hence 
 优势条件化微调）` 调试微调（先运行前一项生成 `debug` 标签；检查点写入 `/data/jiang/train_checkpoints_debug`）。真机侧：
 `muscleVLTA RL：录制回合并标注成败（Tac G2，每回合回起点并执行）` 采集下一轮的数据，`muscleVLTA RL：插充电头真机推理
 （RL 微调后的检查点，Tac G2，回起点并执行）` 运行微调后的检查点（先把 step 目录复制到 `infer_checkpoint/muscle_vlta_rl`）。
+
+录制和 DAgger 执行入口均显式配置 `--move-to-start`。每回合先等待释放离合和控制器就绪，再回到
+`--home-file` 保存的初始位姿并确认到达，之后才开始录制和执行模型动作；回位失败不会开始该回合。
+“Preparation tasks opened” 仅表示任务窗口已打开，必须等 ready 窗口报告 `PREPARATION READY`。
+若 arm 窗口出现 `RT takeover refused: operationState=rtControlling(2)`，说明控制柜仍报告 RT 模式，
+不代表机械臂一定正在运动。客户端会立即报告这一故障，不会将它掩盖成缺少 state/tau_m 的超时。
+先让原控制程序正常退出并解除控制柜的旧 RT 会话，再关闭故障 arm 节点并重新准备；仅重启推理客户端
+不能修复该状态。残留 RT 的显式恢复前提和步骤见
+[机械臂控制器说明](../ar3_CartesianImpedanceControl/src/ar3_cartesian_impedance/README.md)，常规启动不自动启用恢复。
 
 ## 🙏 Acknowledgements
 
