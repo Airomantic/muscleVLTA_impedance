@@ -18,15 +18,16 @@
                 "OPENPI_SERVE_GPU": "0"
             },
             "args": [
-                "--checkpoint", "${workspaceFolder}/infer_checkpoint/23000",
+                "--checkpoint", "${workspaceFolder}/infer_checkpoint/25000",
                 "--hardware", "auto",
                 "--", "--execute", "--move-to-start",
                 // 执行总块数：当前每块 10 个动作、10 Hz，35 块约 35 秒；改成 30 即约 30 秒。
                 // 实际耗时另加模型等待时间；模型加载、预热和回起点不计入。此参数不改变每块动作长度。
-                "--max-chunks", "40",
+                "--max-chunks", "55",
                 "--home-file", "${workspaceFolder}/../ar3_CartesianImpedanceControl/config/cartesian_home.json",
                 // "--task=Unplug the white charging plug from the white socket and place it on the table, don't bump your fingers into other objects"
-                "--task=plug the two-pronged white charger on the table into the white socket, don't bump your fingers into other objects, select the nearest hole position"
+                // "--task=plug the two-pronged white charger on the table into the white socket, don't bump your fingers into other objects, select the nearest hole position"
+                "--task=Pick up a bottle and shake it, using force feedback to sense pills moving inside. If it contains  medicine, place it on top of the drawer; otherwise, put it back and try another"
             ]
         },
         {
@@ -46,7 +47,7 @@
                 "OPENPI_SERVE_GPU": "0"
             },
             "args": [
-                "--checkpoint", "${workspaceFolder}/infer_checkpoint/20000",
+                "--checkpoint", "${workspaceFolder}/infer_checkpoint/23000",
                 "--hardware", "skip",
                 "--", "--check",
                 "--task=Unplug the white charging plug from the white socket and place it on the table, don't bump your fingers into other objects"
@@ -69,7 +70,7 @@
                 "OPENPI_SERVE_GPU": "0"
             },
             "args": [
-                "--checkpoint", "${workspaceFolder}/infer_checkpoint/20000",
+                "--checkpoint", "${workspaceFolder}/infer_checkpoint/23000",
                 "--hardware", "auto",
                 "--", "--max-chunks", "3",
                 "--task=Unplug the white charging plug from the white socket and place it on the table, don't bump your fingers into other objects"
@@ -92,9 +93,9 @@
                 "OPENPI_SERVE_GPU": "0"
             },
             "args": [
-                "--checkpoint", "${workspaceFolder}/infer_checkpoint/20000",
+                "--checkpoint", "${workspaceFolder}/infer_checkpoint/23000",
                 "--hardware", "auto",
-                "--", "--execute",
+                "--", "--execute", "--move-to-start",
                 "--record-dir", "${workspaceFolder}/outputs/ar3_lift_rollouts",
                 "--home-file", "${workspaceFolder}/../ar3_CartesianImpedanceControl/config/cartesian_home.json",
                 "--task=Unplug the white charging plug from the white socket and place it on the table, don't bump your fingers into other objects"
@@ -117,7 +118,7 @@
                 "OPENPI_SERVE_GPU": "0"
             },
             "args": [
-                "--checkpoint", "${workspaceFolder}/infer_checkpoint/20000",
+                "--checkpoint", "${workspaceFolder}/infer_checkpoint/23000",
                 "--hardware", "skip",
                 "--", "--check", "--dagger",
                 "--task=Unplug the white charging plug from the white socket and place it on the table, don't bump your fingers into other objects"
@@ -140,9 +141,9 @@
                 "OPENPI_SERVE_GPU": "0"
             },
             "args": [
-                "--checkpoint", "${workspaceFolder}/infer_checkpoint/20000",
+                "--checkpoint", "${workspaceFolder}/infer_checkpoint/23000",
                 "--hardware", "skip",
-                "--", "--execute", "--dagger",
+                "--", "--execute", "--move-to-start", "--dagger",
                 "--record-dir", "${input:ar3LiftDaggerDir}",
                 "--home-file", "${workspaceFolder}/../ar3_CartesianImpedanceControl/config/cartesian_home.json",
                 "--task=Unplug the white charging plug from the white socket and place it on the table, don't bump your fingers into other objects"
