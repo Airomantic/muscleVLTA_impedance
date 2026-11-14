@@ -48,5 +48,13 @@
   "wilson": "E. B. Wilson. Probable Inference, the Law of Succession, and Statistical Inference. Journal of the American Statistical Association, 22(158):209–212, 1927.",
   "flashhogan": "T. Flash and N. Hogan. The Coordination of Arm Movements: An Experimentally Confirmed Mathematical Model. Journal of Neuroscience, 5(7):1688–1703, 1985.",
   "sparc": "S. Balasubramanian, A. Melendez-Calderon, A. Roby-Brami, and E. Burdet. On the Analysis of Movement Smoothness. Journal of NeuroEngineering and Rehabilitation, 12:112, 2015.",
-  "sparc2012": "S. Balasubramanian, A. Melendez-Calderon, and E. Burdet. A Robust and Sensitive Metric for Quantifying Movement Smoothness. IEEE Transactions on Biomedical Engineering, 59(8):2126–2136, 2012."
+  "sparc2012": "S. Balasubramanian, A. Melendez-Calderon, and E. Burdet. A Robust and Sensitive Metric for Quantifying Movement Smoothness. IEEE Transactions on Biomedical Engineering, 59(8):2126–2136, 2012.",
+  "raibert": "M. H. Raibert and J. J. Craig. Hybrid Position/Force Control of Manipulators. Journal of Dynamic Systems, Measurement, and Control, 103(2):126–133, 1981.",
+  "mason": "M. T. Mason. Compliance and Force Control for Computer Controlled Manipulators. IEEE Transactions on Systems, Man, and Cybernetics, 11(6):418–432, 1981.",
+  "recap": "Physical Intelligence: A. Amin, R. Aniceto, A. Balakrishna, et al. π^{*}_{0.6}: a VLA That Learns From Experience. arXiv:2511.14759, 2025.",
+  "dagger": "S. Ross, G. Gordon, and D. Bagnell. A Reduction of Imitation Learning and Structured Prediction to No-Regret Online Learning. In AISTATS, 2011.",
+  "torlvla": "H. Zheng, Y. Yang, K. Ma, S. Xu, T. Xie, G. Li, X. Wang, Y. Ma, S. Liu, Y. Mao, and B. Liu. TORL-VLA: Tactile Guided Online Reinforcement Learning for Contact-Rich Manipulation. arXiv:2606.09337, 2026.",
+  "forcerft": "Y. Wang, C. Zhang, X. Su, J. Ma, H. Zhu, and X. Li. ForceRFT: Refining VLA Actions through Force-Guided Residual Reinforcement Learning. arXiv:2609.22840, 2026.",
+  "taccorl": "S. Ma, Y. Liang, C. Yu, Y. Chen, H. Su, Y. Zhu, Y. Yang, and C. Jiang. TacCoRL: Integrating Tactile Feedback into VLA via Simulation. arXiv:2606.11743, 2026.",
+  "haddadin": "S. Haddadin, A. De Luca, and A. Albu-Schäffer. Robot Collisions: A Survey on Detection, Isolation, and Identification. IEEE Transactions on Robotics, 33(6):1292–1312, 2017."
 }

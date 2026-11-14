@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1000" height="262" viewBox="0 0 1000 262" font-family="Arial, Helvetica, 'Liberation Sans', 'Nimbus Sans', sans-serif">
+  <title>muscleVLTA-RL: offline advantage-conditioned fine-tuning with a force-touch critic</title>
+  <defs>
+    <style>
+      .h { font-size: 15px; font-weight: bold; fill: #102A43; }
+      .m { font-size: 13px; font-weight: bold; fill: #102A43; }
+      .t { font-size: 12.5px; fill: #243B53; }
+      .b { font-weight: bold; }
+      .n { font-size: 12px; fill: #52606D; }
+      .i { font-style: italic; }
+      .c { text-anchor: middle; }
+      .bd { font-size: 11px; font-weight: bold; fill: #FFFFFF; text-anchor: middle; }
+      .x { font-size: 10px; fill: #52606D; }
+      .ln { fill: none; stroke: #4A5568; stroke-width: 1.2; stroke-linejoin: round; }
+      .tile { fill: #F7F9FB; stroke: #DDE3EA; stroke-width: 1; }
+      .pre { fill: #E9EEF5; stroke: #7C8DA6; stroke-width: 1.2; }
+      .vl { fill: #E3EDF9; stroke: #3B6FB6; stroke-width: 1.2; }
+      .arm { fill: #FDEBD7; stroke: #DD7A1E; stroke-width: 1.2; }
+      .hand { fill: #DDF3EE; stroke: #1E9E87; stroke-width: 1.2; }
+      .act { fill: #ECE6F8; stroke: #7A5BC2; stroke-width: 1.2; }
+      .card { fill: #FFFFFF; stroke: #CBD2DA; stroke-width: 1; }
+      .pos { fill: #2E9E6B; }
+      .neg { fill: #D7263D; }
+    </style>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" markerUnits="userSpaceOnUse" orient="auto">
+      <path d="M0 1 L10 5 L0 9 Z" fill="#4A5568"/>
+    </marker>
+  </defs>
+  <rect width="1000" height="262" fill="#FFFFFF"/>
+  <rect class="tile" x="6" y="6" width="988" height="250" rx="10"/>
+  <text class="h" x="16" y="24">muscleVLTA-RL: offline advantage-conditioned fine-tuning with a force–touch critic</text>
+
+  <!-- ===================== 1 EXPERIENCE ===================== -->
+  <rect x="12" y="34" width="200" height="180" rx="8" fill="#EEF4FB"/>
+  <circle cx="28" cy="48" r="8" fill="#102A43"/><text class="bd" x="28" y="52">1</text>
+  <text class="m" x="42" y="52.5">Experience</text>
+  <rect class="card" x="22" y="62" width="180" height="40" rx="6"/>
+  <text class="t b" x="32" y="78">Demonstrations</text>
+  <text class="n" x="32" y="93">teleoperation, successful</text>
+  <rect class="card" x="22" y="108" width="180" height="52" rx="6"/>
+  <text class="t b" x="32" y="124">Policy rollouts</text>
+  <text class="n" x="32" y="139">outcome of every episode:</text>
+  <circle class="pos" cx="37" cy="150" r="4"/><text class="n" x="45" y="154">success</text>
+  <circle class="neg" cx="103" cy="150" r="4"/><text class="n" x="111" y="154">failure</text>
+  <rect class="card" x="22" y="166" width="180" height="40" rx="6"/>
+  <text class="t b" x="32" y="182">Human corrections</text>
+  <text class="n" x="32" y="197">the operator takes over</text>
+  <path class="ln" d="M212 124 H225" marker-end="url(#ah)"/>
+
+  <!-- ===================== 2 CRITIC ===================== -->
+  <rect x="226" y="34" width="290" height="180" rx="8" fill="#FCF6EC"/>
+  <circle cx="242" cy="48" r="8" fill="#102A43"/><text class="bd" x="242" y="52">2</text>
+  <text class="m" x="256" y="52.5">Force–touch critic</text>
+  <rect class="pre" x="236" y="62" width="150" height="26" rx="6"/>
+  <text class="t c" x="311" y="79.5">SigLIP image features</text>
+  <rect class="card" x="236" y="94" width="150" height="26" rx="6"/>
+  <text class="t c" x="311" y="111.5">TCP pose, gripper</text>
+  <rect class="arm" x="236" y="126" width="150" height="26" rx="6"/>
+  <text class="t c" x="311" y="143.5">Arm force 13-D · GRU</text>
+  <rect class="hand" x="236" y="158" width="150" height="26" rx="6"/>
+  <text class="t c" x="311" y="175.5">Fingers · hand encoder</text>
+  <text class="x c" x="311" y="201">1 s history, as in the policy</text>
+  <path class="ln" d="M386 75 H398 M386 107 H398 M386 139 H398 M386 171 H398 M398 75 V171"/>
+  <path class="ln" d="M398 123 H409" marker-end="url(#ah)"/>
+  <rect class="act" x="410" y="98" width="96" height="50" rx="6"/>
+  <text class="m c" x="458" y="119">Value head</text>
+  <text class="n c" x="458" y="136">201 bins</text>
+  <text class="n c" x="458" y="168">V: minus the time</text>
+  <text class="n c" x="458" y="183">left to success</text>
+  <text class="x c" x="458" y="201">4-fold cross-fitted</text>
+  <path class="ln" d="M516 124 H529" marker-end="url(#ah)"/>
+
+  <!-- ===================== 3 ADVANTAGE ===================== -->
+  <rect x="530" y="34" width="210" height="180" rx="8" fill="#F4EFFB"/>
+  <circle cx="546" cy="48" r="8" fill="#102A43"/><text class="bd" x="546" y="52">3</text>
+  <text class="m" x="560" y="52.5">Advantage label</text>
+  <text class="t" x="540" y="78">A(t) = r(t) + … + r(t+n−1)</text>
+  <text class="t" x="540" y="95">+ V(t+n) − V(t),  n = 50 (5 s)</text>
+  <text class="x" x="540" y="115">action chunks of one episode</text>
+  <rect class="pos" x="540" y="120" width="66" height="12"/>
+  <rect class="neg" x="606" y="120" width="58" height="12"/>
+  <rect class="pos" x="664" y="120" width="66" height="12"/>
+  <rect class="pos" x="540" y="140" width="8" height="8"/><text class="x" x="552" y="148">positive</text>
+  <rect class="neg" x="606" y="140" width="8" height="8"/><text class="x" x="618" y="148">negative</text>
+  <text class="n" x="540" y="169">positive: the best 50% of the</text>
+  <text class="n" x="540" y="184">demonstration and 40% of the</text>
+  <text class="n" x="540" y="199">policy frames; all corrections</text>
+  <path class="ln" d="M740 124 H753" marker-end="url(#ah)"/>
+
+  <!-- ===================== 4 FINE-TUNING ===================== -->
+  <rect x="754" y="34" width="234" height="180" rx="8" fill="#EAF6F2"/>
+  <circle cx="770" cy="48" r="8" fill="#102A43"/><text class="bd" x="770" y="52">4</text>
+  <text class="m" x="784" y="52.5">Conditioned fine-tuning</text>
+  <rect x="764" y="60" width="214" height="20" rx="10" fill="#FFFFFF" stroke="#2E9E6B" stroke-width="1.2"/>
+  <circle class="pos" cx="776" cy="70" r="4"/>
+  <text class="n i" x="786" y="74">“task prompt”</text>
+  <rect x="764" y="86" width="214" height="20" rx="10" fill="#FFFFFF" stroke="#D7263D" stroke-width="1.2"/>
+  <circle class="neg" cx="776" cy="96" r="4"/>
+  <text class="x i" x="786" y="99.5">“task prompt, Advantage: negative”</text>
+  <path class="ln" d="M871 106 V121" marker-end="url(#ah)"/>
+  <rect class="vl" x="774" y="122" width="194" height="42" rx="6"/>
+  <text class="m c" x="871" y="139">muscleVLTA, all weights</text>
+  <text class="n c" x="871" y="155">losses of pre-training</text>
+  <text class="n" x="764" y="184">Deployment: the task prompt</text>
+  <text class="n" x="764" y="199">without an indicator</text>
+
+  <!-- ===================== NEXT ROUND ===================== -->
+  <path class="ln" d="M871 214 V238 H112 V215" marker-end="url(#ah)"/>
+  <rect x="262" y="229" width="476" height="18" fill="#F7F9FB"/>
+  <text class="n c" x="500" y="242">next round: deploy, record rollouts with their outcomes, refit the critic, fine-tune again</text>
+</svg>

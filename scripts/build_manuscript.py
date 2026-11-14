@@ -15,7 +15,8 @@ Markup. Blocks are separated by blank lines:
     $$ a_{i} = b^{2} $$         display equation, numbered automatically
     !figure wide|column FILE    followed by a line "caption: ..." (FILE.svg and FILE.png must both exist)
     !table wide|column W1 W2 .. followed by "caption: ..." and "| cell | cell |" rows (first row = header);
-                                the widths are relative
+                                the widths are relative. Tables are three-line tables; a row "---" draws a
+                                rule above the row that follows it
     !algorithm Title            followed by one line per step
     !columns 1|2                switches the column layout;  !pagebreak;  !references (the cited entries, in order)
 
@@ -230,28 +231,46 @@ def figure(path: pathlib.Path, caption: str, document: Document, *, wide: bool) 
 def table(
     weights: Sequence[float], caption: str, rows: Sequence[Sequence[str]], document: Document, *, wide: bool
 ) -> str:
+    """A three-line table: heavy rules above and below, light rules under the header and where the source says so."""
     total = PAGE_DXA if wide else COLUMN_DXA
     widths = [round(total * weight / sum(weights)) for weight in weights]
-    border = "".join(
-        f'<w:{side} w:val="single" w:sz="4" w:space="0" w:color="D9D9D9"/>'
-        for side in ("top", "left", "bottom", "right")
-    )
     margins = "".join(f'<w:{side} w:w="60" w:type="dxa"/>' for side in ("top", "left", "bottom", "right"))
+    content: list[Sequence[str]] = []
+    ruled = {1}
+    for cells in rows:
+        if list(cells) == ["---"]:
+            ruled.add(len(content))
+        else:
+            content.append(cells)
+    heavy, light = 10, 4  # eighths of a point
     body = []
-    for row_index, cells in enumerate(rows):
+    for row_index, cells in enumerate(content):
         if len(cells) != len(widths):
             raise ValueError(f"Table row {cells} has {len(cells)} cells, expected {len(widths)}")
         header = row_index == 0
+        last = row_index == len(content) - 1
+        rules = {
+            "top": heavy if header else light if row_index in ruled else 0,
+            "left": 0,
+            "bottom": heavy if last else light if header else 0,
+            "right": 0,
+        }
+        border = "".join(
+            f'<w:{side} w:val="single" w:sz="{size}" w:space="0" w:color="000000"/>'
+            if size
+            else f'<w:{side} w:val="nil"/>'
+            for side, size in rules.items()
+        )
         # Every row but the last stays with the next one, so a table is not split between columns or pages.
-        keep = "<w:keepNext/>" if row_index < len(rows) - 1 else ""
+        keep = "<w:keepNext/>" if not last else ""
         row = ["<w:tr><w:trPr><w:cantSplit/>" + ("<w:tblHeader/>" if header else "") + "</w:trPr>"]
-        for cell, width in zip(cells, widths, strict=True):
-            shade = '<w:shd w:val="clear" w:color="auto" w:fill="E8ECEF"/>' if header else ""
+        for column, (cell, width) in enumerate(zip(cells, widths, strict=True)):
             text = inline(cell, document, *(["<w:b/>"] if header else []), '<w:sz w:val="16"/>')
+            align = '<w:jc w:val="center"/>' if column else '<w:jc w:val="left"/>'
             row.append(
-                f'<w:tc><w:tcPr><w:tcW w:w="{width}" w:type="dxa"/><w:tcBorders>{border}</w:tcBorders>{shade}'
+                f'<w:tc><w:tcPr><w:tcW w:w="{width}" w:type="dxa"/><w:tcBorders>{border}</w:tcBorders>'
                 f"<w:tcMar>{margins}</w:tcMar></w:tcPr>"
-                + paragraph(text, f'{keep}<w:spacing w:after="20"/><w:ind w:firstLine="0"/>')
+                + paragraph(text, f'{keep}<w:spacing w:after="20"/><w:ind w:firstLine="0"/>{align}')
                 + "</w:tc>"
             )
         body.append("".join(row) + "</w:tr>")

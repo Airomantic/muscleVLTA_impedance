@@ -1,18 +1,19 @@
 {
   "real_robot": {
-    "note": "Success counts of occluded charger insertion on the AR3, as reported by the authors: [successes, trials]. null = not measured yet (drawn as TBD). The measured 'Ours, shared fusion' counts are the pi05_ar3_muscle_vlta policy; fill 'Ours, balanced fusion' once pi05_ar3_muscle_vlta_v2 has been evaluated.",
+    "note": "Success counts of occluded charger insertion on the AR3, as reported by the authors: [successes, trials]. null = no count (drawn as TBD): not measured, or reported as a percentage that 60 trials cannot give (ForceVLA2 near: 60.5%). Counts given as percentages were converted with 60 trials (6.67% = 4/60, 5.0% = 3/60, 21.67% = 13/60). Shared fusion is the pi05_ar3_muscle_vlta policy, balanced fusion pi05_ar3_muscle_vlta_v2.",
     "conditions": {
       "near": "Start within 20 cm of the socket",
       "far": "Start 40-50 cm from the socket"
     },
     "methods": [
-      {"name": "π0.5", "near": null, "far": [0, 60]},
-      {"name": "GR00T", "near": null, "far": null},
-      {"name": "ForceVLA2", "near": null, "far": null},
-      {"name": "LIFT", "near": null, "far": null},
-      {"name": "Ours w/o touch", "near": null, "far": [3, 60]},
-      {"name": "Ours, shared fusion", "near": [55, 60], "far": [13, 60]},
-      {"name": "Ours, balanced fusion", "near": null, "far": null}
+      {"name": "π0.5", "near": [1, 60], "far": [0, 60]},
+      {"name": "GR00T", "near": [1, 60], "far": [0, 60]},
+      {"name": "ForceVLA2", "near": null, "far": [5, 60]},
+      {"name": "LIFT", "near": [4, 60], "far": [2, 60]},
+      {"name": "muscleVLTA w/o touch", "near": [3, 60], "far": [3, 60]},
+      {"name": "muscleVLTA, shared", "near": [55, 60], "far": [13, 60]},
+      {"name": "muscleVLTA, balanced", "near": [53, 60], "far": [13, 60]},
+      {"name": "muscleVLTA-RL", "near": null, "far": null}
     ]
   },
   "attribution": {

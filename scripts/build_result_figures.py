@@ -43,7 +43,7 @@ def real_robot_figure(data: dict) -> svg_chart.Canvas:
     methods = data["methods"]
     rows = 17 * len(methods)
     canvas = svg_chart.Canvas(340, 2 * rows + 118)
-    colors = [PURPLE if method["name"].startswith("Ours,") else GREY for method in methods]
+    colors = [PURPLE if method["name"].startswith("muscleVLTA") else GREY for method in methods]
     for index, (key, title) in enumerate(data["conditions"].items()):
         cells = [method[key] for method in methods]
         svg_chart.hbar_panel(

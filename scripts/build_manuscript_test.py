@@ -35,6 +35,8 @@ caption: Figure 1. A chart.
 !table column 2 1
 caption: Table 1. Counts.
 | Method | Far
+| Baseline | 0/60
+| ---
 | Ours | {{TBD}}
 
 !algorithm Algorithm 1. Steps
@@ -132,7 +134,13 @@ def test_manuscript_keeps_the_template_and_embeds_figures_as_svg_with_png_fallba
     assert len(list(body.iter(f"{W}tbl"))) == 1
     # A table is not split between columns: every row but the last keeps with the next one.
     rows = body.find(f".//{W}tbl").findall(f"{W}tr")
-    assert [row.find(f".//{W}keepNext") is not None for row in rows] == [True, False]
+    assert [row.find(f".//{W}keepNext") is not None for row in rows] == [True, True, False]
+    # Three-line table: heavy rules above the header and below the last row, light rules under the header and where
+    # the source has a "---" row; no vertical lines.
+    borders = [row.find(f"{W}tc/{W}tcPr/{W}tcBorders") for row in rows]
+    sizes = [[border.find(f"{W}{side}").get(f"{W}sz") for side in ("top", "bottom")] for border in borders]
+    assert sizes == [["10", "4"], ["4", None], ["4", "10"]]
+    assert {border.find(f"{W}{side}").get(f"{W}val") for border in borders for side in ("left", "right")} == {"nil"}
     assert len(body.findall(f".//{W}drawing")) == 1
 
 
