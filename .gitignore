@@ -24,3 +24,5 @@ logs/
 *.tmp
 *.swp
 .ipynb_checkpoints/
+
+picture
