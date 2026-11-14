@@ -141,6 +141,18 @@ class RobotError(RuntimeError):
     """The arm, its controller or its sensors cannot (or can no longer) be used safely."""
 
 
+def check_controller_status(status: str) -> None:
+    """Report controller faults even before this client owns a session, without issuing any commands."""
+    if (
+        status.startswith(("fault:", "offline:", "stop failed:"))
+        or "RT monitoring restoration failed" in status
+        or "monitoring unavailable" in status
+    ):
+        raise RobotError(
+            f"controller {status}; resolve the arm task fault and wait for PREPARATION READY before inference"
+        )
+
+
 class GripperError(RuntimeError):
     """Gripper feedback or a gripper command failed."""
 
@@ -944,6 +956,7 @@ class Ar3Robot:
                 for name, topic in self._camera_topics.items():
                     ages[topic] = (now - self._images.get(name, (None, -math.inf))[1], max_image_age)
                 status, metadata = self._status, self._metadata
+            check_controller_status(status)
             missing = [topic for topic, (age, limit) in ages.items() if age > limit]
             if not status:
                 missing.append(self.prefix + "/status")
@@ -2377,14 +2390,19 @@ class Session:
         """DAgger: clutch released and controller idle. A clutch press while no episode runs starts a teleoperation
         session that it keeps after the release; the operator may stop it. False if the operator quits."""
         robot = self.robot
+        check_controller_status(robot.status)
         if robot.clutch_pressed:
             logger.warning("release the teleoperation clutch to start the episode")
             self._await_release()
         deadline = time.monotonic() + 3.0
-        while not robot.status.startswith(IDLE_STATUS):
+        while True:
+            status = robot.status
+            check_controller_status(status)
+            if status.startswith(IDLE_STATUS):
+                return True
             if time.monotonic() > deadline:
                 answer = self.console.ask(
-                    f"the controller is busy ({robot.status}), e.g. the teleoperation holds the arm. "
+                    f"the controller is busy ({status}), e.g. the teleoperation holds the arm. "
                     "Enter = stop the controller (the arm stays where it is), q = quit",
                     "q",
                 )
@@ -2393,7 +2411,6 @@ class Session:
                 robot.stop_controller()
                 return True
             time.sleep(0.05)
-        return True
 
     def _reanchor(self) -> None:
         """Centres the controller's workspace sphere at the start pose, like in the recordings."""
