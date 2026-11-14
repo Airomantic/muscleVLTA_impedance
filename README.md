@@ -379,6 +379,8 @@ losses for the contact gates and for an action-conditioned forward model of the 
 ```bash
 OPENPI_EXP_NAME=muscle_vlta_30k OPENPI_NUM_TRAIN_STEPS=30000 bash scripts/train_ar3_muscle_vlta.sh
 # other GPUs: OPENPI_CUDA_VISIBLE_DEVICES=4,5,6,7; continue a run: OPENPI_RESUME=1 with the same OPENPI_EXP_NAME
+# start a run again under its name: OPENPI_OVERWRITE=1. It refuses an experiment that holds saved checkpoints (a
+#   mistyped command once wiped another run this way); OPENPI_OVERWRITE=force deletes them
 # all 8 GPUs: OPENPI_CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OPENPI_BATCH_SIZE=256 (JAX then preallocates 90% of each
 #   GPU instead of 95%: NCCL needs about 4.2 GB per GPU outside JAX's pool with 8 GPUs)
 # 30 s and 35 s sessions together (one Tac G2 cache each):

@@ -191,19 +191,8 @@ def test_muscle_vlta_launcher_builds_the_tactile_cache_before_training(launcher_
     assert not (dataset / "tactile_cache").exists()
 
 
-@pytest.mark.parametrize(
-    ("launcher", "gpus", "override", "fraction"),
-    [
-        ("train_ar3_muscle_vlta.sh", "4,5,6,7", None, "0.95"),
-        ("train_ar3_muscle_vlta.sh", "0,1,2,3,4,5,6,7", None, "0.90"),
-        ("train_ar3_muscle_vlta.sh", "0,1,2,3,4,5,6,7", "0.8", "0.8"),
-        ("train_ar3_muscle_vlta_rl.sh", "0,1,2,3,4,5,6,7", None, "0.90"),
-        ("train_ar3_lift_dagger_gpu012.sh", "0,1,2,3,4,5,6,7", None, "0.90"),
-    ],
-)
-def test_training_on_many_gpus_leaves_memory_for_nccl(launcher, gpus, override, fraction, launcher_env, tmp_path):
-    """With 8 GPUs NCCL needs about 4.2 GB per GPU outside JAX's pool: preallocating 0.95 of the H100s aborted the
-    first step ("Cuda failure 2 'out of memory'")."""
+def ar3_training_setup(launcher_env, tmp_path):
+    """Prepares what the AR3 training launchers check before a dry run; returns their arguments by launcher name."""
     dataset = tmp_path / "plug_in"
     (dataset / "meta").mkdir(parents=True)
     (dataset / "meta" / "info.json").write_text("{}")
@@ -221,20 +210,76 @@ def test_training_on_many_gpus_leaves_memory_for_nccl(launcher, gpus, override, 
             "OPENPI_AR3_WEIGHT_PATH": launcher_env["OPENPI_INIT_CHECKPOINT"],
             "OPENPI_DATA_HOME": str(tmp_path / "home"),
             "OPENPI_CHECKPOINT_BASE_DIR": str(tmp_path / "checkpoints"),
-            "OPENPI_CUDA_VISIBLE_DEVICES": gpus,
-            "OPENPI_BATCH_SIZE": "256",
         }
     )
-    launcher_env.pop("XLA_PYTHON_CLIENT_MEM_FRACTION", None)
-    if override is not None:
-        launcher_env["XLA_PYTHON_CLIENT_MEM_FRACTION"] = override
-    arguments = {
+    return {
         "train_ar3_muscle_vlta_rl.sh": [str(step)],
         "train_ar3_lift_dagger_gpu012.sh": [str(step), str(dataset)],
     }
+
+
+@pytest.mark.parametrize(
+    ("launcher", "gpus", "override", "fraction"),
+    [
+        ("train_ar3_muscle_vlta.sh", "4,5,6,7", None, "0.95"),
+        ("train_ar3_muscle_vlta.sh", "0,1,2,3,4,5,6,7", None, "0.90"),
+        ("train_ar3_muscle_vlta.sh", "0,1,2,3,4,5,6,7", "0.8", "0.8"),
+        ("train_ar3_muscle_vlta_rl.sh", "0,1,2,3,4,5,6,7", None, "0.90"),
+        ("train_ar3_lift_dagger_gpu012.sh", "0,1,2,3,4,5,6,7", None, "0.90"),
+    ],
+)
+def test_training_on_many_gpus_leaves_memory_for_nccl(launcher, gpus, override, fraction, launcher_env, tmp_path):
+    """With 8 GPUs NCCL needs about 4.2 GB per GPU outside JAX's pool: preallocating 0.95 of the H100s aborted the
+    first step ("Cuda failure 2 'out of memory'")."""
+    arguments = ar3_training_setup(launcher_env, tmp_path)
+    launcher_env.update({"OPENPI_CUDA_VISIBLE_DEVICES": gpus, "OPENPI_BATCH_SIZE": "256"})
+    launcher_env.pop("XLA_PYTHON_CLIENT_MEM_FRACTION", None)
+    if override is not None:
+        launcher_env["XLA_PYTHON_CLIENT_MEM_FRACTION"] = override
     result = run_launcher(launcher, launcher_env, *arguments.get(launcher, []))
     assert result.returncode == 0, result.stderr
     assert f"JAX preallocates {fraction} of each of the {len(gpus.split(','))} GPUs" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("launcher", "config"),
+    [
+        ("train_ar3_muscle_vlta.sh", "pi05_ar3_muscle_vlta"),
+        ("train_ar3_muscle_vlta_rl.sh", "pi05_ar3_muscle_vlta_rl"),
+        ("train_ar3_lift_dagger_gpu012.sh", "pi05_ar3_lift_reactive_dagger"),
+    ],
+)
+def test_overwrite_does_not_delete_saved_checkpoints(launcher, config, launcher_env, tmp_path):
+    """A command whose first line lacked its continuation lost OPENPI_CONFIG_NAME, ran with the default preset under the
+    same experiment name and, with OPENPI_OVERWRITE=1, wiped the checkpoints of the run that had trained there."""
+    arguments = ar3_training_setup(launcher_env, tmp_path).get(launcher, [])
+    experiment = tmp_path / "checkpoints" / config / "new_visuotactile"
+    experiment.mkdir(parents=True)
+    (experiment / "wandb_id.txt").write_text("v1it8tr3")
+    launcher_env.update({"OPENPI_EXP_NAME": "new_visuotactile", "OPENPI_OVERWRITE": "1"})
+
+    def train_command():
+        result = run_launcher(launcher, launcher_env, *arguments)
+        assert result.returncode == 0, result.stderr
+        (line,) = [line for line in result.stdout.splitlines() if line.startswith("+ ") and "scripts/train.py" in line]
+        return shlex.split(line[2:])
+
+    # A run that stopped before its first checkpoint is simply started again.
+    assert "--overwrite" in train_command()
+
+    (experiment / "25000" / "params").mkdir(parents=True)
+    (experiment / "24000.tar").write_text("")
+    result = run_launcher(launcher, launcher_env, *arguments)
+    assert result.returncode == 1
+    assert f"{experiment} holds: 24000.tar 25000" in result.stderr
+    assert "OPENPI_OVERWRITE=force" in result.stderr
+    assert "scripts/train.py" not in result.stdout
+
+    launcher_env["OPENPI_RESUME"] = "1"
+    assert "--resume" in train_command()
+    del launcher_env["OPENPI_RESUME"]
+    launcher_env["OPENPI_OVERWRITE"] = "force"
+    assert "--overwrite" in train_command()
 
 
 def test_muscle_vlta_launcher_trains_several_sessions_as_one(launcher_env, tmp_path):

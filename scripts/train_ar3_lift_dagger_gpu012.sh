@@ -23,7 +23,8 @@
 #   OPENPI_AR3_ASSET_ID      norm-stats id under <step>/assets (default: the only one there)
 #   OPENPI_CUDA_VISIBLE_DEVICES (default 0,1,2), OPENPI_BATCH_SIZE (default 96), OPENPI_NUM_WORKERS (default 16)
 #   OPENPI_NUM_TRAIN_STEPS (default 10000), OPENPI_SAVE_INTERVAL (default 1000), OPENPI_KEEP_PERIOD (default 2000)
-#   OPENPI_RESUME=1 / OPENPI_OVERWRITE=1, WANDB_MODE (default offline), OPENPI_DRY_RUN=1 prints the commands
+#   OPENPI_RESUME=1 / OPENPI_OVERWRITE=1 (force: also when the experiment holds saved checkpoints)
+#   WANDB_MODE (default offline), OPENPI_DRY_RUN=1 prints the commands
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -60,6 +61,18 @@ fi
 if ((BATCH_SIZE % NUM_GPUS != 0)); then
     echo "OPENPI_BATCH_SIZE=${BATCH_SIZE} must be divisible by the number of GPUs (${NUM_GPUS})" >&2
     exit 1
+fi
+# As in scripts/train_ar3_lift_gpu012.sh: OPENPI_OVERWRITE=1 does not delete an experiment that saved checkpoints.
+EXP_DIR="${CHECKPOINT_BASE_DIR}/${CONFIG_NAME}/${EXP_NAME}"
+if [[ "${OPENPI_RESUME:-0}" != "1" && "${OPENPI_OVERWRITE:-0}" == "1" && -d "${EXP_DIR}" ]]; then
+    SAVED="$(find "${EXP_DIR}" -mindepth 1 -maxdepth 1 ! -name wandb_id.txt -printf '%f\n' | sort -V |
+        paste -sd ' ' -)"
+    if [[ -n "${SAVED}" ]]; then
+        echo "${EXP_DIR} holds: ${SAVED}" >&2
+        echo "OPENPI_OVERWRITE=1 does not delete saved checkpoints: use another OPENPI_EXP_NAME, OPENPI_RESUME=1 to" \
+            "continue this run, or OPENPI_OVERWRITE=force to delete them." >&2
+        exit 1
+    fi
 fi
 if [[ ! -d "${STEP_DIR}/params" ]]; then
     echo "${STEP_DIR} is not a checkpoint step directory (missing params/)" >&2
@@ -166,7 +179,7 @@ TRAIN_ARGS=(
 )
 if [[ "${OPENPI_RESUME:-0}" == "1" ]]; then
     TRAIN_ARGS+=(--resume)
-elif [[ "${OPENPI_OVERWRITE:-0}" == "1" ]]; then
+elif [[ "${OPENPI_OVERWRITE:-0}" == "1" || "${OPENPI_OVERWRITE:-0}" == "force" ]]; then
     TRAIN_ARGS+=(--overwrite)
 fi
 if [[ "${WANDB_MODE}" == "disabled" ]]; then

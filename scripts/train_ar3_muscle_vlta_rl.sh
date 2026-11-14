@@ -38,7 +38,8 @@
 #   OPENPI_AR3_ASSET_ID      norm-stats id under <step>/assets (default: the only one there)
 #   OPENPI_CUDA_VISIBLE_DEVICES (default 4,5,6,7), OPENPI_BATCH_SIZE (default 128), OPENPI_NUM_WORKERS (default 16)
 #   OPENPI_NUM_TRAIN_STEPS (default 10000), OPENPI_SAVE_INTERVAL (default 1000), OPENPI_KEEP_PERIOD (default 2000)
-#   OPENPI_RESUME=1 / OPENPI_OVERWRITE=1, WANDB_MODE (default offline), OPENPI_DRY_RUN=1 prints the commands
+#   OPENPI_RESUME=1 / OPENPI_OVERWRITE=1 (force: also when the experiment holds saved checkpoints)
+#   WANDB_MODE (default offline), OPENPI_DRY_RUN=1 prints the commands
 #
 # Serve the result with its preset name:
 #   OPENPI_CONFIG_NAME=<config> bash scripts/serve_ar3_lift.sh <checkpoint root>/<config>/<exp>/<step>
@@ -57,7 +58,7 @@ run() {
 # is therefore a function, which is parsed completely before it starts, and nothing is read after it.
 main() {
     local repo_root step_dir source_config default_config config_name exp_name tag stages gpus num_gpus first_gpu
-    local batch_size checkpoint_base_dir python log_file dataset path labelled mem_fraction
+    local batch_size checkpoint_base_dir python log_file dataset path labelled mem_fraction exp_dir saved
     local -a fit_args stats dataset_entries datasets train_args
 
     repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -100,6 +101,19 @@ main() {
     if ((batch_size % num_gpus != 0)); then
         echo "OPENPI_BATCH_SIZE=${batch_size} must be divisible by the number of GPUs (${num_gpus})" >&2
         return 1
+    fi
+    # As in scripts/train_ar3_lift_gpu012.sh: OPENPI_OVERWRITE=1 does not delete an experiment that saved checkpoints.
+    exp_dir="${checkpoint_base_dir}/${config_name}/${exp_name}"
+    if [[ "${stages}" == *" policy "* && "${OPENPI_RESUME:-0}" != "1" && "${OPENPI_OVERWRITE:-0}" == "1" &&
+        -d "${exp_dir}" ]]; then
+        saved="$(find "${exp_dir}" -mindepth 1 -maxdepth 1 ! -name wandb_id.txt -printf '%f\n' | sort -V |
+            paste -sd ' ' -)"
+        if [[ -n "${saved}" ]]; then
+            echo "${exp_dir} holds: ${saved}" >&2
+            echo "OPENPI_OVERWRITE=1 does not delete saved checkpoints: use another OPENPI_EXP_NAME, OPENPI_RESUME=1" \
+                "to continue this run, or OPENPI_OVERWRITE=force to delete them." >&2
+            return 1
+        fi
     fi
     if [[ ! -d "${step_dir}/params" ]]; then
         echo "${step_dir} is not a checkpoint step directory (missing params/)" >&2
@@ -198,7 +212,7 @@ main() {
     )
     if [[ "${OPENPI_RESUME:-0}" == "1" ]]; then
         train_args+=(--resume)
-    elif [[ "${OPENPI_OVERWRITE:-0}" == "1" ]]; then
+    elif [[ "${OPENPI_OVERWRITE:-0}" == "1" || "${OPENPI_OVERWRITE:-0}" == "force" ]]; then
         train_args+=(--overwrite)
     fi
     if [[ "${WANDB_MODE}" == "disabled" ]]; then

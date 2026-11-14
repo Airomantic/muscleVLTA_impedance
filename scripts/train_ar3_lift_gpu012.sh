@@ -27,7 +27,8 @@
 #   OPENPI_CHECKPOINT_BASE_DIR  checkpoint root (default /data/jiang/train_checkpoints)
 #   XLA_PYTHON_CLIENT_MEM_FRACTION  fraction of each GPU preallocated by JAX (default 0.95; 0.90 with more than 4 GPUs)
 #   NCCL_SOCKET_IFNAME / NCCL_IB_DISABLE  NCCL bootstrap interface / IB switch (default lo / 1: single node, NVLink only)
-#   OPENPI_RESUME=1 resumes the experiment, OPENPI_OVERWRITE=1 overwrites it
+#   OPENPI_RESUME=1 resumes the experiment; OPENPI_OVERWRITE=1 starts it again, unless it holds saved checkpoints
+#                          (OPENPI_OVERWRITE=force deletes those as well)
 #   OPENPI_RECOMPUTE_NORM_STATS=1 recomputes assets/<config>/<asset_id>/norm_stats.json
 #   WANDB_MODE  defaults to offline; use online / disabled as needed
 #   OPENPI_DRY_RUN=1 prints the commands without running them
@@ -52,6 +53,21 @@ PYTHON="${OPENPI_PYTHON:-${REPO_ROOT}/.venv/bin/python}"
 if ((BATCH_SIZE % NUM_GPUS != 0)); then
     echo "OPENPI_BATCH_SIZE=${BATCH_SIZE} must be divisible by the number of GPUs (${NUM_GPUS})" >&2
     exit 1
+fi
+
+# OPENPI_OVERWRITE=1 deletes <checkpoint root>/<config>/<exp>. A command whose line continuation is mistyped loses its
+# OPENPI_CONFIG_NAME or OPENPI_EXP_NAME and runs with the defaults: it wiped the checkpoints of another run that way.
+# Saved checkpoints are therefore only deleted with OPENPI_OVERWRITE=force (wandb_id.txt alone: nothing was saved).
+EXP_DIR="${CHECKPOINT_BASE_DIR}/${CONFIG_NAME}/${EXP_NAME}"
+if [[ "${OPENPI_RESUME:-0}" != "1" && "${OPENPI_OVERWRITE:-0}" == "1" && -d "${EXP_DIR}" ]]; then
+    SAVED="$(find "${EXP_DIR}" -mindepth 1 -maxdepth 1 ! -name wandb_id.txt -printf '%f\n' | sort -V |
+        paste -sd ' ' -)"
+    if [[ -n "${SAVED}" ]]; then
+        echo "${EXP_DIR} holds: ${SAVED}" >&2
+        echo "OPENPI_OVERWRITE=1 does not delete saved checkpoints: use another OPENPI_EXP_NAME, OPENPI_RESUME=1 to" \
+            "continue this run, or OPENPI_OVERWRITE=force to delete them." >&2
+        exit 1
+    fi
 fi
 
 export OPENPI_AR3_REPO_ID="${OPENPI_AR3_REPO_ID:-/data/jiang/ar3_eef_forceVisuoTactaile_front_wrist}"
@@ -148,7 +164,7 @@ if [[ -n "${OPENPI_LR_DECAY_STEPS:-}" ]]; then
 fi
 if [[ "${OPENPI_RESUME:-0}" == "1" ]]; then
     TRAIN_ARGS+=(--resume)
-elif [[ "${OPENPI_OVERWRITE:-0}" == "1" ]]; then
+elif [[ "${OPENPI_OVERWRITE:-0}" == "1" || "${OPENPI_OVERWRITE:-0}" == "force" ]]; then
     TRAIN_ARGS+=(--overwrite)
 fi
 if [[ "${WANDB_MODE}" == "disabled" ]]; then
